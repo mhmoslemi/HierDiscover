@@ -321,8 +321,13 @@ def restart_changed_rollout_step(cfg, exp_dir, step):
 
     run = Path(exp_dir)
     directory = run / f"step{step:02d}"
-    parents_path = directory / f"step{step:02d}.parents.json"
-    jev_path = directory / f"step{step:02d}.jev.json"
+    frozen_step = run / "frozen_solver" / directory.name
+    coder_parents = directory / f"step{step:02d}.parents.json"
+    frozen_parents = frozen_step / coder_parents.name
+    parents_path = coder_parents if coder_parents.is_file() else frozen_parents
+    coder_jev = directory / f"step{step:02d}.jev.json"
+    frozen_jev = frozen_step / coder_jev.name
+    jev_path = coder_jev if coder_jev.is_file() else frozen_jev
     if ((directory / f"step{step:02d}.summary.json").is_file()
             or not (parents_path.is_file() or jev_path.is_file())):
         return None
@@ -341,7 +346,12 @@ def restart_changed_rollout_step(cfg, exp_dir, step):
     if jev is not None:
         values["groups_per_step"] = int(jev["requested"])
     budget_changed = any(getattr(cfg, key, None) != value for key, value in values.items())
-    mode_changed = bool(saved.get("frozen_solver", False)) != bool(getattr(cfg, "frozen_solver", False))
+    frozen_enabled = bool(getattr(cfg, "frozen_solver", False))
+    mode_changed = bool(saved.get("frozen_solver", False)) != frozen_enabled
+    layout_changed = (
+        frozen_enabled and (coder_parents.is_file() or coder_jev.is_file())
+        and not frozen_parents.is_file()
+    )
     # Step zero uses ordinary PUCT, so its parents do not depend on this gate.
     threshold_changed = (
         step > 0 and getattr(cfg, "parent_selection", None) == "puct-jev"
@@ -349,7 +359,7 @@ def restart_changed_rollout_step(cfg, exp_dir, step):
         and jev["threshold"] != cfg.jev_same_core_threshold)
     prompt_changed = (saved.get("rollout_prompt_revision")
                       != getattr(cfg, "rollout_prompt_revision", None))
-    if not (budget_changed or mode_changed or threshold_changed or prompt_changed):
+    if not (budget_changed or mode_changed or layout_changed or threshold_changed or prompt_changed):
         return None
 
     # Partial gradients belong to the discarded trajectories.
@@ -372,14 +382,14 @@ def restart_changed_rollout_step(cfg, exp_dir, step):
     for path in dict.fromkeys(sidecars):
         if path.is_file():
             path.rename(backup / path.name)
-    frozen_step = run / "frozen_solver" / directory.name
     if frozen_step.is_dir():
         frozen_backup = backup / "frozen_solver"
         frozen_backup.mkdir()
         frozen_step.rename(frozen_backup / frozen_step.name)
-    directory.rename(backup / directory.name)
+    if directory.is_dir():
+        directory.rename(backup / directory.name)
 
-    if threshold_changed and not (budget_changed or mode_changed or prompt_changed):
+    if threshold_changed and not (frozen_enabled or budget_changed or mode_changed or prompt_changed):
         # Probabilities do not depend on the gate. Retain only that cache;
         # never carry old parents, rollouts, evaluations, or gradients forward.
         # Leave the old threshold/signature intact for the sampler to validate
@@ -397,6 +407,8 @@ def restart_changed_rollout_step(cfg, exp_dir, step):
         reasons.append("rollout counts changed")
     if mode_changed:
         reasons.append("frozen solver mode changed")
+    if layout_changed:
+        reasons.append("frozen solver now updates the archive before coder selection")
     if prompt_changed:
         reasons.append("task prompt revision changed")
     if threshold_changed:
@@ -504,7 +516,7 @@ def save_parent_selections(exp_dir: Path, step: int, sampler_type: str,
     duplicates, or eventually pruned.
     """
     step_dir = Path(exp_dir) / f"step{step:02d}"
-    step_dir.mkdir(exist_ok=True)
+    step_dir.mkdir(parents=True, exist_ok=True)
     selected = []
     for group, parent in enumerate(parents):
         info = picks_info[group] if group < len(picks_info) else {}

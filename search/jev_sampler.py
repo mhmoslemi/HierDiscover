@@ -98,7 +98,7 @@ class PUCTJevSampler(PUCTSampler):
         self.gpu_id = 0
         self.before_judge = self.after_judge = None
         self.host_memory_admission = None
-        self._selection_step, self._selected = None, []
+        self._selection_key, self._selected = None, []
 
     @property
     def selection_mode(self):
@@ -106,7 +106,7 @@ class PUCTJevSampler(PUCTSampler):
 
     def load_state_dict(self, payload):
         super().load_state_dict(payload)
-        self._selection_step, self._selected = None, []
+        self._selection_key, self._selected = None, []
 
     def _seed_manifest(self):
         return [{"id": s.id, "digest": _digest({
@@ -119,20 +119,24 @@ class PUCTJevSampler(PUCTSampler):
         messages = self.problem.build_prompt(ParentContext())
         return "\n\n".join(str(message["content"]) for message in messages)
 
-    def sample_states(self, num_states, *, selection_step=None):
+    def sample_states(self, num_states, *, selection_step=None, selection_root=None):
         if (isinstance(num_states, bool) or not isinstance(num_states, int)
                 or num_states < 1 or isinstance(selection_step, bool)
                 or not isinstance(selection_step, int) or selection_step < 0):
             raise ValueError("puct-jev needs a positive parent count and nonnegative step")
+        root = Path(selection_root) if selection_root is not None else self.exp_dir
+        key = (root, selection_step)
         with self._lock:
-            if self._selection_step == selection_step:
+            if self._selection_key == key:
                 if num_states != self._requested:
-                    raise ValueError("cannot change the puct-jev parent count within a step")
+                    raise ValueError("cannot change the puct-jev count for a saved parent selection")
                 return list(self._selected)
-            return self._select(num_states, selection_step)
+            picks = self._select(num_states, selection_step, root)
+            self._requested, self._selection_key, self._selected = num_states, key, list(picks)
+            return picks
 
-    def _select(self, count, step):
-        directory = self.exp_dir / f"step{step:02d}"
+    def _select(self, count, step, root):
+        directory = root / f"step{step:02d}"
         directory.mkdir(parents=True, exist_ok=True)
         path = directory / f"step{step:02d}.jev.json"
         saved = json.loads(path.read_text(encoding="utf-8")) if path.exists() else None
@@ -196,7 +200,6 @@ class PUCTJevSampler(PUCTSampler):
 
         saved.update(selected=[s.id for s in picks], picks_info=self.last_picks_info)
         _write(path, saved)
-        self._requested, self._selection_step, self._selected = count, step, list(picks)
         print(f"[puct-jev] step {step}: {len(picks)}/{count} parents; "
               f"{len(saved['comparisons'])} comparisons; threshold={threshold:g}; "
               f"decisions saved to {path}", flush=True)

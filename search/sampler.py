@@ -274,7 +274,7 @@ class PUCTSampler:
             "is_seed": entry[2].id in self._seed_ids,
         }
 
-    def sample_states(self, num_states: int, *, selection_step=None):
+    def sample_states(self, num_states: int, *, selection_step=None, selection_root=None):
         """Pick `num_states` parent states for the next batch."""
         if not self._states:
             return []
@@ -446,8 +446,7 @@ class PUCTSampler:
             }
 
     def record_expansion(self, parent: State, count: int = 1):
-        """Called once per parent per step. Pass count=group_size so n and T
-        grow per-ROLLOUT (matching discover). count=1 gives per-parent growth."""
+        """Count a parent batch by attempted rollouts, including failed candidates."""
         anc_ids = [parent.id] + [p["id"] for p in (parent.parents or [])]
         for aid in anc_ids:
             self._n[aid] = self._n.get(aid, 0) + count

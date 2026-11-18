@@ -473,7 +473,8 @@ def _migrate_parent_selection(sampler, cfg, exp_dir, next_step, adapter_path,
     if not can_migrate_parent_selection(sampler.selection_mode, cfg.parent_selection):
         raise ValueError("unsupported resume parent-selection change")
     parents_path = Path(exp_dir) / f"step{next_step:02d}" / f"step{next_step:02d}.parents.json"
-    if recovery_pending or parents_path.exists():
+    frozen_parents_path = Path(exp_dir) / "frozen_solver" / parents_path.parent.name / parents_path.name
+    if recovery_pending or parents_path.exists() or frozen_parents_path.exists():
         print(f"[resume] finishing interrupted step {next_step} with "
               f"{sampler.selection_mode.upper()}; "
               f"{cfg.parent_selection.upper()} starts at the next fresh step",
@@ -557,6 +558,9 @@ def _legacy_resume_info(exp_dir):
         except ValueError:
             continue
     if not matches:
+        initial_adapter = Path(exp_dir) / "adapter_initial"
+        if initial_adapter.is_dir():
+            return 0, initial_adapter
         raise FileNotFoundError(
             "this older run has no training_state.pt and no adapter_step* "
             "directory; the trained policy cannot be resumed"
@@ -662,23 +666,27 @@ def _complete_unfinished_rollout_paths(exp_dir, step_idx, cfg):
             or not step_dir.is_dir()):
         return None
     paths = sorted(step_dir.glob(f"step{step_idx:02d}_group*_rollout*.meta.json"))
-    expected = int(cfg.groups_per_step) * int(cfg.group_size)
+    parent_count = int(cfg.groups_per_step)
+    if getattr(cfg, "frozen_solver", False):
+        if not _frozen_archive_path(exp_dir, step_idx).is_file():
+            return None
+        frozen_dir = Path(exp_dir) / "frozen_solver" / step_dir.name
+        parents_name = f"step{step_idx:02d}.parents.json"
+        try:
+            parent_count = len(json.loads((step_dir / parents_name).read_text())["parents"])
+            frozen_parent_count = len(json.loads((frozen_dir / parents_name).read_text())["parents"])
+            frozen_paths = list(frozen_dir.glob(f"step{step_idx:02d}_group*_rollout*.meta.json"))
+            if len(frozen_paths) != frozen_parent_count * int(cfg.frozen_programs_per_parent):
+                return None
+            if any(json.loads(path.read_text()).get("status") != "evaluated" for path in frozen_paths):
+                return None
+        except (OSError, KeyError, TypeError, ValueError, AttributeError):
+            return None
+    expected = parent_count * int(cfg.group_size)
     if len(paths) > expected:
         raise RuntimeError(
             f"Unfinished step {step_idx} has {len(paths)} saved rollouts "
             f"for a batch of {expected}. This step cannot be replayed.")
-    if getattr(cfg, "frozen_solver", False):
-        frozen_dir = Path(exp_dir) / "frozen_solver" / step_dir.name
-        frozen_paths = list(frozen_dir.glob(f"step{step_idx:02d}_group*_rollout*.meta.json"))
-        frozen_expected = int(cfg.groups_per_step) * int(cfg.frozen_programs_per_parent)
-        if len(frozen_paths) != frozen_expected:
-            return None
-        try:
-            if any(json.loads(path.read_text()).get("status") != "evaluated"
-                   for path in frozen_paths):
-                return None
-        except (OSError, ValueError, AttributeError):
-            return None
     return paths if len(paths) == expected else None
 
 
@@ -1042,8 +1050,6 @@ def _finalize_pending_spo_rs_artifacts(
         raise RuntimeError("generated-step recovery refuses non-exact response token IDs")
 
     parents = sampler.sample_states(int(cfg.groups_per_step), selection_step=step_idx)
-    if len(parents) != int(cfg.groups_per_step):
-        raise RuntimeError("generated-step recovery could not reconstruct every parent")
     parents_path = (Path(exp_dir) / f"step{int(step_idx):02d}" / f"step{int(step_idx):02d}.parents.json")
     try:
         saved_parent_rows = json.loads(parents_path.read_text(encoding="utf-8"))["parents"]
@@ -1052,6 +1058,8 @@ def _finalize_pending_spo_rs_artifacts(
         raise RuntimeError("generated-step recovery cannot read its saved parent selection") \
             from error
     saved_parents = {int(row["group"]): row for row in saved_parent_rows}
+    if set(saved_parents) != set(range(len(parents))):
+        raise RuntimeError("generated-step recovery could not reconstruct every parent")
     for group, parent in enumerate(parents):
         row = saved_parents.get(group)
         if row is None:
@@ -1403,7 +1411,7 @@ def _rebind_interrupted_step_zero_selection(sampler, exp_dir, parents):
 def _resume_spo_rs_step_from_artifacts(
         model, tokenizer, sampler, step_idx, cfg, exp_dir,
         problem, parallel_trainer, spo_rs_tracker, sampling_adapter_path,
-        artifacts, evaluation_complete=None):
+        artifacts, evaluation_complete=None, frozen_pass=None):
     """Finish one interrupted SPO-RS step from its durable evaluations."""
     import torch
     from experiment_io import save_best_state_snapshot, save_rollout
@@ -1422,7 +1430,8 @@ def _resume_spo_rs_step_from_artifacts(
     for item in artifacts:
         by_group.setdefault(int(item["meta"]["group"]), []).append(item)
     parents = _rebind_saved_step_zero_parents(
-        sampler, by_group, int(cfg.groups_per_step)) if step_idx == 0 else None
+        sampler, by_group, int(cfg.groups_per_step)
+    ) if step_idx == 0 and frozen_pass is None else None
     if parents is None:
         parents = sampler.sample_states(
             int(cfg.groups_per_step), selection_step=step_idx)
@@ -1432,10 +1441,10 @@ def _resume_spo_rs_step_from_artifacts(
             "current parent-selection settings begin at step 1",
             flush=True,
         )
-    if len(parents) != int(cfg.groups_per_step):
+    if set(by_group) != set(range(len(parents))):
         raise RuntimeError(
             "evaluated-step recovery could not reconstruct every selected "
-            f"parent ({len(parents)}/{int(cfg.groups_per_step)})")
+            f"parent ({len(parents)}/{len(by_group)})")
     for group, parent in enumerate(parents):
         records = by_group.get(group, ())
         if not records:
@@ -1701,15 +1710,10 @@ def _resume_spo_rs_step_from_artifacts(
             flush=True,
         )
 
-    raw_states = [
-        child for child, _parent in all_children
-        if child.raw_score is not None and math.isfinite(float(child.raw_score))
-    ]
-    step_best = (
-        (max(raw_states, key=lambda state: float(state.raw_score))
-         if problem.maximize else
-         min(raw_states, key=lambda state: float(state.raw_score)))
-        if raw_states else None)
+    step_states = [child for child, _parent in all_children]
+    if frozen_pass is not None and frozen_pass["best"] is not None:
+        step_states.append(SimpleNamespace(**frozen_pass["best"]))
+    step_best = _step_best_candidate(step_states, problem.maximize)
     best_seen = (sampler.best_raw_state(maximize=bool(problem.maximize)) or sampler.best_state())
     best_snapshot_path = save_best_state_snapshot(
         exp_dir, step_idx, best_seen,
@@ -1727,7 +1731,9 @@ def _resume_spo_rs_step_from_artifacts(
         "planned_rollouts": len(artifacts),
         "result_metric_name": str(problem.metric_name),
         "result_maximize": bool(problem.maximize),
-        "step_best_raw_score": (float(step_best.raw_score) if step_best is not None else None),
+        "step_best_raw_score": (
+            float(step_best.raw_score)
+            if step_best is not None and step_best.raw_score is not None else None),
         "step_best_reward": (float(step_best.value) if step_best is not None else None),
         "best_seen_raw_score": (
             float(best_seen.raw_score)
@@ -1748,6 +1754,8 @@ def _resume_spo_rs_step_from_artifacts(
         "recovered_evaluated_step": True,
         "recovered_rollouts": len(artifacts),
     }
+    if frozen_pass is not None:
+        stats.update(frozen_pass["stats"])
     if overflow_state is not None:
         stats.update(parallel_trainer.recover_spo_rs_overflow(recovery_examples, cfg, step_idx, overflow_state))
     else:
@@ -1802,6 +1810,355 @@ def _automatic_sandbox_memory_limit_bytes(concurrent_sandboxes: int) -> int:
     return max(512 * 1024**2, min(1024**3, per_process))
 
 
+def _open_reward_pool(cfg, problem, rollout_count, step_idx, gen_pool,
+                      parallel_trainer, *, label=""):
+    from concurrent.futures import Future, ThreadPoolExecutor
+    from queue import Queue
+    from problems.base import RewardResult
+
+    from runtime.host_memory import HostMemoryAdmission
+    host_admission = getattr(parallel_trainer, "host_memory_admission", None)
+    if host_admission is None:
+        host_admission = getattr(gen_pool, "host_memory_admission", None)
+    if host_admission is None:
+        import multiprocessing
+        host_admission = HostMemoryAdmission(multiprocessing.get_context("spawn"), hardware_profile=cfg.hardware_profile)
+    isolated_eval = bool(getattr(cfg, "isolate_eval", False))
+    isolated_cpu_slots = None
+    isolated_cpu_count = 0
+    isolated_processes_per_cpu = 0
+    isolated_memory_limit_bytes = None
+    if isolated_eval:
+        isolated_cpu_ids = _isolated_evaluation_cpu_ids(cfg)
+        isolated_cpu_count = len(isolated_cpu_ids)
+        isolated_processes_per_cpu = int(cfg.reward_workers)
+        isolated_cpu_slots = Queue()
+        # Layered admission is intentional: put one candidate on every CPU
+        # before allowing a second on each CPU, and so on.
+        for _layer in range(isolated_processes_per_cpu):
+            for cpu_id in isolated_cpu_ids:
+                isolated_cpu_slots.put(cpu_id)
+        isolated_capacity = isolated_cpu_count * isolated_processes_per_cpu
+        n_reward_workers = max(1, min(rollout_count, isolated_capacity))
+        isolated_memory_limit_bytes = (_automatic_sandbox_memory_limit_bytes(n_reward_workers))
+        setting_log_only(
+            f"[step {step_idx}] {label}isolated evaluation pool: "
+            f"{n_reward_workers} sandbox process(es) across "
+            f"{isolated_cpu_count} CPU(s), up to "
+            f"{isolated_processes_per_cpu}/CPU from reward_workers; each "
+            "process tree is pinned to one CPU and excess candidates remain "
+            "queued; live RAM admission is shared with model transfers and "
+            f"activation offload; RAM reservation="
+            f"{min(1024**3, isolated_memory_limit_bytes) / 1024**3:.2f} GiB/process; "
+            f"automatic address-space ceiling="
+            f"{isolated_memory_limit_bytes / 1024**3:.2f} GiB/process, "
+            "stdout+stderr capture is bounded")
+    else:
+        n_reward_workers = _resolve_reward_workers(cfg, problem)
+        print(f"[step {step_idx}] {label}evaluation pool: {n_reward_workers} worker(s), "
+              f"{getattr(problem, 'eval_cpus', 1)} CPU(s) per candidate")
+    reward_pool = ThreadPoolExecutor(max_workers=n_reward_workers)
+
+    def run_isolated(text, parent_ctx, **answer_options):
+        with host_admission.reservation(min(1024**3, isolated_memory_limit_bytes)):
+            cpu_id = isolated_cpu_slots.get()
+            try:
+                return problem.compute_reward(
+                    text, parent_ctx, cfg.sandbox_timeout_s, cpu_id=cpu_id,
+                    memory_limit_bytes=isolated_memory_limit_bytes, **answer_options)
+            finally:
+                isolated_cpu_slots.put(cpu_id)
+
+    def submit(text, parent_ctx, final_text, format_issue):
+        if format_issue is not None:
+            future = Future()
+            future.set_result(RewardResult(
+                reward=float(problem.fail_score), msg=format_issue, failure_kind="code"))
+            return future
+        answer_options = {} if final_text is None else {"final_answer_text": final_text}
+        if isolated_eval:
+            return reward_pool.submit(run_isolated, text, parent_ctx, **answer_options)
+        return reward_pool.submit(
+            problem.compute_reward, text, parent_ctx, cfg.sandbox_timeout_s, **answer_options)
+
+    return reward_pool, submit, {
+        "evaluation_isolated": isolated_eval,
+        "evaluation_workers": int(n_reward_workers),
+        "evaluation_cpu_count": int(isolated_cpu_count),
+        "evaluation_processes_per_cpu": int(isolated_processes_per_cpu),
+    }
+
+
+def _prepare_gpu_evaluation(backend, optimizer, cfg, problem, step_idx, count,
+                            *, trainer_parked=False):
+    import gc
+    import torch
+
+    if getattr(problem, "problem_type", "") == "trimul":
+        problem.begin_evaluation_batch()
+    if trainer_parked:
+        return False
+    print(f"[step {step_idx}] releasing trainer memory before {count} benchmark(s); "
+          "one benchmark at a time per evaluation GPU")
+    try:
+        torch.cuda.synchronize()
+        _move_optimizer_state(optimizer, "cpu", hardware_profile=getattr(cfg, "hardware_profile", "RTX6000"))
+        backend.offload_for_generation()
+        gc.collect()
+        torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()
+    except Exception as exc:
+        try:
+            backend.restore_after_generation()
+            _restore_optimizer_state_to_parameters(optimizer)
+        except Exception:
+            pass
+        raise RuntimeError(
+            "shared-GPU evaluation requires the trainer to offload before "
+            "candidate benchmark evaluation, but this model/runtime "
+            "cannot move the training state to CPU") from exc
+    return True
+
+
+def _restore_after_gpu_evaluation(backend, optimizer, step_idx):
+    import gc
+    import torch
+
+    print(f"[step {step_idx}] restoring trainer after shared-GPU benchmark evaluation")
+    gc.collect()
+    torch.cuda.empty_cache()
+    backend.restore_after_generation()
+    _restore_optimizer_state_to_parameters(optimizer)
+    backend.set_training_mode()
+
+
+def _parent_context(parent):
+    from problems.base import ParentContext
+
+    return ParentContext(
+        code=parent.code, value=parent.value if parent.value is not None else 0.0,
+        raw_score=parent.raw_score, construction=parent.construction,
+        observation=parent.observation, previous_raw_score=parent.previous_raw_score,
+        poisson=parent.poisson,
+    )
+
+
+def _step_best_candidate(states, maximize):
+    raw_states = []
+    for state in states:
+        try:
+            if math.isfinite(float(state.raw_score)):
+                raw_states.append(state)
+        except (TypeError, ValueError):
+            continue
+    if raw_states:
+        choose = max if maximize else min
+        return choose(raw_states, key=lambda state: float(state.raw_score))
+    return max(states, key=lambda state: float(state.value) if state.value is not None else -math.inf,
+               default=None)
+
+
+def _frozen_archive_path(exp_dir, step_idx):
+    return Path(exp_dir) / "frozen_solver" / f"step{step_idx:02d}" / "archive.pt"
+
+
+def _restore_frozen_archive(sampler, exp_dir, step_idx):
+    import torch
+
+    path = _frozen_archive_path(exp_dir, step_idx)
+    if not path.is_file():
+        return None
+    payload = torch.load(path, map_location="cpu", weights_only=False)
+    if (not isinstance(payload, dict) or payload.get("version") != 1
+            or payload.get("step") != step_idx):
+        raise ValueError(f"invalid frozen solver archive checkpoint: {path}")
+    sampler.load_state_dict(payload["sampler"])
+    print(f"[step {step_idx}] restored archive after frozen solver evaluation", flush=True)
+    return payload
+
+
+def _run_frozen_search_pass(backend, model, tokenizer, sampler, optimizer,
+                            step_idx, cfg, exp_dir, problem, gen_pool,
+                            strategy_pool, parallel_trainer):
+    """Evaluate and archive the frozen solver's complete batch before sampling coder parents."""
+    import torch
+    from concurrent.futures import ThreadPoolExecutor
+    from experiment_io import save_parent_selections, save_rollout, save_rollout_artifacts
+    from generation.gen_workers import native_final_answer_scope
+    from search.sampler import State
+
+    restored = _restore_frozen_archive(sampler, exp_dir, step_idx)
+    if restored is not None:
+        return restored
+
+    frozen_dir = Path(exp_dir) / "frozen_solver"
+    parents = sampler.sample_states(int(cfg.groups_per_step), selection_step=step_idx,
+                                    selection_root=frozen_dir)
+    if step_idx == 0:
+        _rebind_interrupted_step_zero_selection(sampler, frozen_dir, parents)
+    count = int(cfg.frozen_programs_per_parent)
+    sampler_type = ("UCTSampler" if sampler.use_uct else type(sampler).__name__)
+    save_parent_selections(
+        frozen_dir, step_idx, sampler_type, parents, sampler.last_picks_info, rollout_config=cfg)
+    print(f"[step {step_idx}] frozen solver picked {len(parents)} parents, "
+          f"{count} programs each", flush=True)
+
+    parent_ctxs = [_parent_context(parent) for parent in parents]
+    try:
+        prompts = [
+            tokenizer.apply_chat_template(
+                problem.build_prompt(context), tokenize=False, add_generation_prompt=True,
+                enable_thinking=cfg.strategy_thinking, reasoning_effort=cfg.strategy_reasoning_effort)
+            for context in parent_ctxs
+        ]
+    except TypeError as exc:
+        raise RuntimeError(
+            f"The frozen {cfg.strategy_model_name} solver needs a chat template "
+            f"that supports reasoning_effort={cfg.strategy_reasoning_effort} "
+            "with thinking enabled.") from exc
+
+    before = sampler.best_raw_state(maximize=bool(problem.maximize))
+    for parent in parents:
+        sampler.record_expansion(parent, count=count)
+
+    rollout_count = len(parents) * count
+    gpu_shared = bool(getattr(cfg, "evaluation_shares_generation", False))
+    pool = strategy_pool or gen_pool
+    reward_pool, submit_reward, _ = _open_reward_pool(
+        cfg, problem, rollout_count, step_idx, pool, parallel_trainer, label="frozen solver ")
+    rows_by_group = [[] for _ in parents]
+    writes = []
+    children = []
+    offloaded = False
+
+    options = dict(
+        max_new_tokens=int(cfg.strategy_max_new_tokens),
+        temperature=float(cfg.strategy_temperature),
+        top_p=float(cfg.strategy_top_p),
+        top_k=getattr(cfg, "strategy_sampling_top_k", None),
+        min_p=getattr(cfg, "strategy_sampling_min_p", None),
+    )
+
+    def collect(batches):
+        for group, responses in batches:
+            group = int(group)
+            if not 0 <= group < len(parents) or len(rows_by_group[group]) + len(responses) > count:
+                raise RuntimeError("unexpected frozen solver rollout count")
+            for text, token_ids in responses:
+                index = len(rows_by_group[group])
+                ids = list(token_ids)
+                final = native_final_answer_scope(
+                    tokenizer, ids, prompt_text=prompts[group],
+                    require_final_marker=bool(cfg.strategy_thinking))
+                issue = coder_output_issue(text, final_answer_text=final)
+                parent = parents[group]
+                meta = {
+                    "solver": "frozen", "model_name": cfg.strategy_model_name,
+                    "status": "evaluation_pending", "step": step_idx,
+                    "group": group, "parent_group": group, "rollout": index,
+                    "parent_id": parent.id, "parent_timestep": parent.timestep,
+                    "parent_value": parent.value, "parent_raw_score": parent.raw_score,
+                    "parent_is_seed": parent.is_seed,
+                    "n_response_tokens": len(ids), "output_format_issue": issue,
+                }
+                writes.append(writer.submit(
+                    save_rollout_artifacts, frozen_dir, step_idx, group, index, text,
+                    prompt_text=prompts[group], response_token_ids=ids, pending_meta=meta))
+                future = (None if gpu_shared else
+                          submit_reward(text, parent_ctxs[group], final, issue))
+                rows_by_group[group].append((text, final, meta, future))
+        if any(len(rows) != count for rows in rows_by_group):
+            raise RuntimeError("frozen solver omitted rollouts")
+
+    try:
+        with ThreadPoolExecutor(max_workers=1, thread_name_prefix="frozen-rollout-save") as writer, reward_pool:
+            frozen_seed_step = step_idx + 2_000_000
+            if pool is not None:
+                try:
+                    collect(pool.iter_group_jobs(
+                        prompts_by_group=prompts, group_size=count,
+                        counts_by_group=[count] * len(parents), adapter_path=None,
+                        step_idx=frozen_seed_step, progress_desc="frozen solver", **options))
+                finally:
+                    if pool is not gen_pool or (gpu_shared and getattr(pool, "sequential", False)):
+                        pool.release()
+            else:
+                backend.set_inference_mode()
+                frozen_cfg = SimpleNamespace(**vars(cfg))
+                frozen_cfg.advantage_mode = "entropic"
+                frozen_cfg.max_seq_length = int(cfg.strategy_max_seq_length)
+                if cfg.deterministic:
+                    torch.manual_seed((int(cfg.seed) * 1_000_003 + frozen_seed_step * 1009 + 13) % (2**31 - 1))
+                with backend.disable_adapter():
+                    collect(generate_prompt_jobs(
+                        model, tokenizer, prompts, [count] * len(parents), frozen_cfg, **options))
+
+            if gpu_shared and rollout_count:
+                # vLLM already parked the trainer and released generation GPUs.
+                # Keep it parked for the second parent pick and coder pool.
+                offloaded = _prepare_gpu_evaluation(
+                    backend, optimizer, cfg, problem, step_idx, rollout_count,
+                    trainer_parked=(cfg.generation_backend == "vllm"
+                                    and getattr(pool, "sequential", False)))
+                for group, rows in enumerate(rows_by_group):
+                    rows_by_group[group] = [
+                        (text, final, meta,
+                         submit_reward(text, parent_ctxs[group], final, meta["output_format_issue"]))
+                        for text, final, meta, _ in rows
+                    ]
+
+            print(f"[step {step_idx}] waiting for frozen solver evaluations before coder selection", flush=True)
+            for group, rows in enumerate(rows_by_group):
+                parent = parents[group]
+                for text, _final, meta, future in rows:
+                    result = future.result()
+                    child = State.make(
+                        timestep=step_idx, value=float(result.reward),
+                        code=result.code or "", raw_score=result.raw_score,
+                        construction=result.construction, observation=result.stdout, poisson=result.poisson)
+                    eligible = bool(result.valid and result.code)
+                    if eligible:
+                        children.append((child, parent))
+                    evaluated = _evaluated_rollout_meta(meta, result)
+                    evaluated.update(node_id=child.id, archive_eligible=eligible)
+                    if getattr(problem, "saves_construction", False):
+                        evaluated["construction"] = _as_float_list(
+                            result.construction, cfg.max_saved_construction)
+                        evaluated["parent_construction"] = _as_float_list(
+                            parent.construction, cfg.max_saved_construction)
+                    writes.append(writer.submit(
+                        save_rollout, frozen_dir, step_idx, group, meta["rollout"], text,
+                        evaluated, artifacts_already_saved=True))
+            for write in writes:
+                write.result()
+    finally:
+        if offloaded:
+            _restore_after_gpu_evaluation(backend, optimizer, step_idx)
+
+    archive = sampler.update(children)
+    stats = {
+        "frozen_rollouts": rollout_count,
+        "valid_frozen_rollouts": len(children),
+        "frozen_retained_children": archive["retained_new"],
+    }
+    best = _step_best_candidate([child for child, _parent in children], problem.maximize)
+    payload = {
+        "version": 1,
+        "step": step_idx,
+        "sampler": sampler.state_dict(),
+        "stats": stats,
+        "previous_best_raw": float(before.raw_score) if before is not None else None,
+        "best": {"raw_score": best.raw_score, "value": best.value} if best is not None else None,
+    }
+    target = _frozen_archive_path(exp_dir, step_idx)
+    temporary = target.with_suffix(".pt.tmp")
+    torch.save(payload, temporary)
+    temporary.replace(target)
+    print(f"[step {step_idx}] frozen solver evaluated {rollout_count} programs, "
+          f"{len(children)} valid; kept {archive['retained_new']} in the archive", flush=True)
+    return payload
+
+
 def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                cfg, exp_dir, problem, gen_pool=None,
                strategy_pool=None, strategy_tokenizer=None,
@@ -1810,13 +2167,12 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                evaluation_complete=None):
     import os
     import torch
-    from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
-    from queue import Queue
+    from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 
     from search.sampler import State
     from experiment_io import (save_best_state_snapshot, save_parent_selections,
                                save_rollout, save_rollout_artifacts, save_rollout_logprobs)
-    from problems.base import ParentContext, RewardResult, is_code_failure
+    from problems.base import is_code_failure
     from generation.gen_workers import make_progress_bar, native_final_answer_scope
 
 
@@ -1831,11 +2187,29 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
     if (spo_rs_mode and (not spo_rs_tracker.initialized)):
         raise ValueError('SPO-RS tracker must be initialized from pre-step history before rollouts are sampled')
     clipped_policy_mode = _uses_clipped_policy_loss(active_advantage_mode)
-    requested_parent_contexts = (int(cfg.groups_per_step))
-    parents = sampler.sample_states(requested_parent_contexts, selection_step=step_idx)
-    if step_idx == 0:
+    # SPO-RS needs immutable consecutive policy versions. Binary-coder mode
+    # likewise reuses the adapter saved after the preceding update; once its
+    # initialization window closes, this is the frozen rollout policy for the
+    # rest of the discovery run. Only a fresh run needs an initial snapshot.
+    adapter_path = None
+    if spo_rs_mode:
+        if sampling_adapter_path is None:
+            adapter_path = _save_adapter(model, exp_dir, step_idx, directory_name="adapter_initial")
+        else:
+            adapter_path = str(Path(sampling_adapter_path))
+            if not Path(adapter_path).is_dir():
+                raise FileNotFoundError(f"SPO-RS sampling adapter not found: {adapter_path}")
+    elif gen_pool is not None:
+        adapter_path = _save_adapter(model, exp_dir, step_idx)
+
+    frozen_pass = None
+    if getattr(cfg, "frozen_solver", False):
+        frozen_pass = _run_frozen_search_pass(
+            backend, model, strategy_tokenizer or tokenizer, sampler, optimizer,
+            step_idx, cfg, exp_dir, problem, gen_pool, strategy_pool, parallel_trainer)
+    parents = sampler.sample_states(int(cfg.groups_per_step), selection_step=step_idx)
+    if step_idx == 0 and frozen_pass is None:
         _rebind_interrupted_step_zero_selection(sampler, exp_dir, parents)
-    frozen_solver = bool(getattr(cfg, "frozen_solver", False))
     print(f"\n[step {step_idx}] parents picked: {len(parents)}")
     for i, info in enumerate(sampler.last_picks_info):
         tag = "seed" if info["is_seed"] else "expanded"
@@ -1867,34 +2241,11 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
     parent_ctxs = []
     base_messages = []
 
-    for g, parent in enumerate(parents):
+    for parent in parents:
         sampler.record_expansion(parent, count=int(cfg.group_size))
-        pc = ParentContext(
-            code=parent.code,
-            value=parent.value if parent.value is not None else 0.0,
-            raw_score=parent.raw_score,
-            construction=parent.construction,
-            observation=parent.observation,
-            previous_raw_score=parent.previous_raw_score,
-            poisson=parent.poisson,
-        )
+        pc = _parent_context(parent)
         parent_ctxs.append(pc)
         base_messages.append(problem.build_prompt(pc))
-
-    # SPO-RS needs immutable consecutive policy versions. Binary-coder mode
-    # likewise reuses the adapter saved after the preceding update; once its
-    # initialization window closes, this is the frozen rollout policy for the
-    # rest of the discovery run. Only a fresh run needs an initial snapshot.
-    adapter_path = None
-    if spo_rs_mode:
-        if sampling_adapter_path is None:
-            adapter_path = _save_adapter(model, exp_dir, step_idx, directory_name="adapter_initial")
-        else:
-            adapter_path = str(Path(sampling_adapter_path))
-            if not Path(adapter_path).is_dir():
-                raise FileNotFoundError(f"SPO-RS sampling adapter not found: {adapter_path}")
-    elif gen_pool is not None:
-        adapter_path = _save_adapter(model, exp_dir, step_idx)
 
     coder_effort = getattr(cfg, "coder_reasoning_effort", None)
 
@@ -1937,21 +2288,6 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                     "the model tokenizer files")
             return tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
 
-    strategy_tokenizer = strategy_tokenizer or tokenizer
-
-    def _render_strategy(messages):
-        try:
-            return strategy_tokenizer.apply_chat_template(
-                messages, tokenize=False, add_generation_prompt=True,
-                enable_thinking=cfg.strategy_thinking,
-                reasoning_effort=cfg.strategy_reasoning_effort,
-            )
-        except TypeError as exc:
-            raise RuntimeError(
-                f"The frozen {cfg.strategy_model_name} solver needs a chat template "
-                f"that supports reasoning_effort={cfg.strategy_reasoning_effort} "
-                "with thinking enabled.") from exc
-
     prompt_jobs = []
     for g, _parent in enumerate(parents):
         messages = base_messages[g]
@@ -1963,12 +2299,6 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
             "coder_reasoning_effort": coder_effort,
             "count": count,
         })
-
-    frozen_prompts = [_render_strategy(messages) for messages in base_messages] if frozen_solver else []
-    frozen_count = int(cfg.frozen_programs_per_parent) if frozen_solver else 0
-    frozen_dir = Path(exp_dir) / "frozen_solver"
-    frozen_rollouts = []
-    frozen_valid = 0
 
     spo_rs_divergence = 0.0
     spo_rs_context_divergences = {}
@@ -1995,48 +2325,8 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
     # parallel across cores. THREAD-SAFETY REQUIREMENT: each compute_reward call
     # must use a unique temp file/dir and must not os.chdir or mutate shared
     # state; otherwise concurrent runs corrupt each other's rewards.
-    from runtime.host_memory import HostMemoryAdmission
-    host_admission = getattr(parallel_trainer, "host_memory_admission", None)
-    if host_admission is None:
-        host_admission = getattr(gen_pool, "host_memory_admission", None)
-    if host_admission is None:
-        import multiprocessing
-        host_admission = HostMemoryAdmission(multiprocessing.get_context("spawn"), hardware_profile=cfg.hardware_profile)
-    isolated_eval = bool(getattr(cfg, "isolate_eval", False))
-    isolated_cpu_slots = None
-    isolated_cpu_count = 0
-    isolated_processes_per_cpu = 0
-    isolated_memory_limit_bytes = None
-    if isolated_eval:
-        isolated_cpu_ids = _isolated_evaluation_cpu_ids(cfg)
-        isolated_cpu_count = len(isolated_cpu_ids)
-        isolated_processes_per_cpu = int(cfg.reward_workers)
-        isolated_cpu_slots = Queue()
-        # Layered admission is intentional: put one candidate on every CPU
-        # before allowing a second on each CPU, and so on.
-        for _layer in range(isolated_processes_per_cpu):
-            for cpu_id in isolated_cpu_ids:
-                isolated_cpu_slots.put(cpu_id)
-        isolated_capacity = isolated_cpu_count * isolated_processes_per_cpu
-        n_reward_workers = max(1, min(total_rollouts, isolated_capacity))
-        isolated_memory_limit_bytes = (_automatic_sandbox_memory_limit_bytes(n_reward_workers))
-        setting_log_only(
-            f"[step {step_idx}] isolated evaluation pool: "
-            f"{n_reward_workers} sandbox process(es) across "
-            f"{isolated_cpu_count} CPU(s), up to "
-            f"{isolated_processes_per_cpu}/CPU from reward_workers; each "
-            "process tree is pinned to one CPU and excess candidates remain "
-            "queued; live RAM admission is shared with model transfers and "
-            f"activation offload; RAM reservation="
-            f"{min(1024**3, isolated_memory_limit_bytes) / 1024**3:.2f} GiB/process; "
-            f"automatic address-space ceiling="
-            f"{isolated_memory_limit_bytes / 1024**3:.2f} GiB/process, "
-            "stdout+stderr capture is bounded")
-    else:
-        n_reward_workers = _resolve_reward_workers(cfg, problem)
-        print(f"[step {step_idx}] evaluation pool: {n_reward_workers} worker(s), "
-              f"{getattr(problem, 'eval_cpus', 1)} CPU(s) per candidate")
-    reward_pool = ThreadPoolExecutor(max_workers=n_reward_workers)
+    reward_pool, submit_reward, evaluation_stats = _open_reward_pool(
+        cfg, problem, total_rollouts, step_idx, gen_pool, parallel_trainer)
     # Large response/prompt files are persisted as soon as generation returns,
     # on a dedicated thread so disk I/O never blocks the generation scheduler.
     # The complete reward/advantage metadata replaces the provisional metadata
@@ -2095,36 +2385,11 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
     queued_by_parent = {g: 0 for g in range(len(parents))}
     defer_gpu_evaluation = bool(getattr(cfg, "evaluation_shares_generation", False))
 
-    def _run_isolated_reward(response_text, parent_ctx, **answer_options):
-        with host_admission.reservation(min(1024**3, isolated_memory_limit_bytes)):
-            cpu_id = isolated_cpu_slots.get()
-            try:
-                return problem.compute_reward(
-                    response_text, parent_ctx, cfg.sandbox_timeout_s,
-                    cpu_id=cpu_id,
-                    memory_limit_bytes=isolated_memory_limit_bytes, **answer_options)
-            finally:
-                isolated_cpu_slots.put(cpu_id)
-
-    def _submit_reward(text, parent_group, final_text, format_issue):
-        answer_options = {} if final_text is None else {"final_answer_text": final_text}
-        if format_issue is not None:
-            fut = Future()
-            fut.set_result(RewardResult(
-                reward=float(problem.fail_score), msg=format_issue, failure_kind="code"))
-            return fut
-        if isolated_eval:
-            return reward_pool.submit(
-                _run_isolated_reward, text, parent_ctxs[parent_group], **answer_options)
-        return reward_pool.submit(
-            problem.compute_reward, text, parent_ctxs[parent_group],
-            cfg.sandbox_timeout_s, **answer_options)
-
     def _submit_rollout(record):
         g = int(record["group_id"])
         group_responses[g].append(record)
-        fut = _submit_reward(
-            record["text"], record["parent_group"], record["_final_answer_text"],
+        fut = submit_reward(
+            record["text"], parent_ctxs[record["parent_group"]], record["_final_answer_text"],
             record["output_format_issue"])
         reward_futures[g].append(fut)
         record["_reward_future"] = fut
@@ -2132,58 +2397,6 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
             lambda completed, rollout=record:
             _record_evaluation_completion(completed, rollout))
         return fut
-
-    def _submit_frozen_reward(record):
-        record["reward_future"] = _submit_reward(
-            record["text"], record["parent_group"], record["final_text"],
-            record["meta"]["output_format_issue"])
-
-    def _queue_frozen_rollout(group, index, text, token_ids):
-        token_ids = list(token_ids)
-        prompt = frozen_prompts[group]
-        final_text = native_final_answer_scope(
-            strategy_tokenizer, token_ids, prompt_text=prompt,
-            require_final_marker=bool(cfg.strategy_thinking))
-        parent = parents[group]
-        meta = {
-            "solver": "frozen",
-            "model_name": cfg.strategy_model_name,
-            "status": "evaluation_pending",
-            "step": step_idx,
-            "group": group,
-            "parent_group": group,
-            "rollout": index,
-            "parent_id": parent.id,
-            "parent_raw_score": parent.raw_score,
-            "n_response_tokens": len(token_ids),
-            "output_format_issue": coder_output_issue(text, final_answer_text=final_text),
-        }
-        rollout_io_futures.append(rollout_io_pool.submit(
-            save_rollout_artifacts, frozen_dir, step_idx, group, index, text,
-            prompt_text=prompt, response_token_ids=token_ids, pending_meta=meta,
-        ))
-        record = {
-            "parent_group": group,
-            "index": index,
-            "text": text,
-            "final_text": final_text,
-            "meta": meta,
-        }
-        frozen_rollouts.append(record)
-        if not defer_gpu_evaluation:
-            _submit_frozen_reward(record)
-
-    def _consume_frozen_results(batches):
-        counts = [0] * len(frozen_prompts)
-        for group, responses in batches:
-            group = int(group)
-            if not 0 <= group < len(counts) or counts[group] + len(responses) > frozen_count:
-                raise RuntimeError("unexpected frozen solver rollout count")
-            for text, token_ids in responses:
-                _queue_frozen_rollout(group, counts[group], text, token_ids)
-                counts[group] += 1
-        if any(count != frozen_count for count in counts):
-            raise RuntimeError("frozen solver omitted rollouts")
 
     def _queue_rollout(job_idx, text, token_ids, behavior_logprobs=None):
         # Record malformed responses with the failure reward.
@@ -2255,22 +2468,6 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
     try:
         try:
             if gen_pool is not None:
-                if frozen_solver:
-                    frozen_pool = strategy_pool or gen_pool
-                    try:
-                        _consume_frozen_results(frozen_pool.iter_group_jobs(
-                            prompts_by_group=frozen_prompts, group_size=frozen_count,
-                            counts_by_group=[frozen_count] * len(frozen_prompts), adapter_path=None,
-                            max_new_tokens=int(cfg.strategy_max_new_tokens),
-                            temperature=float(cfg.strategy_temperature), top_p=float(cfg.strategy_top_p),
-                            top_k=getattr(cfg, "strategy_sampling_top_k", None),
-                            min_p=getattr(cfg, "strategy_sampling_min_p", None),
-                            step_idx=step_idx + 2_000_000, progress_desc="frozen solver",
-                        ))
-                    finally:
-                        if frozen_pool is not gen_pool:
-                            frozen_pool.release()
-
                 generation_options = {
                     "prompts_by_group": [job["prompt_text"] for job in prompt_jobs],
                     "group_size": cfg.group_size,
@@ -2301,21 +2498,6 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                 def _seed_local_generation(seed_step):
                     if cfg.deterministic:
                         torch.manual_seed((int(cfg.seed) * 1_000_003 + int(seed_step) * 1009 + 13) % (2**31 - 1))
-
-                if frozen_solver:
-                    frozen_cfg = SimpleNamespace(**vars(cfg))
-                    frozen_cfg.advantage_mode = "entropic"
-                    frozen_cfg.max_seq_length = int(cfg.strategy_max_seq_length)
-                    _seed_local_generation(step_idx + 2_000_000)
-                    with backend.disable_adapter():
-                        _consume_frozen_results(generate_prompt_jobs(
-                            model, strategy_tokenizer, frozen_prompts,
-                            [frozen_count] * len(frozen_prompts), frozen_cfg,
-                            max_new_tokens=int(cfg.strategy_max_new_tokens),
-                            temperature=float(cfg.strategy_temperature), top_p=float(cfg.strategy_top_p),
-                            top_k=getattr(cfg, "strategy_sampling_top_k", None),
-                            min_p=getattr(cfg, "strategy_sampling_min_p", None),
-                        ))
 
                 _seed_local_generation(step_idx)
                 gen_bar = make_progress_bar(total_rollouts, desc="rollouts")
@@ -2478,35 +2660,13 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                 else:
                     gen_pool.release()
 
-        if deferred_rollouts or (defer_gpu_evaluation and frozen_rollouts):
-            if getattr(problem, "problem_type", "") == "trimul":
-                problem.begin_evaluation_batch()
-            print(f"[step {step_idx}] releasing trainer memory before "
-                  f"{len(deferred_rollouts) + len(frozen_rollouts)} benchmark(s); "
-                  "one benchmark at a time per evaluation GPU")
-            try:
-                torch.cuda.synchronize()
-                _move_optimizer_state(optimizer, "cpu", hardware_profile=getattr(cfg, "hardware_profile", "RTX6000"))
-                backend.offload_for_generation()
-                import gc
-                gc.collect()
-                torch.cuda.empty_cache()
-                torch.cuda.ipc_collect()
-                evaluation_trainer_offloaded = True
-            except Exception as exc:
-                try:
-                    backend.restore_after_generation()
-                    _restore_optimizer_state_to_parameters(optimizer)
-                except Exception:
-                    pass
-                raise RuntimeError(
-                    "shared-GPU evaluation requires the trainer to offload before "
-                    "candidate benchmark evaluation, but this model/runtime "
-                    "cannot move the training state to CPU") from exc
+        if deferred_rollouts:
+            evaluation_trainer_offloaded = _prepare_gpu_evaluation(
+                backend, optimizer, cfg, problem, step_idx, len(deferred_rollouts),
+                trainer_parked=(not training_enabled and cfg.generation_backend == "vllm"
+                                and getattr(gen_pool, "sequential", False)))
             for record in deferred_rollouts:
                 _submit_rollout(record)
-            for record in frozen_rollouts:
-                _submit_frozen_reward(record)
 
         all_futs = [f for g in range(num_groups) for f in reward_futures[g]]
         try:
@@ -2700,14 +2860,6 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
             wait(all_futs)
             with eval_progress_condition:
                 eval_progress_condition.wait_for(lambda: eval_progress_completed >= len(all_futs))
-            for record in frozen_rollouts:
-                result = record["reward_future"].result()
-                frozen_valid += int(result.valid)
-                rollout_io_futures.append(rollout_io_pool.submit(
-                    save_rollout, frozen_dir, step_idx, record["parent_group"], record["index"],
-                    record["text"], _evaluated_rollout_meta(record["meta"], result),
-                    artifacts_already_saved=True,
-                ))
         finally:
             eval_bar.close()
             eval_bar_closed = True
@@ -2717,23 +2869,13 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
         if not eval_bar_closed:
             eval_bar.close()
         if evaluation_trainer_offloaded:
-            print(f'[step {step_idx}] restoring trainer after shared-GPU benchmark evaluation')
-            import gc
-            gc.collect()
-            torch.cuda.empty_cache()
-            backend.restore_after_generation()
-            _restore_optimizer_state_to_parameters(optimizer)
-            backend.set_training_mode()
+            _restore_after_gpu_evaluation(backend, optimizer, step_idx)
 
     # Surface an unlikely disk failure before constructing the checkpoint.
     # In the normal path every write completed concurrently with generation or
     # evaluation, so this is only a non-blocking correctness barrier.
     for save_future in rollout_io_futures:
         save_future.result()
-    if frozen_solver:
-        print(f"[step {step_idx}] frozen solver evaluated {len(frozen_rollouts)} programs "
-              f"({frozen_valid} valid)", flush=True)
-
     if spo_rs_mode and not training_enabled:
         # With policy optimization disabled, consecutive policies are exactly
         # identical even though the selected parents may be new.
@@ -3055,7 +3197,9 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
     # Keep the previous raw optimum so the status line can distinguish a new
     # run best from a step that merely repeats the best-ever value.
     previous_best_raw = sampler.best_raw_state(maximize=bool(problem.maximize))
-    previous_best_value = (float(previous_best_raw.raw_score) if previous_best_raw is not None else None)
+    previous_best_value = (
+        frozen_pass["previous_best_raw"] if frozen_pass is not None else
+        float(previous_best_raw.raw_score) if previous_best_raw is not None else None)
 
     # Update archive
     sampler.update(all_children)
@@ -3065,32 +3209,12 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
     # later by deduplication or archive caps, so the per-step result reflects
     # what was actually evaluated rather than only what survived the archive.
     step_states = [child for child, _parent in all_children]
-    step_raw_states = []
-    for child in step_states:
-        try:
-            raw_score = float(child.raw_score)
-        except (TypeError, ValueError):
-            continue
-        if math.isfinite(raw_score):
-            step_raw_states.append(child)
-    if step_raw_states:
-        step_best_result = (
-            max(step_raw_states, key=lambda state: float(state.raw_score))
-            if problem.maximize else
-            min(step_raw_states, key=lambda state: float(state.raw_score))
-        )
-        step_best_raw_score = float(step_best_result.raw_score)
-    elif step_states:
-        # Generic fallback for a problem that exposes only the normalized
-        # higher-is-better reward and no native raw metric.
-        step_best_result = max(
-            step_states,
-            key=lambda state: (float(state.value) if state.value is not None else -math.inf),
-        )
-        step_best_raw_score = None
-    else:
-        step_best_result = None
-        step_best_raw_score = None
+    if frozen_pass is not None and frozen_pass["best"] is not None:
+        step_states.append(SimpleNamespace(**frozen_pass["best"]))
+    step_best_result = _step_best_candidate(step_states, problem.maximize)
+    step_best_raw_score = (
+        float(step_best_result.raw_score)
+        if step_best_result is not None and step_best_result.raw_score is not None else None)
 
     # Report the problem-native metric before waiting for streamed backward. This
     # is deliberately separate from reward: some problems maximize the raw
@@ -3215,10 +3339,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
         "best_seen_step": (int(best_seen_result.timestep) if best_seen_result is not None else None),
         "valid_fraction": float(valid_fraction),
         "code_valid_fraction": float(code_valid_fraction),
-        "evaluation_isolated": isolated_eval,
-        "evaluation_workers": int(n_reward_workers),
-        "evaluation_cpu_count": int(isolated_cpu_count),
-        "evaluation_processes_per_cpu": int(isolated_processes_per_cpu),
+        **evaluation_stats,
     }
     if spo_rs_mode:
         step_stats["spo_rs_updates"] = spo_rs_updates
@@ -3229,9 +3350,8 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
         step_stats["spo_rs_sampling_adapter"] = Path(adapter_path).name
         step_stats["spo_rs_policy_updated"] = False
 
-    if frozen_solver:
-        step_stats["frozen_rollouts"] = len(frozen_rollouts)
-        step_stats["valid_frozen_rollouts"] = frozen_valid
+    if frozen_pass is not None:
+        step_stats.update(frozen_pass["stats"])
 
     if not training_enabled:
         step_stats["training_disabled"] = True
@@ -3793,8 +3913,8 @@ def main():
             # starve the packed-MXFP4 trainer's fused dequant workspace.  A
             # fresh rollout pool is faster overall than training every step
             # through the OOM-driven unfused fallback.
-            # TriMul benchmarks use every rollout GPU after the coder exits.
-            vllm_persistent_workers=(0 if getattr(problem, "problem_type", "") == "trimul"
+            # Shared benchmark GPUs must be released by generation.
+            vllm_persistent_workers=(0 if cfg.evaluation_shares_generation
                                      else _coder_vllm_persistent_workers(cfg)),
             # Distinct strategist/coder pools share the same cards. Account
             # for a sleeping pool's residual CUDA/NCCL state.
@@ -4030,7 +4150,9 @@ def main():
                 # the coder resident and stop the strategist processes before
                 # the coder wakes.
                 strategy_persistent_workers = getattr(cfg, "strategy_vllm_persistent_workers", None)
-                if str(getattr(cfg, "coder_model_profile", "")).lower() == ("gpt-oss-120b"):
+                if cfg.evaluation_shares_generation:
+                    strategy_persistent_workers = 0
+                elif str(getattr(cfg, "coder_model_profile", "")).lower() == "gpt-oss-120b":
                     strategy_persistent_workers = 0
                     setting_log_only(
                         "[memory] GPT-OSS-120B coder: local strategist "
@@ -4172,18 +4294,23 @@ def main():
                                    parallel_trainer, gen_pool, strategy_pool,
                                    prepare_jev_trainer)
 
+            frozen_pass = None
+            if cfg.frozen_solver and (interrupted_spo_rs_artifacts or pending_spo_rs_artifacts):
+                frozen_pass = _restore_frozen_archive(sampler, exp_dir, step)
+                if frozen_pass is None:
+                    raise RuntimeError("coder rollout recovery requires the saved post-frozen archive")
             if interrupted_spo_rs_artifacts is not None:
                 stats = _resume_spo_rs_step_from_artifacts(
                     model, tokenizer, sampler, step,
                     step_cfg, exp_dir, problem, parallel_trainer,
                     spo_rs_tracker, current_policy_adapter_path,
                     interrupted_spo_rs_artifacts,
-                    evaluation_complete=step_plotter.submit)
+                    evaluation_complete=step_plotter.submit, frozen_pass=frozen_pass)
             elif pending_spo_rs_artifacts is not None:
                 print(
                     f"[resume] found {len(pending_spo_rs_artifacts)} exact "
                     f"saved trajectories for interrupted SPO-RS step {step}; "
-                    "skipping strategist and coder generation",
+                    "reusing the saved generation batch",
                     flush=True,
                 )
                 completed_spo_rs_artifacts = (
@@ -4201,7 +4328,7 @@ def main():
                     step_cfg, exp_dir, problem, parallel_trainer,
                     spo_rs_tracker, current_policy_adapter_path,
                     completed_spo_rs_artifacts,
-                    evaluation_complete=step_plotter.submit)
+                    evaluation_complete=step_plotter.submit, frozen_pass=frozen_pass)
             else:
                 stats = train_step(
                     backend, model, tokenizer, sampler, optimizer, step,
@@ -4251,6 +4378,8 @@ def main():
                 **(stats or {}),
             }
             save_step_summary(exp_dir, step, step_summary)
+            if cfg.frozen_solver:
+                _frozen_archive_path(exp_dir, step).unlink(missing_ok=True)
             append_step_result(exp_dir, step, step_summary)
             current_policy_adapter_path = Path(adapter_path)
             removed_adapters = _prune_adapter_snapshots(
