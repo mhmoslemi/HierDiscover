@@ -13,7 +13,6 @@ from typing import Any, List, Optional
 
 from evaluation.reward import extract_python_code
 from evaluation.sandbox import run_code
-from prompts.utils import coder_messages, strategy_messages
 
 
 # ----------------------------------------------------------------------
@@ -26,6 +25,7 @@ class SeedState:
     value: float = 0.0                 # reward (higher=better), used by the sampler
     raw_score: Optional[float] = None  # true metric, shown in the prompt
     construction: Optional[list] = None  # injected global (height_sequence_1 / initial_h_values)
+    poisson: Optional[float] = None
 
 
 @dataclass
@@ -36,6 +36,8 @@ class ParentContext:
     raw_score: Optional[float] = None
     construction: Optional[list] = None
     observation: str = ""
+    previous_raw_score: Optional[float] = None
+    poisson: Optional[float] = None
 
 
 @dataclass
@@ -54,6 +56,7 @@ class RewardResult:
     # program rejected by the scientific verifier; timeout/infrastructure are
     # distinct from code failures.
     failure_kind: str = ""
+    poisson: Optional[float] = None
 
 
 def is_code_failure(res) -> bool:
@@ -89,7 +92,6 @@ class Problem(ABC):
     # optimizers, so a replay need not reproduce them. Circle packing and
     # gpu_mode carry no construction at all, and their programs are the artifact.
     saves_construction: bool = False
-    two_stage_rollouts: bool = False
 
     def __init__(self, cfg: dict):
         self.cfg = dict(cfg or {})
@@ -110,15 +112,6 @@ class Problem(ABC):
     def build_prompt(self, parent: ParentContext) -> List[dict]:
         """Build the chat messages for one parent state."""
         ...
-
-    def build_strategy_messages(
-            self, messages: List[dict],
-            previous_strategies: Optional[List[str]] = None) -> List[dict]:
-        return strategy_messages(messages, previous_strategies)
-
-    def build_code_messages(self, messages: List[dict],
-                            strategy: str) -> List[dict]:
-        return coder_messages(messages, strategy)
 
     @abstractmethod
     def preprocess(self, code: str, parent: ParentContext) -> str:

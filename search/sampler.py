@@ -78,10 +78,13 @@ class State:
     raw_score: float = None      # true metric for prompt display (may equal value)
     construction: list = None    # injected global threaded parent -> child
     observation: str = ""        # evaluator output shown when this state is a parent
+    previous_raw_score: float | None = None
+    poisson: float | None = None
 
     @staticmethod
     def make(timestep, value, code, parents=None, is_seed=False,
-             raw_score=None, construction=None, observation=""):
+             raw_score=None, construction=None, observation="",
+             previous_raw_score=None, poisson=None):
         return State(
             id=str(uuid.uuid4()),
             timestep=timestep,
@@ -92,6 +95,8 @@ class State:
             raw_score=raw_score,
             construction=construction,
             observation=str(observation or ""),
+            previous_raw_score=previous_raw_score,
+            poisson=poisson,
         )
 
 
@@ -131,6 +136,7 @@ class PUCTSampler:
                     is_seed=True,
                     raw_score=getattr(ss, "raw_score", None),
                     construction=getattr(ss, "construction", None),
+                    poisson=getattr(ss, "poisson", None),
                 )
                 self._states.append(s)
                 self._seed_ids.add(s.id)
@@ -338,6 +344,8 @@ class PUCTSampler:
                     "is enabled")
 
         with self._lock:
+            for child, parent in children_with_parents:
+                child.previous_raw_score = parent.raw_score
             # Do this before deduplication/pruning: every successfully evaluated
             # child counts toward the run's problem-native best-ever value.
             self._record_raw_states(

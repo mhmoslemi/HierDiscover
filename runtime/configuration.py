@@ -16,6 +16,7 @@ from config_validation import (
 )
 from runtime.hardware_profiles import generation_cpu_ids, local_checkpoint, restore_hardware_settings
 
+from prompts.base import UPSTREAM_COMMIT
 from models.strategist_models import (
     STRATEGY_MODEL_NAME, STRATEGY_REASONING_EFFORT, resolve_strategy_token_limits,
 )
@@ -170,9 +171,9 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         help="Training backend. 'vllm' is shorthand for HF+PEFT training plus "
              "vLLM rollout generation (vLLM itself does not backpropagate).")
     p.add_argument(
-        "--strategies", action="store_const", const=True, default=None,
-        help=f"Generate sequential plans with frozen {STRATEGY_MODEL_NAME} "
-             f"at {STRATEGY_REASONING_EFFORT} before generating programs with the coder.")
+        "--strategies", dest="frozen_solver", action="store_true",
+        help=f"Also evaluate programs sampled from frozen {STRATEGY_MODEL_NAME} "
+             f"at {STRATEGY_REASONING_EFFORT} using the same task prompts as the coder.")
     p.add_argument(
         "--fused-long-attention", action="store_const", const=True,
         default=None,
@@ -207,15 +208,8 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--num-steps", type=int, default=None, help="Number of TTT-Discover steps (paper: 50)")
     p.add_argument("--groups-per-step", type=int, default=None, help='Parent states per step.')
     p.add_argument("--group-size", type=int, default=None, help='Rollouts per parent group.')
-    p.add_argument("--strategies-per-parent", type=int, default=None,
-                   help="Sequential diverse strategies generated per parent.")
-    p.add_argument("--programs-per-strategy", type=int, default=None,
-                   help="LoRA-policy code rollouts sampled from each strategy.")
-    p.add_argument(
-        "--strategy-archive-top-r", type=int, default=None,
-        help="With --strategies, admit only the top-r valid unique programs "
-             "from each generated strategy before applying the existing "
-             "topk_children_per_parent archive limit.")
+    p.add_argument("--frozen-programs-per-parent", "--strategies-per-parent", type=int, default=None,
+                   help="Independent programs to evaluate per parent with the frozen solver.")
     p.add_argument("--num-seed-states", type=int, default=None)
     p.add_argument("--parent-selection", choices=PARENT_SELECTION_MODES, default=None,
                    help="Override the YAML picker. On resume, PUCT can switch "
@@ -486,6 +480,9 @@ def load_config():
         reject_retired_coder_cap(saved, source=saved_config_path)
         saved.pop(LEGACY_CODER_CAP_KEY, None)
         saved.pop(_RETIRED_STRATEGY_RETRY_KEY, None)
+        for key in ("strategies", "strategies_per_parent", "programs_per_strategy",
+                    "strategy_archive_top_r", "strict_strategy_validation"):
+            saved.pop(key, None)
 
     # The launcher defaults to erdos. Direct Python calls use the same selection
     # when neither --config nor --problem is provided.
@@ -615,7 +612,8 @@ def load_config():
         if args.spo_rs_clip_epsilon_high is None:
             merged["spo_rs_clip_epsilon_high"] = args.spo_rs_clip_epsilon
     # Trainer/evaluator modes are launch-scoped.
-    merged["strategies"] = bool(args.strategies)
+    merged["frozen_solver"] = bool(args.frozen_solver)
+    merged["rollout_prompt_revision"] = UPSTREAM_COMMIT
     merged["fused_long_attention"] = bool(args.fused_long_attention)
     merged.pop("measure_entropy", None)
     merged["no_train"] = bool(args.no_train)
@@ -663,42 +661,24 @@ def load_config():
         raise ValueError(f"advantage_mode must be one of {ADVANTAGE_MODES}")
     merged["advantage_mode"] = advantage_mode
     merged["uct"] = bool(merged.get("uct", False))
-    strict_strategy_validation = merged.get("strict_strategy_validation", False)
-    if not isinstance(strict_strategy_validation, bool):
-        raise ValueError("strict_strategy_validation must be a boolean")
-    merged["strict_strategy_validation"] = strict_strategy_validation
-    if merged["strategies"]:
+    if merged["frozen_solver"]:
         merged.setdefault("strategy_temperature", 1.0)
         merged.setdefault("strategy_top_p", 1.0)
         strategy_model_name = local_checkpoint(STRATEGY_MODEL_NAME, merged["hardware_profile"])
-        strategies_per_parent = int(merged["strategies_per_parent"])
-        programs_per_strategy = int(merged["programs_per_strategy"])
-        strategy_archive_top_r = int(merged["strategy_archive_top_r"])
+        frozen_programs_per_parent = int(merged["frozen_programs_per_parent"])
         strategy_max_seq_length, strategy_max_new_tokens = resolve_strategy_token_limits(
             merged.get("strategy_max_seq_length", "auto"),
             merged.get("strategy_max_new_tokens", "auto"))
         strategy_temperature = float(merged["strategy_temperature"])
         strategy_top_p = float(merged["strategy_top_p"])
-        if (strategies_per_parent < 1 or programs_per_strategy < 1
-                or strategy_archive_top_r < 1
-                or strategy_max_new_tokens < 1
-                or strategy_max_seq_length < 1):
-            raise ValueError("strategy counts and token limits must be positive")
+        if min(frozen_programs_per_parent, strategy_max_new_tokens, strategy_max_seq_length) < 1:
+            raise ValueError("frozen solver rollout count and token limits must be positive")
         if strategy_temperature <= 0.0:
             raise ValueError("strategy_temperature must be positive")
         if not 0.0 < strategy_top_p <= 1.0:
             raise ValueError("strategy_top_p must be in (0, 1]")
-        effective_group_size = (strategies_per_parent * programs_per_strategy)
-        if (int(merged.get("group_size", effective_group_size)) != effective_group_size):
-            print(f"[config] hierarchical rollout group size derived as "
-                  f"{strategies_per_parent} strategies x "
-                  f"{programs_per_strategy} programs = "
-                  f"{effective_group_size}; replacing configured group_size="
-                  f"{merged.get('group_size')}")
         merged["strategy_model_name"] = strategy_model_name
-        merged["strategies_per_parent"] = strategies_per_parent
-        merged["programs_per_strategy"] = programs_per_strategy
-        merged["strategy_archive_top_r"] = strategy_archive_top_r
+        merged["frozen_programs_per_parent"] = frozen_programs_per_parent
         merged["strategy_max_new_tokens"] = strategy_max_new_tokens
         merged["strategy_max_seq_length"] = strategy_max_seq_length
         merged["strategy_temperature"] = strategy_temperature
@@ -706,7 +686,6 @@ def load_config():
         merged["strategy_thinking"] = True
         merged["strategy_reasoning_effort"] = STRATEGY_REASONING_EFFORT
         merged["strategy_vllm_quantization"] = str(merged.get('strategy_vllm_quantization') or '').strip()
-        merged["group_size"] = effective_group_size
     # Use zero in config to disable top-k filtering in both backends.
     merged["sampling_top_k"] = 0
     if "min_p" in merged:
@@ -912,7 +891,7 @@ def load_config():
     # sharded across the exact same GPU inventory.
     if generation_backend == "vllm":
         separate_local_strategy_pool = bool(
-            merged["strategies"]
+            merged["frozen_solver"]
             and (merged["strategy_model_name"] != coder_name
                  or merged["hardware_profile"] == "B200"
                  or merged["strategy_max_seq_length"] != merged["max_seq_length"]
@@ -955,7 +934,7 @@ def load_config():
                   f"about {layout.unsharded_stage_required_gib:.1f} GiB/GPU "
                   f"within the {layout.budget_gib:.1f} GiB budget")
 
-        if merged["strategies"]:
+        if merged["frozen_solver"]:
             strategy_name = merged["strategy_model_name"]
             strategy_layout_cfg = dict(merged)
             strategy_layout_cfg.update({
@@ -967,11 +946,7 @@ def load_config():
             strategy_heads = detect_attention_heads(strategy_name)
             memory_strategy_layout = derive_vllm_parallel_layout(
                 strategy_layout_cfg, roles, memory, strategy_heads, model_name=strategy_name)
-            # Strategies inside one parent are sequential, so the number of
-            # parents, rather than strategies_per_parent, is the largest live
-            # request frontier. Fold replicas above it into TP/PP ranks rather
-            # than leaving their GPUs idle for every dependent stage.
-            strategy_frontier = int(merged["groups_per_step"])
+            strategy_frontier = int(merged["groups_per_step"]) * int(merged["frozen_programs_per_parent"])
             strategy_layout = align_vllm_layout_to_concurrency(
                 strategy_layout_cfg,
                 memory_strategy_layout,
@@ -1011,8 +986,8 @@ def load_config():
                   f"TP={strategy_layout.tensor_parallel_size}, "
                   f"PP={strategy_layout.pipeline_parallel_size}"
                   f"{frontier_note}")
-    elif merged["strategies"] and merged["strategy_model_name"] != coder_name:
-        raise ValueError(f"Using the {STRATEGY_MODEL_NAME} strategist with a different coder "
+    elif merged["frozen_solver"] and merged["strategy_model_name"] != coder_name:
+        raise ValueError(f"Using the frozen {STRATEGY_MODEL_NAME} solver with a different coder "
                          "requires generation_backend=vllm")
 
     for note in resolve_memory_settings(merged, roles, memory, model_name=coder_name):

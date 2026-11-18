@@ -1,9 +1,13 @@
-"""Task instructions for the NVIDIA MLA decode kernel."""
+"""Upstream TTT-Discover task for mla_decode_nvidia."""
+
+
+TARGET = 1700
 
 
 TASK_PROMPT = """{description}
-{arch_section}
+
 {state_ctx}
+
 {rules}
 """
 

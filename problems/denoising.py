@@ -60,9 +60,12 @@ class Denoising(Problem):
     def build_prompt(self, parent: ParentContext) -> List[dict]:
         from examples.denoising.utils import EVALUATE_MSE_FUNC, EVALUATE_POISSON_FUNC
 
-        value_ctx = ""
+        metrics = []
         if parent.raw_score is not None:
-            value_ctx = denoising.PARENT_SCORE.format(score=parent.raw_score)
+            metrics.append(denoising.PARENT_MSE.format(score=parent.raw_score))
+        if parent.poisson is not None:
+            metrics.append(denoising.PARENT_POISSON.format(score=parent.poisson))
+        value_ctx = denoising.PARENT_METRICS.format(metrics=", ".join(metrics)) if metrics else ""
 
         if parent.code and parent.code.strip():
             clean_code = parent.code.strip()
@@ -81,7 +84,6 @@ class Denoising(Problem):
         user = denoising.TASK_PROMPT.format(
             evaluate_mse=EVALUATE_MSE_FUNC,
             evaluate_poisson=EVALUATE_POISSON_FUNC,
-            eval_cpus=self.eval_cpus,
             code_section=code_section,
         )
         return [{"role": "user", "content": user}]
@@ -148,6 +150,7 @@ def run_denoising():
         current_mse = mse if mse is not None else float("inf")
         res.valid = True
         res.raw_score = float(current_mse)
+        res.poisson = float(poisson)
         res.reward = float(1.0 / current_mse) if current_mse > 0 else self.fail_score
         res.construction = []  # not reused
         res.msg = f"mse={current_mse}, poisson={poisson}"
@@ -163,5 +166,6 @@ def run_denoising():
             code = ""  # bio stack absent; model will write from scratch
         baseline_mse = 0.2316  # value used in create_initial_state
         value = float(1.0 / baseline_mse)
-        return [SeedState(code=code, value=value, raw_score=baseline_mse, construction=[])
+        return [SeedState(code=code, value=value, raw_score=baseline_mse,
+                          construction=[], poisson=0.0370)
                 for _ in range(self.num_seed_states)]

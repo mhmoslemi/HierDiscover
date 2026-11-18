@@ -29,8 +29,7 @@ vllm_enforce_eager vllm_enable_prefix_caching vllm_tensor_parallel_size
 vllm_pipeline_parallel_size vllm_quantization
 vllm_max_num_batched_tokens vllm_enable_expert_parallel vllm_sleep_level
 vllm_staged_loading strategy_vllm_sleep_level strategy_vllm_staged_loading
-num_steps groups_per_step group_size strategies_per_parent
-programs_per_strategy strategy_archive_top_r
+num_steps groups_per_step group_size frozen_programs_per_parent
 num_seed_states learning_rate adam_beta1 adam_beta2 adam_epsilon weight_decay
 kl_penalty_coef grad_clip
 spo_rs_beta logprob_chunk
@@ -50,7 +49,6 @@ COMMON_OPTIONAL_KEYS = frozenset({
     "fused_long_attention",
     "min_p", "strategy_min_p",
     "strategy_vllm_persistent_workers",
-    "strict_strategy_validation",
     "uct", "parent_selection", "jev_model_path", "jev_candidate_multiplier",
     "jev_same_core_threshold",
     "spo_rs_d_half", "spo_rs_rho_min", "spo_rs_rho_max",
@@ -244,8 +242,7 @@ def validate_problem_config(
 
     for key in ("num_steps", "groups_per_step", "group_size",
                 "num_seed_states", "seed_min_points", "seed_max_points",
-                "max_new_tokens", "max_seq_length", "strategies_per_parent",
-                "programs_per_strategy", "strategy_archive_top_r"):
+                "max_new_tokens", "max_seq_length", "frozen_programs_per_parent"):
         if key in data:
             _positive_int(data, key, source)
     if (problem == "erdos"
@@ -255,10 +252,6 @@ def validate_problem_config(
     for key in ("strategy_max_new_tokens", "strategy_max_seq_length"):
         if key in data and data[key] != "auto":
             _positive_int(data, key, source)
-    if ("strict_strategy_validation" in data
-            and not isinstance(data["strict_strategy_validation"], bool)):
-        raise ValueError(
-            f"{_label(source)}: strict_strategy_validation must be a boolean")
     if "parent_selection" in data:
         mode = data["parent_selection"]
         if not isinstance(mode, str) or mode.lower() not in PARENT_SELECTION_MODES:

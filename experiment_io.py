@@ -2,17 +2,14 @@
 Per-experiment file I/O.
 
 Creates a directory under runs/ named from the main hyperparameters, then
-writes one .txt and one .meta.json per rollout. Two-stage problems also write
-the paired base-model planning response as .strategy.txt. ALL rollouts are
+writes one .txt and one .meta.json per rollout. Frozen solver programs use the same artifact files under frozen_solver/. All rollouts are
 saved, including ones that failed extraction or validation.
 
 Filenames:
     step03_group2_rollout17.txt        ← raw model response
     step03_group2_rollout17.tokens.zlib ← exact generated token IDs
     step03_group2_rollout17.behavior_logprobs.zlib ← rollout-policy scores
-    step03_group2_rollout17.strategy.txt ← raw planning-stage response
     step03_group2_rollout17.meta.json  ← reward, valid, msg, beta, advantage, etc.
-    step03_group02_fold00_strategy01.txt ← strategy saved immediately
 
 Directory name (problem-agnostic):
     runs/erdos_gpt-oss-120b_0602-2201/
@@ -38,7 +35,7 @@ _ROLLOUT_IO_RETRY_SECONDS = 5.0
 _ROLLOUT_IO_RETRY_TIMEOUT_SECONDS = 2 * 60 * 60
 
 ROLLOUT_BUDGET_KEYS = (
-    "groups_per_step", "group_size", "strategies_per_parent", "programs_per_strategy",
+    "groups_per_step", "group_size", "frozen_programs_per_parent",
 )
 ROLLOUT_CONFIG_KEYS = ROLLOUT_BUDGET_KEYS
 
@@ -319,7 +316,7 @@ def make_experiment_dir(cfg, root: str = "runs", resume_dir=None,
 
 
 def restart_changed_rollout_step(cfg, exp_dir, step):
-    """Archive an unfinished step whose budget or committed JEV gate changed."""
+    """Archive an unfinished step whose prompt, budget, or committed JEV gate changed."""
     import tempfile
 
     run = Path(exp_dir)
@@ -344,12 +341,15 @@ def restart_changed_rollout_step(cfg, exp_dir, step):
     if jev is not None:
         values["groups_per_step"] = int(jev["requested"])
     budget_changed = any(getattr(cfg, key, None) != value for key, value in values.items())
+    mode_changed = bool(saved.get("frozen_solver", False)) != bool(getattr(cfg, "frozen_solver", False))
     # Step zero uses ordinary PUCT, so its parents do not depend on this gate.
     threshold_changed = (
         step > 0 and getattr(cfg, "parent_selection", None) == "puct-jev"
         and jev is not None and jev.get("selected") is not None
         and jev["threshold"] != cfg.jev_same_core_threshold)
-    if not (budget_changed or threshold_changed):
+    prompt_changed = (saved.get("rollout_prompt_revision")
+                      != getattr(cfg, "rollout_prompt_revision", None))
+    if not (budget_changed or mode_changed or threshold_changed or prompt_changed):
         return None
 
     # Partial gradients belong to the discarded trajectories.
@@ -372,9 +372,14 @@ def restart_changed_rollout_step(cfg, exp_dir, step):
     for path in dict.fromkeys(sidecars):
         if path.is_file():
             path.rename(backup / path.name)
+    frozen_step = run / "frozen_solver" / directory.name
+    if frozen_step.is_dir():
+        frozen_backup = backup / "frozen_solver"
+        frozen_backup.mkdir()
+        frozen_step.rename(frozen_backup / frozen_step.name)
     directory.rename(backup / directory.name)
 
-    if threshold_changed and not budget_changed:
+    if threshold_changed and not (budget_changed or mode_changed or prompt_changed):
         # Probabilities do not depend on the gate. Retain only that cache;
         # never carry old parents, rollouts, evaluations, or gradients forward.
         # Leave the old threshold/signature intact for the sampler to validate
@@ -390,6 +395,10 @@ def restart_changed_rollout_step(cfg, exp_dir, step):
     reasons = []
     if budget_changed:
         reasons.append("rollout counts changed")
+    if mode_changed:
+        reasons.append("frozen solver mode changed")
+    if prompt_changed:
+        reasons.append("task prompt revision changed")
     if threshold_changed:
         reasons.append(f"JEV threshold changed {jev['threshold']:g} -> "
                        f"{cfg.jev_same_core_threshold:g}")
@@ -407,12 +416,10 @@ def save_rollout(
     response_text: str,
     meta: dict,
     prompt_text: str = None,
-    strategy_text: str = None,
     artifacts_already_saved: bool = False,
 ):
     """
-    Save one rollout as a .txt + .meta.json pair, plus optional prompt and
-    planning-stage text files.
+    Save one rollout as a .txt + .meta.json pair, plus the optional prompt.
 
     meta should include at least: reward, valid, parsed, ran, msg.
     Anything JSON-serializable is fine.
@@ -424,7 +431,7 @@ def save_rollout(
     if not artifacts_already_saved:
         save_rollout_artifacts(
             exp_dir, step, group, rollout, response_text,
-            prompt_text=prompt_text, strategy_text=strategy_text)
+            prompt_text=prompt_text)
 
     # Make sure we can dump everything (numpy floats, bools, etc.)
     def _coerce(v):
@@ -454,7 +461,6 @@ def save_rollout_artifacts(
     rollout: int,
     response_text: str,
     prompt_text: str = None,
-    strategy_text: str = None,
     pending_meta: dict = None,
     response_token_ids=None,
     behavior_logprobs=None,
@@ -480,62 +486,12 @@ def save_rollout_artifacts(
                 "rollout behavior-logprob count must match token-ID count")
         save_rollout_logprobs(
             step_dir / f"{base}.behavior_logprobs.zlib", values)
-    if strategy_text is not None:
-        _atomic_text(step_dir / f"{base}.strategy.txt", strategy_text)
     if prompt_text is not None:
         _atomic_text(step_dir / f"{base}.prompt.txt", prompt_text)
     if pending_meta is not None:
         path = step_dir / f"{base}.meta.json"
         _atomic_write_text(
             path, json.dumps(pending_meta, indent=2, default=str))
-
-
-def save_strategy_response(exp_dir: Path, step: int, parent_group: int,
-                           strategy: int,
-                           response_text: str, *, prompt_text,
-                           response_chars: int, extraction_issue=None) -> Path:
-    """Persist the effective response and format verdict for one strategy slot."""
-    step_dir = Path(exp_dir) / f"step{step:02d}"
-    path = step_dir / (f"step{step:02d}_group{parent_group:02d}_fold00_"
-                       f"strategy{strategy:02d}.txt")
-    _atomic_write_text(path.with_suffix(".prompt.txt"), prompt_text, errors="replace")
-    _atomic_write_text(path.with_suffix(".meta.json"), json.dumps({
-        "extraction_issue": extraction_issue,
-        "accepted": extraction_issue is None,
-        "response_chars": response_chars,
-    }, indent=2))
-    # The response file is the completion marker used by resume.
-    _atomic_write_text(path, response_text, errors="replace")
-    return path
-
-
-def load_completed_strategy_responses(exp_dir: Path, step: int, parents: list,
-                                      strategies_per_parent: int):
-    """Return a complete interrupted planning result for the same parents."""
-    step_dir = Path(exp_dir) / f"step{step:02d}"
-    parent_path = step_dir / f"step{step:02d}.parents.json"
-    summary_path = step_dir / f"step{step:02d}.summary.json"
-    if strategies_per_parent < 1 or summary_path.exists() or not parent_path.exists():
-        return None
-
-    rows = json.loads(parent_path.read_text(encoding="utf-8")).get("parents", [])
-    rows = sorted(rows, key=lambda row: int(row["group"]))
-    if [int(row["group"]) for row in rows] != list(range(len(parents))):
-        raise RuntimeError("interrupted step has an invalid saved parent manifest")
-    if [str(row["parent_id"]) for row in rows] != [str(parent.id) for parent in parents]:
-        raise RuntimeError(
-            "interrupted step selected different parents; refusing to attach "
-            "saved strategies to the wrong coder prompts")
-
-    paths = [[
-        step_dir / (f"step{step:02d}_group{group:02d}_fold00_"
-                    f"strategy{strategy:02d}.txt")
-        for strategy in range(strategies_per_parent)
-    ] for group in range(len(parents))]
-    flat = [path for group in paths for path in group]
-    if not flat or not all(path.exists() for path in flat):
-        return None
-    return [[path.read_text(errors="replace") for path in group] for group in paths]
 
 
 def save_parent_selections(exp_dir: Path, step: int, sampler_type: str,
@@ -583,6 +539,10 @@ def save_parent_selections(exp_dir: Path, step: int, sampler_type: str,
             key: int(getattr(rollout_config, key)) for key in ROLLOUT_CONFIG_KEYS
             if hasattr(rollout_config, key)
         }
+        payload["rollout_config"]["rollout_prompt_revision"] = getattr(
+            rollout_config, "rollout_prompt_revision", None)
+        payload["rollout_config"]["frozen_solver"] = bool(
+            getattr(rollout_config, "frozen_solver", False))
     path = step_dir / f"step{step:02d}.parents.json"
     tmp = path.with_suffix(path.suffix + ".tmp")
     tmp.write_text(json.dumps(payload, indent=2))

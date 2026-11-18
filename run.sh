@@ -32,7 +32,7 @@ mkdir -p "$TMPDIR" "$XDG_CONFIG_HOME" "$XDG_DATA_HOME" "$XDG_STATE_HOME" \
     "$TRITON_CACHE_DIR" "$TORCH_EXTENSIONS_DIR" "$CUDA_CACHE_PATH" \
     "$FLASHINFER_WORKSPACE_BASE" "$MPLCONFIGDIR"
 
-export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-0}"
+export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}"
 export AVAILABLE_GPUS="${AVAILABLE_GPUS:-6,7}"
 # config_path="${TTT_CONFIG:-configs/circle_packing.yaml}"
 config_path="${TTT_CONFIG:-configs/ac1.yaml}"
@@ -66,8 +66,7 @@ config_path="${TTT_CONFIG:-configs/ac1.yaml}"
 # Skip adapter training completely while keeping rollout, evaluation, search,
 # search and result/checkpoint persistence:
 #   sh run.sh --no-train
-# Use a frozen local strategist for hierarchical rollouts. Each accepted plan
-# supplies one prompt for its full set of LoRA coder rollouts.
+# Evaluate independent programs from a frozen model alongside the LoRA coder.
 #   sh run.sh --strategies
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 export VLLM_USE_FLASHINFER_SAMPLER="${VLLM_USE_FLASHINFER_SAMPLER:-0}"

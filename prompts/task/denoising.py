@@ -1,4 +1,4 @@
-"""Task instructions for single-cell RNA-seq denoising."""
+"""Upstream TTT-Discover task for single-cell RNA-seq denoising."""
 
 
 TASK_PROMPT = '''You are an expert in computational biology and single-cell RNA-seq analysis.
@@ -70,13 +70,17 @@ def magic_denoise(X, **kwargs):
 - Poisson loss is highly affected by low non-zero values - push values < 1 toward zero
 - The original MAGIC with reversed normalization achieves best results
 
-
-Evaluation resources: you can use up to {eval_cpus} CPUs.
 {code_section}
 Write your improved `magic_denoise` function.'''
 
 
-PARENT_SCORE = "\nCurrent metrics (lower is better): MSE: {score:.6f}"
+PARENT_METRICS = "\nCurrent metrics (lower is better): {metrics}"
+
+
+PARENT_MSE = "MSE: {score:.6f}"
+
+
+PARENT_POISSON = "Poisson: {score:.6f}"
 
 
 IMPROVE_PROGRAM = """

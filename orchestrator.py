@@ -24,9 +24,7 @@ from pathlib import Path
 from types import SimpleNamespace
 import numpy as np
 from config_validation import PARENT_SELECTION_MODES, reject_retired_coder_cap
-from generation.output_validation import (
-    coder_output_issue, normalize_strategy_plan, strategy_answer_scope, strategy_boundary_view,
-)
+from generation.output_validation import coder_output_issue
 # Same-name aliases retain entrypoint exports used by existing tools/tests.
 from diagnostics.console import (
     _NoticeRoutingStream as _NoticeRoutingStream,
@@ -39,7 +37,6 @@ from models.coder_profiles import (
     _coder_vllm_persistent_workers, _model_basename as _model_basename,
     _uses_sequence_level_policy_ratio,
 )
-from prompts.coder_base import FALLBACK_STRATEGY as _STRATEGY_FALLBACK
 from runtime.configuration import (
     _build_arg_parser as _build_arg_parser, _isolated_evaluation_cpu_ids,
     _is_spo_rs_mode,
@@ -68,72 +65,9 @@ from training.trainers import (
 )
 
 
-_STRATEGY_BLOCK_RE = re.compile(
-    # Do not let an earlier malformed opening tag consume the model's actual
-    # final block. With ``<strategy>...<strategy>final</strategy>``, matching
-    # starts at the inner opening tag and only ``final`` reaches the coder.
-    r"<strategy\b[^>]*>\s*((?:(?!<strategy\b).)*?)\s*</strategy\s*>",
-    flags=re.IGNORECASE | re.DOTALL,
-)
 _ANSI_ORANGE = "\033[38;5;208m"
 _ANSI_YELLOW = "\033[93m"
 _ANSI_RESET = "\033[0m"
-
-
-def _extract_final_strategy(response_text, *, strict=False):
-    """Extract only the final, complete strategy block.
-
-    Explicit JSON plans and named plan fences are normalized before extraction.
-
-    GPT-OSS may expose a long analysis channel before its final answer. None of
-    that text is allowed into a later strategist or coder prompt. We retain
-    only the body of the last complete ``<strategy>...</strategy>`` block at
-    the end of the response. An explicit final channel is preferred when the
-    template exposes one, but is not required: preceding reasoning is harmless
-    because it is never returned. A missing, empty, or unclosed final block
-    selects the direct-solve fallback for that slot.
-    """
-    final_text = strategy_answer_scope(normalize_strategy_plan(response_text)).strip()
-    if not final_text:
-        return _STRATEGY_FALLBACK, "empty response"
-
-    boundary_view = strategy_boundary_view(final_text)
-    matches = list(_STRATEGY_BLOCK_RE.finditer(boundary_view))
-    if not matches:
-        return _STRATEGY_FALLBACK, "missing complete final strategy"
-
-    match = matches[-1]
-    if re.search(r"<strategy\b", boundary_view[match.end():], flags=re.IGNORECASE):
-        return _STRATEGY_FALLBACK, "unclosed final strategy block"
-    # Match masked boundaries, but hand off the untouched original plan.
-    body = final_text[match.start(1):match.end(1)].strip()
-    if not body:
-        return _STRATEGY_FALLBACK, "empty final strategy"
-    placeholder = re.sub(r"[\W\d_]+", "", body).casefold()
-    if not placeholder or placeholder in {"todo", "tbd", "placeholder"}:
-        return _STRATEGY_FALLBACK, "incomplete final strategy"
-    if not strict:
-        return body, None
-
-    if len(body) < 80:
-        return _STRATEGY_FALLBACK, "missing complete final strategy"
-    # Extra strict checks remain opt-in; quoted boundaries are never delimiters.
-    if (re.search(r"```\s*python\b", body, flags=re.IGNORECASE)
-            or re.search(
-                r"```[^`]*(?:^|\n)\s*(?:def |class |from \S+ import |import \S+)",
-                body, flags=re.IGNORECASE | re.DOTALL)):
-        return _STRATEGY_FALLBACK, "strategy contained a code fence"
-    if re.search(
-            r"<\s*\.\.\.\s*>|\brest of (?:the )?(?:long )?strategy\b|"
-            r"\bcontinue(?:d)? (?:in|with) (?:the )?next response\b|"
-            r"\bplaceholder implementation\b|"
-            r"\bcannot (?:provide|deliver|write) (?:the )?(?:full|complete)\b",
-            body, flags=re.IGNORECASE):
-        return _STRATEGY_FALLBACK, "incomplete final strategy"
-    return body, None
-
-
-# CLI arg name -> config key (only where they differ)
 
 
 def _pin_training_process(training_gpu_ids) -> None:
@@ -326,6 +260,14 @@ def _as_float_list(seq, max_len: int = 4096):
     return out
 
 
+def _saved_evaluator_output(stdout):
+    # Preserve the prompt's last 500 characters even on artifact-only resume.
+    text = (stdout or "").strip()
+    if len(text) > 2000:
+        return text[:995] + "\n...\n" + text[-1000:]
+    return text
+
+
 def _evaluated_rollout_meta(pending_meta, result):
     """Add one completed CPU evaluation to its provisional rollout metadata."""
     return {
@@ -339,7 +281,8 @@ def _evaluated_rollout_meta(pending_meta, result):
         "ran": bool(result.ran),
         "msg": result.msg,
         "failure_kind": result.failure_kind,
-        "sandbox_stdout": (result.stdout or "")[:2000],
+        "sandbox_stdout": _saved_evaluator_output(result.stdout),
+        "poisson": result.poisson,
     }
 
 
@@ -659,6 +602,8 @@ def _restore_legacy_archive(sampler, exp_dir, before_step):
             timestep=step, value=reward, code=code, raw_score=raw,
             construction=construction,
             observation=str(meta.get("sandbox_stdout") or ""),
+            previous_raw_score=meta.get("parent_raw_score"),
+            poisson=meta.get("poisson"),
         ))
     sampler.import_legacy_states(states, total_expansions=total_rollouts)
     return len(states), total_rollouts
@@ -722,6 +667,18 @@ def _complete_unfinished_rollout_paths(exp_dir, step_idx, cfg):
         raise RuntimeError(
             f"Unfinished step {step_idx} has {len(paths)} saved rollouts "
             f"for a batch of {expected}. This step cannot be replayed.")
+    if getattr(cfg, "frozen_solver", False):
+        frozen_dir = Path(exp_dir) / "frozen_solver" / step_dir.name
+        frozen_paths = list(frozen_dir.glob(f"step{step_idx:02d}_group*_rollout*.meta.json"))
+        frozen_expected = int(cfg.groups_per_step) * int(cfg.frozen_programs_per_parent)
+        if len(frozen_paths) != frozen_expected:
+            return None
+        try:
+            if any(json.loads(path.read_text()).get("status") != "evaluated"
+                   for path in frozen_paths):
+                return None
+        except (OSError, ValueError, AttributeError):
+            return None
     return paths if len(paths) == expected else None
 
 
@@ -848,43 +805,6 @@ def _recoverable_pending_spo_rs_artifacts(exp_dir, step_idx, cfg):
         })
 
     return _ordered_rollout_artifacts(artifacts, int(cfg.group_size))
-
-
-def _saved_rollout_strategy_index(item, cfg):
-    """Recover a rollout's strategy slot, including pre-fix artifacts."""
-    meta = item["meta"]
-    if not bool(getattr(cfg, "strategies", False)
-                or meta.get("two_stage_rollout", False)):
-        return None
-    count = int(cfg.strategies_per_parent)
-    value = meta.get("strategy_index")
-    if value is None:
-        base = item["meta_path"].name.removesuffix(".meta.json")
-        rollout_path = item["meta_path"].with_name(base + ".strategy.txt")
-        if not rollout_path.is_file():
-            raise RuntimeError(
-                f"rollout strategy identity is missing for {item['meta_path'].name}")
-        rollout_response = rollout_path.read_text(
-            encoding="utf-8", errors="replace")
-        parent_group = int(meta["parent_group"])
-        matches = []
-        for index in range(count):
-            canonical = item["meta_path"].parent / (
-                f"step{int(meta['step']):02d}_group{parent_group:02d}_"
-                f"fold00_strategy{index:02d}.txt")
-            if (canonical.is_file()
-                    and canonical.read_text(encoding="utf-8", errors="replace")
-                    == rollout_response):
-                matches.append(index)
-        if not matches:
-            raise RuntimeError(
-                f"cannot match {rollout_path.name} to its saved strategy slot")
-        value = matches[0]
-    value = int(value)
-    if not 0 <= value < count:
-        raise RuntimeError(
-            f"invalid strategy index {value} in {item['meta_path'].name}")
-    return value
 
 
 def _literal_metadata_mapping(value):
@@ -1150,7 +1070,9 @@ def _finalize_pending_spo_rs_artifacts(
             value=(parent.value if parent.value is not None else 0.0),
             raw_score=parent.raw_score,
             construction=parent.construction,
-            observation=getattr(parent, "observation", ""),
+            observation=parent.observation,
+            previous_raw_score=parent.previous_raw_score,
+            poisson=parent.poisson,
         )
         for parent in parents
     ]
@@ -1354,18 +1276,9 @@ def _finalize_pending_spo_rs_artifacts(
         child = State.make(
             timestep=step_idx, value=float(result.reward),
             code=result.code or "", raw_score=result.raw_score,
-            construction=result.construction, observation=result.stdout)
+            construction=result.construction, observation=result.stdout,
+            poisson=result.poisson)
         archive_eligible = bool(result.valid and result.code)
-        strategy_index = _saved_rollout_strategy_index(item, cfg)
-        base = item["meta_path"].name.removesuffix(".meta.json")
-        strategy_path = step_dir / f"{base}.strategy.txt"
-        strategy = None
-        if strategy_path.is_file():
-            raw_strategy = strategy_path.read_text(encoding="utf-8", errors="replace")
-            strategy, _issue = _extract_final_strategy(
-                raw_strategy,
-                strict=bool(getattr(cfg, "strict_strategy_validation", False)),
-            )
         info = rollout_infos[index]
         meta = {key: value for key, value in pending.items() if key != "status"}
         meta.update({
@@ -1375,6 +1288,7 @@ def _finalize_pending_spo_rs_artifacts(
             "sampler_type": sampler_type,
             "reward": float(result.reward),
             "raw_score": (float(result.raw_score) if result.raw_score is not None else None),
+            "poisson": result.poisson,
             "valid": bool(result.valid),
             "parsed": bool(result.parsed),
             "ran": bool(result.ran),
@@ -1384,7 +1298,7 @@ def _finalize_pending_spo_rs_artifacts(
             "beta": float(beta_by_index[index]),
             "advantage_mode": str(cfg.advantage_mode).lower(),
             "advantage_scale": float(beta_by_index[index]),
-            "sandbox_stdout": (result.stdout or "")[:2000],
+            "sandbox_stdout": _saved_evaluator_output(result.stdout),
             "parent_value": (float(parent.value) if parent.value is not None else None),
             "parent_raw_score": (float(parent.raw_score) if parent.raw_score is not None else None),
             "parent_is_seed": parent.id in sampler._seed_ids,
@@ -1394,11 +1308,6 @@ def _finalize_pending_spo_rs_artifacts(
             "parent_exploration_bonus": parent_row.get("exploration_bonus"),
             "parent_selection_score": parent_row.get("selection_score"),
             "archive_eligible": archive_eligible,
-            "two_stage_rollout": bool(cfg.strategies),
-            "strategy": strategy,
-            "strategy_index": strategy_index,
-            "strategy_model_name": (cfg.strategy_model_name if bool(cfg.strategies) else None),
-            "programs_per_strategy": (int(cfg.programs_per_strategy) if bool(cfg.strategies) else None),
             "construction": (_as_float_list(result.construction, cfg.max_saved_construction) if save_ctor else None),
             "parent_construction": (
                 _as_float_list(parent.construction, cfg.max_saved_construction)
@@ -1613,7 +1522,6 @@ def _resume_spo_rs_step_from_artifacts(
     prompt_job_ids = {}
     all_examples = []
     all_children = []
-    strategy_keys = []
     group_sizes = {group: len(records) for group, records in by_group.items()}
     restored_terminal_tokens = 0
     canonical_recovery_responses = 0
@@ -1698,12 +1606,12 @@ def _resume_spo_rs_step_from_artifacts(
                 raw_score=(float(meta["raw_score"]) if meta.get("raw_score") is not None else None),
                 construction=_literal_float_list(meta.get("construction")),
                 observation=str(meta.get("sandbox_stdout") or ""),
+                poisson=meta.get("poisson"),
             )
             if meta.get("node_id"):
                 child.id = str(meta["node_id"])
             parent_group = int(meta.get("parent_group", group))
             all_children.append((child, parents[parent_group]))
-            strategy_keys.append(_saved_rollout_strategy_index(item, cfg))
 
     if not all_examples:
         raise RuntimeError("evaluated-step recovery found no nonempty responses to train")
@@ -1756,11 +1664,7 @@ def _resume_spo_rs_step_from_artifacts(
             overflow_state = None
             recovery_examples = all_examples
 
-    archive_stats = sampler.update(
-        all_children,
-        strategy_keys=(strategy_keys if bool(cfg.strategies) else None),
-        strategy_top_r=(int(cfg.strategy_archive_top_r) if bool(cfg.strategies) else 0),
-    )
+    archive_stats = sampler.update(all_children)
     print(
         f"[resume] step {step_idx}: reusing {len(artifacts)} saved rollout "
         "evaluations; generation and CPU evaluation are skipped",
@@ -1910,11 +1814,8 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
     from queue import Queue
 
     from search.sampler import State
-    from experiment_io import (load_completed_strategy_responses,
-                               save_best_state_snapshot, save_parent_selections, save_rollout,
-                               save_rollout_logprobs,
-                               save_rollout_artifacts,
-                               save_strategy_response)
+    from experiment_io import (save_best_state_snapshot, save_parent_selections,
+                               save_rollout, save_rollout_artifacts, save_rollout_logprobs)
     from problems.base import ParentContext, RewardResult, is_code_failure
     from generation.gen_workers import make_progress_bar, native_final_answer_scope
 
@@ -1934,10 +1835,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
     parents = sampler.sample_states(requested_parent_contexts, selection_step=step_idx)
     if step_idx == 0:
         _rebind_interrupted_step_zero_selection(sampler, exp_dir, parents)
-    two_stage_rollouts = bool(getattr(problem, "two_stage_rollouts", False))
-    strategies_per_parent = (int(cfg.strategies_per_parent) if two_stage_rollouts else 0)
-    saved_strategy_responses = load_completed_strategy_responses(
-        exp_dir, step_idx, parents, strategies_per_parent)
+    frozen_solver = bool(getattr(cfg, "frozen_solver", False))
     print(f"\n[step {step_idx}] parents picked: {len(parents)}")
     for i, info in enumerate(sampler.last_picks_info):
         tag = "seed" if info["is_seed"] else "expanded"
@@ -1964,7 +1862,6 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
     entropic_overlap_state = None
     spo_rs_overlap_state = None
     all_children = []
-    all_child_strategy_keys = []
     saved_rollouts = 0
     # ----- BUILD PROMPTS (one per parent/group) -----
     parent_ctxs = []
@@ -1977,7 +1874,9 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
             value=parent.value if parent.value is not None else 0.0,
             raw_score=parent.raw_score,
             construction=parent.construction,
-            observation=getattr(parent, "observation", ""),
+            observation=parent.observation,
+            previous_raw_score=parent.previous_raw_score,
+            poisson=parent.poisson,
         )
         parent_ctxs.append(pc)
         base_messages.append(problem.build_prompt(pc))
@@ -2049,7 +1948,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
             )
         except TypeError as exc:
             raise RuntimeError(
-                f"The {cfg.strategy_model_name} strategist needs a chat template "
+                f"The frozen {cfg.strategy_model_name} solver needs a chat template "
                 f"that supports reasoning_effort={cfg.strategy_reasoning_effort} "
                 "with thinking enabled.") from exc
 
@@ -2065,127 +1964,11 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
             "count": count,
         })
 
-    programs_per_strategy = (int(cfg.programs_per_strategy) if two_stage_rollouts else 0)
-    if (two_stage_rollouts and int(cfg.group_size) != strategies_per_parent * programs_per_strategy):
-        raise RuntimeError(
-            "hierarchical rollout group size must equal "
-            "strategies_per_parent * programs_per_strategy")
-
-    def _source_schedule(parent_group):
-        indices = [index for index, job in enumerate(prompt_jobs) if int(job["parent_group"]) == int(parent_group)]
-        if not indices:
-            raise RuntimeError(f"parent {parent_group} has no rendered prompt job")
-        weights = [max(0, int(prompt_jobs[index]["count"])) for index in indices]
-        total = sum(weights)
-        if total < 1:
-            return [indices[slot % len(indices)] for slot in range(strategies_per_parent)]
-        cumulative = []
-        running = 0
-        for index, weight in zip(indices, weights):
-            running += weight
-            cumulative.append((running, index))
-        schedule = []
-        for slot in range(strategies_per_parent):
-            target = (slot + 0.5) * total / strategies_per_parent
-            selected = cumulative[-1][1]
-            for boundary, index in cumulative:
-                if target <= boundary:
-                    selected = index
-                    break
-            schedule.append(selected)
-        return schedule
-
-    strategy_chains = []
-    strategy_prompts = {}
-    strict_strategy_validation = bool(getattr(cfg, "strict_strategy_validation", False))
-    if two_stage_rollouts:
-        for parent_group in range(len(parents)):
-            schedule = _source_schedule(parent_group)
-            strategy_chains.append({
-                "chain_id": len(strategy_chains),
-                "parent_group": parent_group,
-                "source_indices": list(schedule),
-                "strategies": [],
-            })
-    def _record_strategy_response(chain_index, strategy_index, response_text, *, persist=True):
-        """Register the slot's effective plan or direct-solve fallback."""
-        chain = strategy_chains[chain_index]
-        if len(chain["strategies"]) != strategy_index:
-            raise RuntimeError(
-                f"strategy chain {chain['chain_id']} received strategy "
-                f"{strategy_index} after {len(chain['strategies'])} records")
-        raw_response = str(response_text or "")
-        normalize_response = getattr(problem, "normalize_strategy_response", None)
-        accepted_response = (str(normalize_response(raw_response)) if callable(normalize_response) else raw_response)
-        strategy, issue = _extract_final_strategy(accepted_response, strict=strict_strategy_validation)
-        if issue is None and strict_strategy_validation and strategy != _STRATEGY_FALLBACK:
-            validate_strategy = getattr(problem, "strategy_output_issue", None)
-            if callable(validate_strategy):
-                issue = validate_strategy(strategy)
-        if issue is not None:
-            if not persist:
-                raise RuntimeError(f"saved strategy {strategy_index} for chain {chain_index} is invalid: {issue}")
-            strategy = _STRATEGY_FALLBACK
-            accepted_response = f"<strategy>{strategy}</strategy>"
-            print(f"[warn] strategy {strategy_index + 1}, chain {chain_index + 1}: "
-                  f"{issue}. Using the direct-solve fallback.", flush=True)
-        if persist:
-            save_strategy_response(
-                exp_dir, step_idx, chain["parent_group"], strategy_index, accepted_response,
-                prompt_text=strategy_prompts.pop((chain_index, strategy_index)),
-                response_chars=len(raw_response), extraction_issue=issue)
-        chain["strategies"].append({
-            "response": accepted_response,
-            "strategy": strategy,
-        })
-
-    restored_strategy_planning = saved_strategy_responses is not None
-    if restored_strategy_planning:
-        for strategy_index in range(strategies_per_parent):
-            for chain in strategy_chains:
-                _record_strategy_response(
-                    chain["chain_id"], strategy_index,
-                    saved_strategy_responses[int(chain["parent_group"])][strategy_index],
-                    persist=False)
-        print(
-            f"[resume] step {step_idx}: reused {len(strategy_chains) * strategies_per_parent} "
-            "saved strategies; continuing directly with coder rollouts",
-            flush=True,
-        )
-
-    def _strategy_prompt(source_jobs, chain_index, strategy_index):
-        chain = strategy_chains[chain_index]
-        source_idx = chain["source_indices"][strategy_index]
-        messages = problem.build_strategy_messages(
-            source_jobs[source_idx]["messages"],
-            previous_strategies=[record["strategy"] for record in chain["strategies"]])
-        prompt = _render_strategy(messages)
-        strategy_prompts[(chain_index, strategy_index)] = prompt
-        return prompt
-
-    def _code_prompt_jobs(source_jobs, chains):
-        code_jobs = []
-        for chain in chains:
-            if len(chain["strategies"]) != strategies_per_parent:
-                raise RuntimeError(
-                    f"strategy chain {chain['chain_id']} expected "
-                    f"{strategies_per_parent} strategies, received "
-                    f"{len(chain['strategies'])}")
-            for strategy_index, strategy_record in enumerate(chain["strategies"]):
-                source_idx = chain["source_indices"][strategy_index]
-                source_job = source_jobs[source_idx]
-                strategy = strategy_record["strategy"]
-                messages = problem.build_code_messages(source_job["messages"], strategy)
-                code_jobs.append({
-                    **source_job,
-                    "messages": messages,
-                    "prompt_text": _render(messages),
-                    "count": programs_per_strategy,
-                    "strategy": strategy,
-                    "strategy_response": strategy_record["response"],
-                    "strategy_index": strategy_index,
-                })
-        return code_jobs
+    frozen_prompts = [_render_strategy(messages) for messages in base_messages] if frozen_solver else []
+    frozen_count = int(cfg.frozen_programs_per_parent) if frozen_solver else 0
+    frozen_dir = Path(exp_dir) / "frozen_solver"
+    frozen_rollouts = []
+    frozen_valid = 0
 
     spo_rs_divergence = 0.0
     spo_rs_context_divergences = {}
@@ -2323,35 +2106,84 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
             finally:
                 isolated_cpu_slots.put(cpu_id)
 
-    def _submit_rollout(record):
-        job = prompt_jobs[record["job_idx"]]
-        g = int(record["group_id"])
-        parent_group = int(job["parent_group"])
-        group_responses[g].append(record)
-        final_text = record["_final_answer_text"]
+    def _submit_reward(text, parent_group, final_text, format_issue):
         answer_options = {} if final_text is None else {"final_answer_text": final_text}
-        if record.get("output_format_issue") is not None:
-            # A missing artifact is already a verified format failure. Never
-            # execute an earlier reasoning snippet or evaluate it twice.
+        if format_issue is not None:
             fut = Future()
             fut.set_result(RewardResult(
-                reward=float(problem.fail_score), msg=record["output_format_issue"],
-                failure_kind="code"))
-        elif isolated_eval:
-            fut = reward_pool.submit(
-                _run_isolated_reward, record["text"], parent_ctxs[parent_group], **answer_options)
-        else:
-            fut = reward_pool.submit(
-                problem.compute_reward, record["text"],
-                parent_ctxs[parent_group],
-                cfg.sandbox_timeout_s, **answer_options
-            )
+                reward=float(problem.fail_score), msg=format_issue, failure_kind="code"))
+            return fut
+        if isolated_eval:
+            return reward_pool.submit(
+                _run_isolated_reward, text, parent_ctxs[parent_group], **answer_options)
+        return reward_pool.submit(
+            problem.compute_reward, text, parent_ctxs[parent_group],
+            cfg.sandbox_timeout_s, **answer_options)
+
+    def _submit_rollout(record):
+        g = int(record["group_id"])
+        group_responses[g].append(record)
+        fut = _submit_reward(
+            record["text"], record["parent_group"], record["_final_answer_text"],
+            record["output_format_issue"])
         reward_futures[g].append(fut)
         record["_reward_future"] = fut
         fut.add_done_callback(
             lambda completed, rollout=record:
             _record_evaluation_completion(completed, rollout))
         return fut
+
+    def _submit_frozen_reward(record):
+        record["reward_future"] = _submit_reward(
+            record["text"], record["parent_group"], record["final_text"],
+            record["meta"]["output_format_issue"])
+
+    def _queue_frozen_rollout(group, index, text, token_ids):
+        token_ids = list(token_ids)
+        prompt = frozen_prompts[group]
+        final_text = native_final_answer_scope(
+            strategy_tokenizer, token_ids, prompt_text=prompt,
+            require_final_marker=bool(cfg.strategy_thinking))
+        parent = parents[group]
+        meta = {
+            "solver": "frozen",
+            "model_name": cfg.strategy_model_name,
+            "status": "evaluation_pending",
+            "step": step_idx,
+            "group": group,
+            "parent_group": group,
+            "rollout": index,
+            "parent_id": parent.id,
+            "parent_raw_score": parent.raw_score,
+            "n_response_tokens": len(token_ids),
+            "output_format_issue": coder_output_issue(text, final_answer_text=final_text),
+        }
+        rollout_io_futures.append(rollout_io_pool.submit(
+            save_rollout_artifacts, frozen_dir, step_idx, group, index, text,
+            prompt_text=prompt, response_token_ids=token_ids, pending_meta=meta,
+        ))
+        record = {
+            "parent_group": group,
+            "index": index,
+            "text": text,
+            "final_text": final_text,
+            "meta": meta,
+        }
+        frozen_rollouts.append(record)
+        if not defer_gpu_evaluation:
+            _submit_frozen_reward(record)
+
+    def _consume_frozen_results(batches):
+        counts = [0] * len(frozen_prompts)
+        for group, responses in batches:
+            group = int(group)
+            if not 0 <= group < len(counts) or counts[group] + len(responses) > frozen_count:
+                raise RuntimeError("unexpected frozen solver rollout count")
+            for text, token_ids in responses:
+                _queue_frozen_rollout(group, counts[group], text, token_ids)
+                counts[group] += 1
+        if any(count != frozen_count for count in counts):
+            raise RuntimeError("frozen solver omitted rollouts")
 
     def _queue_rollout(job_idx, text, token_ids, behavior_logprobs=None):
         # Record malformed responses with the failure reward.
@@ -2395,15 +2227,14 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
             "rollout": rollout_index,
             "n_response_tokens": len(token_ids),
             "coder_reasoning_effort": job.get("coder_reasoning_effort"),
-            "strategy_index": (
-                int(job["strategy_index"]) if two_stage_rollouts else None),
+            "solver": "coder",
+            "model_name": cfg.coder_model_name,
         }
         record["_pending_meta"] = pending_meta
         save_future = rollout_io_pool.submit(
             save_rollout_artifacts,
             exp_dir, step_idx, group_id, rollout_index, text,
             prompt_text=job["prompt_text"],
-            strategy_text=(job.get("strategy_response") if two_stage_rollouts else None),
             response_token_ids=token_ids,
             behavior_logprobs=behavior_logprobs,
             pending_meta=pending_meta,
@@ -2423,78 +2254,22 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
     coder_phase_complete = False
     try:
         try:
-            if restored_strategy_planning:
-                source_prompt_jobs = prompt_jobs
-                prompt_jobs = _code_prompt_jobs(source_prompt_jobs, strategy_chains)
-                setting_log_only(
-                    f"[step {step_idx}] resumed two-stage coding: generating "
-                    f"{sum(job['count'] for job in prompt_jobs)} LoRA-policy "
-                    f"programs from {len(prompt_jobs)} saved strategy-conditioned prompts",
-                    flush=True)
             if gen_pool is not None:
-                # Consume the generation stream (the adapter was already saved
-                # above). CPU rewards and rewards on a distinct evaluation GPU
-                # start immediately. A one-card GPU problem defers evaluation
-                # until generation releases that same physical card.
-                if two_stage_rollouts and not restored_strategy_planning:
-                    source_prompt_jobs = prompt_jobs
-                    planning_pool = strategy_pool or gen_pool
-                    setting_log_only(f"[step {step_idx}] hierarchical planning: "
-                          f"{len(strategy_chains)} chain(s) x "
-                          f"{strategies_per_parent} sequential strategies with "
-                          f"{cfg.strategy_model_name}; LoRA disabled "
-                          f"(max {cfg.strategy_max_new_tokens} tokens each)",
-                          flush=True)
+                if frozen_solver:
+                    frozen_pool = strategy_pool or gen_pool
                     try:
-                        if hasattr(planning_pool, "run_sequential_chains"):
-                            planning_pool.run_sequential_chains(
-                                num_chains=len(strategy_chains),
-                                num_stages=strategies_per_parent,
-                                prompt_builder=lambda chain, stage: _strategy_prompt(
-                                    source_prompt_jobs, chain, stage),
-                                result_handler=_record_strategy_response,
-                                adapter_path=None,
-                                max_new_tokens=int(cfg.strategy_max_new_tokens),
-                                temperature=float(cfg.strategy_temperature),
-                                top_p=float(cfg.strategy_top_p),
-                                top_k=getattr(cfg, "strategy_sampling_top_k", None),
-                                min_p=getattr(cfg, "strategy_sampling_min_p", None),
-                                step_idx=int(step_idx) + 2_000_000,
-                                progress_desc="strategies pipelined",
-                            )
-                        else:
-                            chain_indices = range(len(strategy_chains))
-                            for strategy_index in range(strategies_per_parent):
-                                prompts = [
-                                    _strategy_prompt(source_prompt_jobs, chain_index, strategy_index)
-                                    for chain_index in chain_indices]
-                                completed = set()
-                                for chain_index, responses in planning_pool.iter_group_jobs(
-                                        prompts_by_group=prompts, group_size=1,
-                                        counts_by_group=[1] * len(prompts), adapter_path=None,
-                                        max_new_tokens=int(cfg.strategy_max_new_tokens),
-                                        temperature=float(cfg.strategy_temperature),
-                                        top_p=float(cfg.strategy_top_p),
-                                        top_k=getattr(cfg, "strategy_sampling_top_k", None),
-                                        min_p=getattr(cfg, "strategy_sampling_min_p", None),
-                                        step_idx=int(step_idx) + 2_000_000 + strategy_index * 10_000,
-                                        progress_desc=f"strategy {strategy_index + 1}/{strategies_per_parent}"):
-                                    chain_index = int(chain_index)
-                                    if (chain_index not in chain_indices or chain_index in completed
-                                            or len(responses) != 1):
-                                        raise RuntimeError("invalid strategy generation result for a parent chain")
-                                    _record_strategy_response(chain_index, strategy_index, responses[0][0])
-                                    completed.add(chain_index)
-                                if len(completed) != len(chain_indices):
-                                    raise RuntimeError("strategy generation omitted a parent chain")
+                        _consume_frozen_results(frozen_pool.iter_group_jobs(
+                            prompts_by_group=frozen_prompts, group_size=frozen_count,
+                            counts_by_group=[frozen_count] * len(frozen_prompts), adapter_path=None,
+                            max_new_tokens=int(cfg.strategy_max_new_tokens),
+                            temperature=float(cfg.strategy_temperature), top_p=float(cfg.strategy_top_p),
+                            top_k=getattr(cfg, "strategy_sampling_top_k", None),
+                            min_p=getattr(cfg, "strategy_sampling_min_p", None),
+                            step_idx=step_idx + 2_000_000, progress_desc="frozen solver",
+                        ))
                     finally:
-                        if planning_pool is not gen_pool:
-                            planning_pool.release()
-                    prompt_jobs = _code_prompt_jobs(source_prompt_jobs, strategy_chains)
-                    setting_log_only(f"[step {step_idx}] two-stage coding: generating "
-                          f"{sum(job['count'] for job in prompt_jobs)} "
-                          f"LoRA-policy programs from {len(prompt_jobs)} "
-                          "strategy-conditioned prompts", flush=True)
+                        if frozen_pool is not gen_pool:
+                            frozen_pool.release()
 
                 generation_options = {
                     "prompts_by_group": [job["prompt_text"] for job in prompt_jobs],
@@ -2527,56 +2302,20 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                     if cfg.deterministic:
                         torch.manual_seed((int(cfg.seed) * 1_000_003 + int(seed_step) * 1009 + 13) % (2**31 - 1))
 
-                if two_stage_rollouts and not restored_strategy_planning:
-                    source_prompt_jobs = prompt_jobs
-                    setting_log_only(f"[step {step_idx}] hierarchical planning: "
-                          f"{len(strategy_chains)} chain(s) x "
-                          f"{strategies_per_parent} sequential strategies with "
-                          f"{cfg.strategy_model_name}; LoRA disabled "
-                          f"(max {cfg.strategy_max_new_tokens} tokens each)",
-                          flush=True)
-                    strategy_cfg = SimpleNamespace(**vars(cfg))
-                    strategy_cfg.advantage_mode = "entropic"
-                    strategy_cfg.max_seq_length = int(cfg.strategy_max_seq_length)
-                    strategy_cfg.temperature = float(cfg.strategy_temperature)
-                    strategy_cfg.top_p = float(cfg.strategy_top_p)
-                    strategy_cfg.sampling_top_k = getattr(cfg, "strategy_sampling_top_k", None)
-                    strategy_cfg.sampling_min_p = getattr(cfg, "strategy_sampling_min_p", None)
+                if frozen_solver:
+                    frozen_cfg = SimpleNamespace(**vars(cfg))
+                    frozen_cfg.advantage_mode = "entropic"
+                    frozen_cfg.max_seq_length = int(cfg.strategy_max_seq_length)
+                    _seed_local_generation(step_idx + 2_000_000)
                     with backend.disable_adapter():
-                        chain_indices = range(len(strategy_chains))
-                        for strategy_index in range(strategies_per_parent):
-                            prompts = [
-                                _strategy_prompt(source_prompt_jobs, chain_index, strategy_index)
-                                for chain_index in chain_indices]
-                            _seed_local_generation(int(step_idx) + 2_000_000 + strategy_index * 10_000)
-                            completed = set()
-                            strategy_bar = make_progress_bar(
-                                len(chain_indices), desc=f"strategy {strategy_index + 1}/{strategies_per_parent}")
-                            try:
-                                for chain_index, responses in generate_prompt_jobs(
-                                        model, tokenizer, prompts, [1] * len(prompts), strategy_cfg,
-                                        max_new_tokens=int(cfg.strategy_max_new_tokens),
-                                        temperature=float(cfg.strategy_temperature),
-                                        top_p=float(cfg.strategy_top_p),
-                                        top_k=getattr(cfg, "strategy_sampling_top_k", None),
-                                        min_p=getattr(cfg, "strategy_sampling_min_p", None),
-                                        cap_state=cap_state):
-                                    chain_index = int(chain_index)
-                                    if (chain_index not in chain_indices or chain_index in completed
-                                            or len(responses) != 1):
-                                        raise RuntimeError("invalid strategy generation result for a parent chain")
-                                    _record_strategy_response(chain_index, strategy_index, responses[0][0])
-                                    completed.add(chain_index)
-                                    strategy_bar.update(1)
-                            finally:
-                                strategy_bar.close()
-                            if len(completed) != len(chain_indices):
-                                raise RuntimeError("strategy generation omitted a parent chain")
-                    prompt_jobs = _code_prompt_jobs(source_prompt_jobs, strategy_chains)
-                    setting_log_only(f"[step {step_idx}] two-stage coding: generating "
-                          f"{sum(job['count'] for job in prompt_jobs)} "
-                          f"LoRA-policy programs from {len(prompt_jobs)} "
-                          "strategy-conditioned prompts", flush=True)
+                        _consume_frozen_results(generate_prompt_jobs(
+                            model, strategy_tokenizer, frozen_prompts,
+                            [frozen_count] * len(frozen_prompts), frozen_cfg,
+                            max_new_tokens=int(cfg.strategy_max_new_tokens),
+                            temperature=float(cfg.strategy_temperature), top_p=float(cfg.strategy_top_p),
+                            top_k=getattr(cfg, "strategy_sampling_top_k", None),
+                            min_p=getattr(cfg, "strategy_sampling_min_p", None),
+                        ))
 
                 _seed_local_generation(step_idx)
                 gen_bar = make_progress_bar(total_rollouts, desc="rollouts")
@@ -2739,11 +2478,11 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                 else:
                     gen_pool.release()
 
-        if deferred_rollouts:
+        if deferred_rollouts or (defer_gpu_evaluation and frozen_rollouts):
             if getattr(problem, "problem_type", "") == "trimul":
                 problem.begin_evaluation_batch()
             print(f"[step {step_idx}] releasing trainer memory before "
-                  f"{len(deferred_rollouts)} benchmark(s); "
+                  f"{len(deferred_rollouts) + len(frozen_rollouts)} benchmark(s); "
                   "one benchmark at a time per evaluation GPU")
             try:
                 torch.cuda.synchronize()
@@ -2766,6 +2505,8 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                     "cannot move the training state to CPU") from exc
             for record in deferred_rollouts:
                 _submit_rollout(record)
+            for record in frozen_rollouts:
+                _submit_frozen_reward(record)
 
         all_futs = [f for g in range(num_groups) for f in reward_futures[g]]
         try:
@@ -2959,6 +2700,14 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
             wait(all_futs)
             with eval_progress_condition:
                 eval_progress_condition.wait_for(lambda: eval_progress_completed >= len(all_futs))
+            for record in frozen_rollouts:
+                result = record["reward_future"].result()
+                frozen_valid += int(result.valid)
+                rollout_io_futures.append(rollout_io_pool.submit(
+                    save_rollout, frozen_dir, step_idx, record["parent_group"], record["index"],
+                    record["text"], _evaluated_rollout_meta(record["meta"], result),
+                    artifacts_already_saved=True,
+                ))
         finally:
             eval_bar.close()
             eval_bar_closed = True
@@ -2981,6 +2730,9 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
     # evaluation, so this is only a non-blocking correctness barrier.
     for save_future in rollout_io_futures:
         save_future.result()
+    if frozen_solver:
+        print(f"[step {step_idx}] frozen solver evaluated {len(frozen_rollouts)} programs "
+              f"({frozen_valid} valid)", flush=True)
 
     if spo_rs_mode and not training_enabled:
         # With policy optimization disabled, consecutive policies are exactly
@@ -3129,11 +2881,11 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                 raw_score=res.raw_score,
                 construction=res.construction,
                 observation=res.stdout,
+                poisson=res.poisson,
             )
             archive_eligible = bool(valids[r_idx] and codes[r_idx])
             if archive_eligible:
                 all_children.append((child, parent))
-                all_child_strategy_keys.append(int(job["strategy_index"]) if two_stage_rollouts else None)
             pick_info = (sampler.last_picks_info[parent_group] if parent_group < len(sampler.last_picks_info) else {})
             meta = {
                 "output_format_issue": record["output_format_issue"],
@@ -3147,6 +2899,9 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                 "sampler_type": sampler_type,
                 "reward": float(rewards[r_idx]),
                 "raw_score": (float(res.raw_score) if res.raw_score is not None else None),
+                "poisson": res.poisson,
+                "solver": "coder",
+                "model_name": cfg.coder_model_name,
                 "valid": bool(valids[r_idx]),
                 "parsed": bool(res.parsed),
                 "ran": bool(res.ran),
@@ -3158,7 +2913,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                 "advantage_scale": (float(adv_scale) if math.isfinite(adv_scale) else None),
                 "n_response_tokens": len(token_ids),
                 "coder_reasoning_effort": job.get("coder_reasoning_effort"),
-                "sandbox_stdout": (res.stdout or '')[:2000],
+                "sandbox_stdout": _saved_evaluator_output(res.stdout),
                 "parent_value": float(parent.value) if parent.value is not None else None,
                 "parent_raw_score": (float(parent.raw_score) if parent.raw_score is not None else None),
                 "parent_is_seed": parent.id in sampler._seed_ids,
@@ -3168,11 +2923,6 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                 "parent_exploration_bonus": (float(pick_info["bonus"]) if pick_info.get("bonus") is not None else None),
                 "parent_selection_score": (float(pick_info["score"]) if pick_info.get("score") is not None else None),
                 "archive_eligible": archive_eligible,
-                "two_stage_rollout": bool(two_stage_rollouts),
-                "strategy": (job.get("strategy") if two_stage_rollouts else None),
-                "strategy_index": (job.get("strategy_index") if two_stage_rollouts else None),
-                "strategy_model_name": (cfg.strategy_model_name if two_stage_rollouts else None),
-                "programs_per_strategy": (programs_per_strategy if two_stage_rollouts else None),
                 # The solution itself, and the one it started from. Neither is
                 # recoverable afterwards: `construction` lives only in the
                 # in-memory sampler State, and a mid-run rollout's parent array
@@ -3192,7 +2942,6 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
             save_rollout(exp_dir, step_idx, g, artifact_rollout_index,
                          text, meta,
                          prompt_text=job["prompt_text"],
-                         strategy_text=(job.get("strategy_response") if two_stage_rollouts else None),
                          artifacts_already_saved=True)
             saved_rollouts += 1
 
@@ -3309,22 +3058,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
     previous_best_value = (float(previous_best_raw.raw_score) if previous_best_raw is not None else None)
 
     # Update archive
-    archive_stats = sampler.update(
-        all_children,
-        strategy_keys=(all_child_strategy_keys if two_stage_rollouts else None),
-        strategy_top_r=(int(cfg.strategy_archive_top_r) if two_stage_rollouts else 0),
-    )
-    if two_stage_rollouts:
-        print(
-            f"[step {step_idx}] strategy archive: "
-            f"valid={archive_stats['submitted']}, "
-            f"unique-new={archive_stats['unique_new']}, "
-            f"top-{archive_stats['strategy_top_r']}/strategy="
-            f"{archive_stats['strategy_admitted']}, "
-            f"survived parent-top-{cfg.topk_children_per_parent}/global-cap="
-            f"{archive_stats['retained_new']}",
-            flush=True,
-        )
+    sampler.update(all_children)
 
     # Keep the best valid candidate produced by this exact step separate from
     # the cumulative best. ``all_children`` still contains candidates removed
@@ -3495,6 +3229,10 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
         step_stats["spo_rs_sampling_adapter"] = Path(adapter_path).name
         step_stats["spo_rs_policy_updated"] = False
 
+    if frozen_solver:
+        step_stats["frozen_rollouts"] = len(frozen_rollouts)
+        step_stats["valid_frozen_rollouts"] = frozen_valid
+
     if not training_enabled:
         step_stats["training_disabled"] = True
         step_stats["training_seconds"] = 0.0
@@ -3582,7 +3320,7 @@ def main():
             run_file_tmp.write_text(str(Path(exp_dir).resolve()), encoding="utf-8")
             run_file_tmp.replace(run_file)
         setting_log_path = Path(exp_dir).resolve() / "setting.log"
-        startup_log.title = ("Strategist Bandit" if cfg.strategies else "Single-Model Discovery")
+        startup_log.title = ("Two-Solver Discovery" if cfg.frozen_solver else "Single-Model Discovery")
         startup_log.bind(setting_log_path)
         bind_setting_log(setting_log_path)
     # Keep the full resolved settings in the file; show their grouped dashboard
@@ -3605,7 +3343,7 @@ def main():
     vllm_log_path = None
     strategy_vllm_log_path = None
     dependency_log_path = None
-    separate_strategy_pool = (cfg.generation_backend == "vllm" and cfg.strategies
+    separate_strategy_pool = (cfg.generation_backend == "vllm" and cfg.frozen_solver
                               and cfg.separate_strategy_inference_pool)
     if cfg.generation_backend == "vllm":
         vllm_log_path = str((Path(exp_dir).resolve() / "vllm.log"))
@@ -3647,14 +3385,10 @@ def main():
         problem_config = dict(merged)
         problem_config["eval_cpus"] = 1
     problem = get_problem(cfg.problem, problem_config)
-    # Strategy generation is a launch mode, not a permanent property of a
-    # problem class. Without --strategies every problem follows its direct
-    # one-stage policy rollout path.
-    problem.two_stage_rollouts = bool(cfg.strategies)
 
     startup_log.begin_summary()
     print("=" * 70)
-    print("Strategist Bandit" if cfg.strategies else "Single-Model Discovery")
+    print("Two-Solver Discovery" if cfg.frozen_solver else "Single-Model Discovery")
     print("=" * 70)
     problem_type = getattr(cfg, "problem_type", "")
     print(f"Problem:            {cfg.problem}" + (f" ({problem_type})" if problem_type else ""))
@@ -3662,8 +3396,8 @@ def main():
     print(f"Metric:             {getattr(problem, 'metric_name', '?')} "
           f"({'maximize' if getattr(problem, 'maximize', True) else 'minimize'})")
     print(f"Coder model:        {cfg.coder_model_name}")
-    if getattr(problem, "two_stage_rollouts", False):
-        print(f'Strategy model:     {cfg.strategy_model_name} (frozen local checkpoint)')
+    if cfg.frozen_solver:
+        print(f'Frozen solver:      {cfg.strategy_model_name} (frozen local checkpoint)')
     print(f"Training backend:   {cfg.backend}")
     print(f"Generation backend: {cfg.generation_backend}")
     print(f"Hardware profile:   {cfg.hardware_profile}")
@@ -3682,7 +3416,7 @@ def main():
     if cfg.generation_backend == "vllm":
         print(f"vLLM parallelism:   TP={cfg.vllm_tensor_parallel_size or 'auto'} "
               f"PP={cfg.vllm_pipeline_parallel_size}")
-    print(f"Prompt target:      {cfg.target}")
+    print(f"Configured target:  {cfg.target}")
     print(f"Print/SOTA target:  {getattr(cfg, 'target_print', cfg.target)}")
     print(f"Steps:              {cfg.num_steps}")
     selection = cfg.parent_selection
@@ -3728,17 +3462,9 @@ def main():
         f"top_k={getattr(cfg, 'sampling_top_k', None)}, "
         f"min_p={getattr(cfg, 'sampling_min_p', None)}, "
         f"thinking={'on' if cfg.thinking else 'off'}")
-    if getattr(problem, "two_stage_rollouts", False):
-        print(f"Rollout hierarchy:  {cfg.strategies_per_parent} sequential "
-              f"strategies/parent x {cfg.programs_per_strategy} "
-              f"programs/strategy = {cfg.group_size}/parent")
-        print(f"Strategy archive:   top {cfg.strategy_archive_top_r}/strategy "
-              f"then existing top {cfg.topk_children_per_parent}/parent")
-        strategy_validation_label = (
-            "strict" if bool(getattr(cfg, "strict_strategy_validation", False))
-            else "basic format")
-        print(f"Strategy validation: {strategy_validation_label}, one response per slot with direct-solve fallback")
-        print(f"Strategy sampling:  max_new={cfg.strategy_max_new_tokens}, "
+    if cfg.frozen_solver:
+        print(f"Frozen programs:    {cfg.frozen_programs_per_parent}/parent")
+        print(f"Frozen sampling:    max_new={cfg.strategy_max_new_tokens}, "
               f"max_seq={cfg.strategy_max_seq_length}, "
               f"temperature={cfg.strategy_temperature}, "
               f"top_p={cfg.strategy_top_p}, "
@@ -3782,7 +3508,7 @@ def main():
         backend = load_backend(cfg.backend, cfg)
         model, tokenizer = backend.load()
     strategy_tokenizer = tokenizer
-    if (getattr(problem, "two_stage_rollouts", False)
+    if (cfg.frozen_solver
             and cfg.strategy_model_name != cfg.coder_model_name):
         from transformers import AutoTokenizer
         with _route_dependency_notices(dependency_log_path):
@@ -4377,7 +4103,7 @@ def main():
             print(f"[init] hybrid HF rollout pool: live trainer on "
                   f"physical GPU {gpu_ids[0]} plus persistent workers "
                   f"{gpu_ids[1:]}")
-        if (getattr(problem, "two_stage_rollouts", False) and strategy_pool is None):
+        if (cfg.frozen_solver and strategy_pool is None):
             strategy_pool = gen_pool
         if cfg.gen_micro_batch and cfg.gen_micro_batch > 0:
             limit_name = ("max_num_seqs" if cfg.generation_backend == "vllm" else "micro-batch")
@@ -4422,19 +4148,9 @@ def main():
         for step in range(start_step, cfg.num_steps):
             active_step = int(step)
             step_cfg = cfg
-            if getattr(problem, "two_stage_rollouts", False):
-                setting_log_only(
-                    f"[step {step}] batch: parents={cfg.groups_per_step} "
-                    f"strategies/parent={cfg.strategies_per_parent} "
-                    f"programs/strategy={cfg.programs_per_strategy} "
-                    f"({cfg.groups_per_step * cfg.group_size} code rollouts)",
-                    flush=True)
-            else:
-                setting_log_only(
-                    f"[step {step}] batch: G={cfg.groups_per_step} "
-                    f"K={cfg.group_size} "
-                    f"({cfg.groups_per_step * cfg.group_size} rollouts)",
-                    flush=True)
+            setting_log_only(
+                f"[step {step}] batch: G={cfg.groups_per_step} K={cfg.group_size} "
+                f"({cfg.groups_per_step * cfg.group_size} coder rollouts)", flush=True)
 
             if (resume_dir and step == start_step
                     and _is_spo_rs_mode(configured_advantage_mode)):

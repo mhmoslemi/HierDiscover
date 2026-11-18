@@ -149,18 +149,17 @@ def dashboard_sections(fields, run_dir, *, resuming=False):
     sections = [
         ("RUN", 96, [
             row("Problem", "Entrypoint", "Steps"),
-            row("Metric", "Target"),
+            row("Metric", "Configured target"),
             row("Search selection", "Seed", "Deterministic"),
         ]),
         ("MODELS & SAMPLING", 95, [
             row("Coder model"), row("Coder sampling"),
             row("Coder reasoning"), row("Max new tokens", "Max seq length"),
-            row("Strategy model"), row("Strategy sampling"),
+            row("Frozen solver"), row("Frozen sampling"),
         ]),
         ("ROLLOUTS", 93, [
             row("Groups per step", "Group size", "Total rollouts/step"),
-            row("Rollout hierarchy"),
-            row("Strategy archive"), row("Strategy validation"),
+            row("Frozen programs"),
         ]),
         ("TRAINING", 92, [
             row("Advantage mode", "LR", "KL coef", "Reference KL"),
@@ -201,7 +200,7 @@ def render_dashboard(fields, run_dir, *, width=104, color=False, resuming=False)
     def content(text):
         return "│ " + text.ljust(inner) + " │"
 
-    title = ("STRATEGIST BANDIT" if "Strategy model" in fields
+    title = ("TWO-SOLVER DISCOVERY" if "Frozen solver" in fields
              else "SINGLE-MODEL DISCOVERY")
     lines = [paint("╭" + "─" * (width - 2) + "╮", 90),
              content(paint(title.ljust(inner), "1;96"))]

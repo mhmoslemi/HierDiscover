@@ -1,4 +1,7 @@
-"""Task instructions for AC1."""
+"""Upstream TTT-Discover task for AC1."""
+
+
+TARGET = 1.5030
 
 
 TASK_PROMPT = '''Act as an expert software developer and inequality specialist specializing in creating step functions with certain properties.
@@ -9,7 +12,7 @@ Your task is to generate the sequence of non-negative heights of a step function
 
 {literature}
 
-Your task is to write a search function that searches for the best sequence of coefficients. Your function will have {budget_s} seconds to run, and after that it has to have returned the best sequence it found. If after {budget_s} seconds it has not returned anything, it will be terminated with negative infinity points. All numbers in your sequence have to be positive or zero. Larger sequences with {budget_s}s of items often have better attack surface, but too large sequences with 100s of thousands of items may be too slow to search.
+Your task is to write a search function that searches for the best sequence of coefficients. Your function will have 1000 seconds to run, and after that it has to have returned the best sequence it found. If after 1000 seconds it has not returned anything, it will be terminated with negative infinity points. All numbers in your sequence have to be positive or zero. Larger sequences with 1000s of items often have better attack surface, but too large sequences with 100s of thousands of items may be too slow to search.
 
 You may code up any search method you want, and you are allowed to call the evaluate_sequence() function as many times as you want. You have access to it, you don't need to code up the evaluate_sequence() function.
 
@@ -25,7 +28,7 @@ Unless you make a meaningful improvement, you will not be rewarded.
 Rules:
 - You must define the `propose_candidate` function as this is what will be invoked.
 - You can use scientific libraries like scipy, numpy, cvxpy[CBC,CVXOPT,GLOP,GLPK,GUROBI,MOSEK,PDLP,SCIP,XPRESS,ECOS], math.
-- You can use up to {eval_cpus} CPUs.
+- You can use up to 2 CPUs.
 - Make all helper functions top level and have no closures from function nesting. Don't use any lambda functions.
 - No filesystem or network IO.
 - Do not import evaluate_sequence yourself. Assume it will already be imported and can be directly invoked.
@@ -33,16 +36,6 @@ Rules:
 - Include a short docstring at the top summarizing your algorithm.
 
 Make sure to think and return the final program between ```python and ```.'''
-
-
-STRATEGY_NOTES = '''
-AC1 mathematical checks for the final plan:
-- For a returned sequence a of length n, the exact lower-is-better objective is
-  2*n*max(convolve(a, a, mode="full"))/sum(a)^2, with sum(a) >= 0.01 after
-  defensive clipping. Include every one of the 2*n-1 convolution positions.
-- Any normalization or LP direction must preserve nonnegativity and must be
-  evaluated with that exact ratio. Do not infer monotonic improvement from a
-  surrogate bound without an exact acceptance comparison.'''
 
 
 EVALUATOR = '''```python

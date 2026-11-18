@@ -2,54 +2,21 @@
 Circle packing.
 
   - entrypoint:  run_packing
-  - validator:   validate_packing (byte-identical to the paper's)
+  - validator:   validates and scores the returned packing
   - reward:      sum of radii if valid else 0   (maximize)
 """
 
 from __future__ import annotations
-import inspect
 from typing import Any, List
 import numpy as np
 
+from evaluation.reward import validate_packing
 from problems.base import Problem, ParentContext, RewardResult, SeedState
 from prompts.task import circle_packing
 from prompts.utils import render_state_context
 
 
-# ----------------------------------------------------------------------
-# Validator (verbatim copy of the paper's / examples/circle_packing/env.py)
-# ----------------------------------------------------------------------
-def validate_packing(centers, radii):
-    n = centers.shape[0]
-
-    if np.isnan(centers).any() or np.isnan(radii).any():
-        return False, "NaN values present"
-
-    for i in range(n):
-        if radii[i] < 0:
-            return False, f"Circle {i} has negative radius {radii[i]}"
-
-    for i in range(n):
-        x, y = centers[i]
-        r = radii[i]
-        if (x - r < -1e-12 or x + r > 1 + 1e-12
-                or y - r < -1e-12 or y + r > 1 + 1e-12):
-            return False, f"Circle {i} at ({x},{y}) r={r} outside unit square"
-
-    for i in range(n):
-        for j in range(i + 1, n):
-            dist = np.sqrt(np.sum((centers[i] - centers[j]) ** 2))
-            if dist < radii[i] + radii[j] - 1e-12:
-                return False, f"Circles {i} and {j} overlap"
-
-    return True, "ok"
-
-
-_VALIDATOR_SRC = inspect.getsource(validate_packing)
-
-
 class CirclePacking(Problem):
-    two_stage_rollouts = True
     name = "circle_packing"
     entrypoint = "run_packing"
     metric_name = "sum of radii"
@@ -63,16 +30,11 @@ class CirclePacking(Problem):
 
     # ------------------------------------------------------------------
     def build_prompt(self, parent: ParentContext) -> List[dict]:
-        state_ctx = render_state_context(
-            self.metric_name, self.target, parent, maximize=self.maximize,
-        )
-        user = circle_packing.TASK_PROMPT.format(
-            n=self.num_circles,
-            validator=_VALIDATOR_SRC,
-            state_ctx=state_ctx,
-            eval_cpus=self.eval_cpus,
-        )
-        return [{"role": "user", "content": user}]
+        target = circle_packing.TARGET_26 if self.num_circles == 26 else circle_packing.TARGET_32
+        state_ctx = render_state_context(self.metric_name, target, parent)
+        return [{"role": "user", "content": circle_packing.TASK_PROMPT.format(
+            n=self.num_circles, validator=circle_packing.VALIDATOR, state_ctx=state_ctx,
+        )}]
 
     # ------------------------------------------------------------------
     def preprocess(self, code: str, parent: ParentContext) -> str:
@@ -83,7 +45,7 @@ class CirclePacking(Problem):
             "    from scipy.optimize import minimize\n"
             "except ImportError:\n"
             "    minimize = None\n\n"
-            + _VALIDATOR_SRC + "\n"
+            + circle_packing.VALIDATOR + "\n"
         )
         return prelude + "\n# ---- model code below ----\n" + code
 

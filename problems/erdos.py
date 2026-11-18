@@ -6,7 +6,7 @@ from typing import Any, List
 import numpy as np
 from problems.base import Problem, ParentContext, RewardResult, SeedState
 from prompts.task import erdos
-from prompts.utils import append_user_instruction, render_state_context
+from prompts.utils import render_state_context
 
 
 def verify_c5_solution(h_values: np.ndarray, c5_achieved: float, n_points: int):
@@ -83,7 +83,6 @@ _VERIFIER_SRC = (
 
 
 class ErdosMinOverlap(Problem):
-    two_stage_rollouts = True
     name = "erdos"
     entrypoint = "run"
     metric_name = "C\u2085 bound"
@@ -99,25 +98,13 @@ class ErdosMinOverlap(Problem):
             self.target = 0.3808
         self.budget_s = float(cfg.get("budget_s", 60.0))
 
-    def build_strategy_messages(
-            self, messages: List[dict],
-            previous_strategies: List[str] | None = None) -> List[dict]:
-        staged = append_user_instruction(messages, erdos.STRATEGY_NOTES.strip())
-        return super().build_strategy_messages(
-            staged, previous_strategies=previous_strategies)
-
-    def build_code_messages(self, messages: List[dict],
-                            strategy: str) -> List[dict]:
-        staged = super().build_code_messages(messages, strategy)
-        return append_user_instruction(staged, erdos.STAGED_OUTPUT.strip())
-
     # ------------------------------------------------------------------
     def build_prompt(self, parent: ParentContext) -> List[dict]:
         state_ctx = render_state_context(
-            self.metric_name, self.target, parent, maximize=self.maximize,
+            self.metric_name, erdos.TARGET, parent, maximize=self.maximize,
         )
         construction_section = ""
-        if parent.construction is not None and len(parent.construction) > 0:
+        if parent.construction is not None and len(parent.construction):
             construction_section = erdos.PARENT_CONSTRUCTION.format(
                 size=len(parent.construction),
             )
@@ -125,17 +112,10 @@ class ErdosMinOverlap(Problem):
             erdos.IMPROVE_PROGRAM if parent.code and parent.code.strip()
             else erdos.WRITE_PROGRAM
         )
-        direct_output_section = "" if self.two_stage_rollouts else erdos.DIRECT_OUTPUT
-
-        user = erdos.TASK_PROMPT.format(
-            budget_s=self.budget_s,
-            eval_cpus=self.eval_cpus,
-            state_ctx=state_ctx,
-            construction_section=construction_section,
+        return [{"role": "user", "content": erdos.TASK_PROMPT.format(
+            state_ctx=state_ctx, construction_section=construction_section,
             code_section=code_section,
-            direct_output_section=direct_output_section,
-        )
-        return [{"role": "user", "content": user}]
+        )}]
 
     # ------------------------------------------------------------------
     def preprocess(self, code: str, parent: ParentContext) -> str:

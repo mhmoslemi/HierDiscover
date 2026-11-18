@@ -1,15 +1,19 @@
-"""Task instructions for the TriMul kernel."""
+"""Upstream TTT-Discover task for trimul."""
+
+
+TARGET = 1000
 
 
 TASK_PROMPT = """{description}
-{arch_section}
+
 {state_ctx}
+
 Rules:
 - The tensors arguments passed in will be already on your cuda device.
 - Define all of your code in one final ```python ``` block.
 - We will test the correctness of your kernel on multiple input shapes, make sure to support different potential test cases.
 - You are allowed to use mixed precision computations, but make sure your final output is in float32.
-- You must use triton {triton_version} and these kernels will be run on an {gpu_type}.
+- You must use trition 3.3.1 and these kernels will be run on an H100.
 - You do not have to implement everything in triton, you may choose to have some of the operations done in pytorch. However, you must implement at least part of the operations in a kernel.
 - Include a short docstring at the top summarizing your algorithm.
 """

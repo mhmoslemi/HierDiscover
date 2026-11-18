@@ -1,4 +1,7 @@
-"""Task instructions for AC2."""
+"""Upstream TTT-Discover task for AC2."""
+
+
+TARGET = 0.97
 
 
 TASK_PROMPT = """'Act as an expert software developer and inequality specialist specializing in creating step functions with certain properties.
@@ -10,7 +13,7 @@ Your task is to generate the sequence of non-negative heights of a step function
 ```
 
 {literature}
-Your task is to write a search function, construct_function(), that searches for the best sequence of coefficients. Your function will have {budget_s} seconds to run, and after that it has to have returned the best sequence it found. If after {budget_s} seconds it has not returned anything, it will be terminated with negative infinity points. All numbers in your sequence have to be positive or zero. Larger sequences with {budget_s}s of items often have better attack surface, but too large sequences with 100s of thousands of items may be too slow to search.
+Your task is to write a search function, construct_function(), that searches for the best sequence of coefficients. Your function will have 1000 seconds to run, and after that it has to have returned the best sequence it found. If after 1000 seconds it has not returned anything, it will be terminated with negative infinity points. All numbers in your sequence have to be positive or zero. Larger sequences with 1000s of items often have better attack surface, but too large sequences with 100s of thousands of items may be too slow to search.
 
 You may code up any search method you want, and you are allowed to call the evaluate_sequence() function as many times as you want. You have access to it, you don't need to code up the evaluate_sequence() function.
 
@@ -26,7 +29,7 @@ Unless you make a meaningful improvement, you will not be rewarded, if you are s
 Rules:
 - You must define the `construct_function` function as this is what will be invoked.
 - You can use scientific libraries like scipy, numpy, cvxpy[CBC,CVXOPT,GLOP,GLPK,GUROBI,MOSEK,PDLP,SCIP,XPRESS,ECOS], math.
-- You can use up to {eval_cpus} CPUs.
+- You can use up to 2 CPUs.
 - Make all helper functions top level and have no closures from function nesting. Don't use any lambda functions.
 - No filesystem or network IO.
 - Do not import evaluate_sequence yourself. Assume it will already be imported and can be directly invoked. Do not import height_sequence_1 yourself; it will already be available.
@@ -34,20 +37,6 @@ Rules:
 - Include a short docstring at the top summarizing your algorithm.
 
 Make sure to think and return the final program between ```python and ```."""
-
-
-STRATEGY_NOTES = '''
-AC2 mathematical checks for the final plan:
-- Let c=convolve(a,a,mode="full") have m=2*n-1 entries and let
-  y=(0,c_0,...,c_{m-1},0). The evaluator uses uniform spacing
-  dx=1/(m+1), the piecewise-linear integral
-  L2sq=sum_i dx/3*(y_i^2+y_i*y_{i+1}+y_{i+1}^2),
-  L1=sum(abs(c))/(m+1), and Linf=max(abs(c)). The exact higher-is-better
-  objective is L2sq/(L1*Linf).
-- Keep L1 and Linf strictly positive and use the same endpoint convention and
-  spacing in any analytic gradient or surrogate. Verify the saved best and
-  final candidate with the supplied function rather than trusting an internal
-  score.'''
 
 
 EVALUATOR = '''
@@ -112,7 +101,6 @@ def evaluate_sequence(sequence: list[float]) -> float:
 '''
 
 
-# https://arxiv.org/pdf/2506.16750
 LITERATURE = r"""A previous state of the art used the following approach. You can use it as inspiration, but you are not required to use it, and you are encoraged to explore.
 ```latex
 Their procedure is a coarse-to-fine optimization of the score. It starts with a stochastic global search that repeatedly perturbs the current best candidate and keeps the perturbation whenever it improves (Q), with the perturbation scale gradually reduced over time. Once a good basin is found, they switch to a deterministic local improvement step, performing projected gradient ascent (move in the gradient direction and project back to the feasible region). To reach higher resolution, they lift a good low-resolution solution to a higher-dimensional one by simply repeating its entries and then rerun the local refinement. Iterating this explore–refine–upscale cycle yields their final high-resolution maximizer and the improved lower bound.

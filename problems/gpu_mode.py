@@ -35,7 +35,7 @@ import time
 from typing import Any, Dict, List, Optional
 from examples.gpu_mode.seeds import MLA_DECODE_INITIAL_STATE, MLA_DECODE_INITIAL_VALUE
 from problems.base import Problem, ParentContext, RewardResult, SeedState
-from prompts.task import gpu_common, mla_decode_nvidia, trimul
+from prompts.task import mla_decode_nvidia, trimul
 from prompts.utils import render_state_context
 
 # Runtime scaling relative to H100, from memory bandwidth, because trimul and
@@ -514,32 +514,15 @@ class GpuMode(Problem):
 
     # ------------------------------------------------------------------
     def build_prompt(self, parent: ParentContext) -> List[dict]:
+        task = trimul if self.problem_type == "trimul" else mla_decode_nvidia
         state_ctx = render_state_context(
-            self.metric_name, self.target, parent, maximize=self.maximize,
+            self.metric_name, task.TARGET, parent, maximize=self.maximize,
         )
-        if parent.observation and parent.observation.strip():
-            stdout = parent.observation.strip()
-            if len(stdout) > 500:
-                stdout = gpu_common.TRUNCATED_OUTPUT.format(stdout=stdout[-500:])
-            state_ctx = state_ctx.rstrip() + gpu_common.PREVIOUS_OUTPUT.format(stdout=stdout)
-
-        notes = gpu_common.ARCH_NOTES.get((self.gpu_type or "").strip().lower(), "")
-        arch_section = f"\n{notes}\n" if notes else ""
-
-        if self.problem_type == "trimul":
-            user = trimul.TASK_PROMPT.format(
-                description=trimul.DESCRIPTION,
-                arch_section=arch_section,
-                state_ctx=state_ctx,
-                triton_version=self.triton_version,
-                gpu_type=self.gpu_type,
-            )
+        if task is trimul:
+            user = task.TASK_PROMPT.format(description=task.DESCRIPTION, state_ctx=state_ctx)
         else:
-            user = mla_decode_nvidia.TASK_PROMPT.format(
-                description=mla_decode_nvidia.DESCRIPTION,
-                arch_section=arch_section,
-                state_ctx=state_ctx,
-                rules=mla_decode_nvidia.RULES,
+            user = task.TASK_PROMPT.format(
+                description=task.DESCRIPTION, state_ctx=state_ctx, rules=task.RULES,
             )
         return [{"role": "user", "content": user}]
 
