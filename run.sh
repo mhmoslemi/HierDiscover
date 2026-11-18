@@ -66,8 +66,8 @@ config_path="${TTT_CONFIG:-configs/ac1.yaml}"
 # Skip adapter training completely while keeping rollout, evaluation, search,
 # search and result/checkpoint persistence:
 #   sh run.sh --no-train
-# Evaluate independent programs from a frozen model alongside the LoRA coder.
-#   sh run.sh --strategies
+# Set frozen_programs_per_parent: 0 in the YAML for a coder-only run.
+#   sh run.sh --frozen-programs-per-parent 0
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 export VLLM_USE_FLASHINFER_SAMPLER="${VLLM_USE_FLASHINFER_SAMPLER:-0}"
 

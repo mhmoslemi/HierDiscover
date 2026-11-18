@@ -242,7 +242,7 @@ def validate_problem_config(
 
     for key in ("num_steps", "groups_per_step", "group_size",
                 "num_seed_states", "seed_min_points", "seed_max_points",
-                "max_new_tokens", "max_seq_length", "frozen_programs_per_parent"):
+                "max_new_tokens", "max_seq_length"):
         if key in data:
             _positive_int(data, key, source)
     if (problem == "erdos"
@@ -323,12 +323,11 @@ def validate_problem_config(
     for key in ("vllm_sleep_level", "strategy_vllm_sleep_level"):
         if key in data and int(data[key]) not in (1, 2):
             raise ValueError(f"{_label(source)}: {key} must be 1 or 2")
-    if "strategy_vllm_persistent_workers" in data:
-        value = data["strategy_vllm_persistent_workers"]
-        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
-            raise ValueError(
-                f"{_label(source)}: strategy_vllm_persistent_workers must "
-                "be a nonnegative integer")
+    for key in ("frozen_programs_per_parent", "strategy_vllm_persistent_workers"):
+        if key in data:
+            value = data[key]
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError(f"{_label(source)}: {key} must be a nonnegative integer")
     for key in ("vllm_staged_loading", "strategy_vllm_staged_loading"):
         if key in data and not isinstance(data[key], bool):
             raise ValueError(

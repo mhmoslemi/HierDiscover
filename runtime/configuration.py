@@ -209,7 +209,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--groups-per-step", type=int, default=None, help='Parent states per step.')
     p.add_argument("--group-size", type=int, default=None, help='Rollouts per parent group.')
     p.add_argument("--frozen-programs-per-parent", "--strategies-per-parent", type=int, default=None,
-                   help="Independent programs to evaluate per parent with the frozen solver.")
+                   help="Independent programs per parent with the frozen solver. Zero disables it.")
     p.add_argument("--num-seed-states", type=int, default=None)
     p.add_argument("--parent-selection", choices=PARENT_SELECTION_MODES, default=None,
                    help="Override the YAML picker. On resume, PUCT can switch "
@@ -612,7 +612,11 @@ def load_config():
         if args.spo_rs_clip_epsilon_high is None:
             merged["spo_rs_clip_epsilon_high"] = args.spo_rs_clip_epsilon
     # Trainer/evaluator modes are launch-scoped.
-    merged["frozen_solver"] = bool(args.frozen_solver)
+    frozen_programs_per_parent = int(merged.get("frozen_programs_per_parent", 0))
+    if frozen_programs_per_parent < 0:
+        raise ValueError("frozen_programs_per_parent must be a nonnegative integer")
+    merged["frozen_programs_per_parent"] = frozen_programs_per_parent
+    merged["frozen_solver"] = bool(args.frozen_solver and frozen_programs_per_parent > 0)
     merged["rollout_prompt_revision"] = UPSTREAM_COMMIT
     merged["fused_long_attention"] = bool(args.fused_long_attention)
     merged.pop("measure_entropy", None)
@@ -665,20 +669,16 @@ def load_config():
         merged.setdefault("strategy_temperature", 1.0)
         merged.setdefault("strategy_top_p", 1.0)
         strategy_model_name = local_checkpoint(STRATEGY_MODEL_NAME, merged["hardware_profile"])
-        frozen_programs_per_parent = int(merged["frozen_programs_per_parent"])
         strategy_max_seq_length, strategy_max_new_tokens = resolve_strategy_token_limits(
             merged.get("strategy_max_seq_length", "auto"),
             merged.get("strategy_max_new_tokens", "auto"))
         strategy_temperature = float(merged["strategy_temperature"])
         strategy_top_p = float(merged["strategy_top_p"])
-        if min(frozen_programs_per_parent, strategy_max_new_tokens, strategy_max_seq_length) < 1:
-            raise ValueError("frozen solver rollout count and token limits must be positive")
         if strategy_temperature <= 0.0:
             raise ValueError("strategy_temperature must be positive")
         if not 0.0 < strategy_top_p <= 1.0:
             raise ValueError("strategy_top_p must be in (0, 1]")
         merged["strategy_model_name"] = strategy_model_name
-        merged["frozen_programs_per_parent"] = frozen_programs_per_parent
         merged["strategy_max_new_tokens"] = strategy_max_new_tokens
         merged["strategy_max_seq_length"] = strategy_max_seq_length
         merged["strategy_temperature"] = strategy_temperature

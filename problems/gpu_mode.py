@@ -24,6 +24,7 @@ Evaluation diagnostics and isolation:
 """
 
 from __future__ import annotations
+import math
 import multiprocessing as mp
 import os
 from pathlib import Path
@@ -202,6 +203,18 @@ def benchmark_environment_from_python(python_executable: str, *, gpu_id=None):
     return json.loads(lines[-1])
 
 
+def verify_benchmark_environment(python_executable: str, expected_gpu: str,
+                                 expected_triton: str, *, gpu_id=None):
+    identity = benchmark_environment_from_python(python_executable, gpu_id=gpu_id)
+    issue = benchmark_environment_issue(
+        identity["gpu"], identity["capability"], identity["triton"],
+        expected_gpu, expected_triton)
+    if issue is not None:
+        location = f" on physical GPU {gpu_id}" if gpu_id is not None else ""
+        raise RuntimeError(f"benchmark environment mismatch{location}: {issue}")
+    return identity
+
+
 def _eval_process_group_exists(pgid: int) -> bool:
     try:
         os.killpg(pgid, 0)
@@ -325,13 +338,7 @@ def _eval_child(conn, code: str, lib_dir: str, task_yaml: str,
         if lib_dir not in sys.path:
             sys.path.insert(0, lib_dir)
         if problem_type == "trimul" and not environment_verified:
-            identity = benchmark_environment_from_python(py3)
-            environment_issue = benchmark_environment_issue(
-                identity["gpu"], identity["capability"], identity["triton"],
-                expected_gpu, expected_triton)
-            if environment_issue is not None:
-                raise RuntimeError(
-                    f"benchmark environment mismatch: {environment_issue}")
+            verify_benchmark_environment(py3, expected_gpu, expected_triton)
         if problem_type == "trimul":
             out["environment_verified"] = True
         from libkernelbot.task import make_task_definition, build_task_config
@@ -360,16 +367,36 @@ def _eval_child(conn, code: str, lib_dir: str, task_yaml: str,
             out["msg"] = f"Error: {getattr(result, 'error', 'run failed')}"
         else:
             runs = result.runs
-            if "test" in runs and (not runs["test"].run or not runs["test"].run.passed):
+            test_run = getattr(runs.get("test"), "run", None)
+            leaderboard_run = getattr(runs.get("leaderboard"), "run", None)
+            is_trimul = problem_type == "trimul"
+            if is_trimul and (test_run is None or not test_run.success):
+                out["msg"] = "Failed to run tests."
+            elif "test" in runs and (test_run is None or not test_run.passed):
                 out["msg"] = "Failed to pass test cases."
-            elif ("leaderboard" not in runs or not runs["leaderboard"].run
-                  or not runs["leaderboard"].run.passed):
+            elif (leaderboard_run is None or not leaderboard_run.passed
+                  or (is_trimul and not leaderboard_run.success)):
                 out["msg"] = "No passing leaderboard run."
             else:
+                if is_trimul:
+                    timing = leaderboard_run.result
+                    expected_count = len(task.benchmarks)
+                    actual_count = int(timing["benchmark-count"])
+                    if actual_count != expected_count:
+                        raise ValueError(
+                            f"expected {expected_count} leaderboard timings, got {actual_count}")
+                    for index in range(expected_count):
+                        mean_ns = float(timing[f"benchmark.{index}.mean"])
+                        if not math.isfinite(mean_ns) or mean_ns <= 0:
+                            raise ValueError(
+                                f"invalid mean for leaderboard case {index}: {mean_ns} ns")
                 score_seconds = compute_score(result, task, submission_id=-1)
-                out["score_us"] = float(score_seconds) * 1_000_000.0
+                score_us = float(score_seconds) * 1_000_000.0
+                if is_trimul and (not math.isfinite(score_us) or score_us <= 0):
+                    raise ValueError(f"invalid leaderboard runtime: {score_us} us")
+                out["score_us"] = score_us
                 out["ok"] = True
-                out["msg"] = f"runtime_us={out['score_us']}"
+                out["msg"] = f"runtime_us={score_us}"
     except FileNotFoundError as e:
         # subprocess raises this with the executable in .filename and nothing
         # in the repr, which is how this arrived as an unreadable

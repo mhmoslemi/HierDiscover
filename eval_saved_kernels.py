@@ -54,7 +54,7 @@ def main(argv=None):
     parser.add_argument("step_dir", type=Path, help="Existing run's step directory")
     parser.add_argument("--gpu", required=True, type=int, help="Idle physical GPU for sequential evaluation")
     parser.add_argument("--config", type=Path, default=ROOT / "configs/gpu_mode_trimul.yaml",
-                        help="Current YAML supplying the corrected kernel_python path")
+                        help="Current YAML supplying the evaluator Python and TriMul timeout")
     parser.add_argument("--limit", type=int, help="Evaluate only the first N saved rollouts")
     args = parser.parse_args(argv)
     if args.gpu < 0 or (args.limit is not None and args.limit < 1):
@@ -79,25 +79,22 @@ def main(argv=None):
     os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpu)
 
     import yaml
-    from problems.gpu_mode import (
-        GpuMode, benchmark_environment_from_python, benchmark_environment_issue,
-        ensure_python3_on_path)
+    from problems.gpu_mode import GpuMode, verify_benchmark_environment
 
     cfg = json.loads(saved_config.read_text(encoding="utf-8"))
     if cfg.get("problem") != "gpu_mode":
         parser.error("This command only evaluates saved gpu_mode rollouts")
     current = yaml.safe_load(config_path.read_text(encoding="utf-8"))
     cfg["kernel_python"] = current["kernel_python"]
+    if (str(cfg.get("problem_type", "trimul")).lower() == "trimul"
+            and "kernel_timeout_s" in current):
+        cfg["kernel_timeout_s"] = current["kernel_timeout_s"]
     cfg["kernel_gpu_id"] = args.gpu
     cfg["evaluation_shares_generation"] = False
     problem = GpuMode(cfg)
-    python = ensure_python3_on_path(problem.kernel_python)
-    identity = benchmark_environment_from_python(python)
-    issue = benchmark_environment_issue(
-        identity["gpu"], identity["capability"], identity["triton"],
-        problem.gpu_type, problem.triton_version)
-    if issue:
-        raise RuntimeError(issue)
+    identity = verify_benchmark_environment(
+        problem.kernel_python, problem.gpu_type, problem.triton_version,
+        gpu_id=args.gpu)
     print(f"Evaluator: {problem.kernel_python}; {identity['gpu']}; "
           f"Triton {identity['triton']}; physical GPU {args.gpu}", flush=True)
     output_dir = ROOT / ".runtime/kernel_eval_check" / step_dir.parent.name / step_dir.name

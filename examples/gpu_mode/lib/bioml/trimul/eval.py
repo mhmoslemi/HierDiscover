@@ -78,8 +78,7 @@ def get_test_cases(file_name: str, seed: Optional[int]) -> list[TestCase]:
             try:
                 val = int(val)
             except ValueError:
-                if val.lower() in ("true", "false"):
-                    val = val.lower() == "true"
+                pass  # Match TTT-Discover's string parsing, including nomask.
 
             case[key] = val
         tests.append(TestCase(spec=line, args=case))

@@ -3505,6 +3505,12 @@ def main():
         problem_config = dict(merged)
         problem_config["eval_cpus"] = 1
     problem = get_problem(cfg.problem, problem_config)
+    if getattr(problem, "problem_type", "") == "trimul":
+        from problems.gpu_mode import verify_benchmark_environment
+        for gpu_id in problem.kernel_gpu_ids:
+            verify_benchmark_environment(
+                problem.kernel_python, problem.gpu_type, problem.triton_version,
+                gpu_id=gpu_id)
 
     startup_log.begin_summary()
     print("=" * 70)
