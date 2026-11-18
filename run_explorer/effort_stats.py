@@ -10,12 +10,8 @@ What is measured, and how
   * thinking vs answer      for a sample of rollouts the saved response text is split at its reasoning boundary
                             ("</think>" for Qwen, "assistantfinal" for gpt-oss) and the character share of the reasoning is applied to the
                             token count. That is an ESTIMATE (code has more tokens per character than prose).
-  * generation speed        the log's progress bar of the PILOT phase ("pilot rollouts: ... N/N [elapsed<...]"): the phase generates all its
-                            rollouts at once and CPU / GPU evaluation of earlier programs overlaps without blocking it, so
-                            tokens(pilot rollouts of that step) / elapsed is the effective aggregate speed of the generation GPUs, in
-                            tokens per second per GPU. It includes ramp-up and the tail where only the longest sequences are still running.
-                            Per-effort speed cannot be read from the logs (the efforts run together in one batch); it is derived from the
-                            measured speed of the model, see `derived` below.
+  * generation speed        tokens from the planned rollouts divided by the elapsed time on the completed "rollouts" progress bar.
+                            This includes ramp-up and the tail while the longest sequences finish.
 Which runs are used is listed in effort_runs.txt.
 """
 import glob
@@ -23,9 +19,10 @@ import json
 import os
 import re
 import statistics as st
+from collections import Counter
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-BAR = re.compile(r"^\[(\d\d):(\d\d):(\d\d)\] pilot rollouts:\s+\d+%\|[^|]*\|\s*(\d+)/(\d+)\s*\[([0-9:]+)<")
+BAR = re.compile(r"^\[(\d\d):(\d\d):(\d\d)\] rollouts:\s+\d+%\|[^|]*\|\s*(\d+)/(\d+)\s*\[([0-9:]+)<")
 STEP = re.compile(r"\[step (\d+)\]")
 ANSI = re.compile(r"\x1b\[[0-9;]*m")
 MARKERS = (("</think>", 8), ("assistantfinal", 14))      # (text, length): the end of the reasoning in the saved response
@@ -33,7 +30,7 @@ SAMPLE_PER_GROUP = 120
 
 
 def family(cfg, name):
-    p = str(cfg.get("coder_model_profile") or cfg.get("coder_model_name") or cfg.get("model_name") or name).lower()
+    p = str(cfg.get("coder_model_profile") or cfg.get("model_name") or cfg.get("coder_model_name") or name).lower()
     if "gpt-oss" in p or "gpt_oss" in p:
         return "gpt-oss-120b"
     if "qwen" in p:
@@ -73,28 +70,28 @@ def _think_share(path):
     return None
 
 
-def pilot_bars(log_path):
-    """[(step, total, elapsed_s)] of every pilot progress bar that reached (almost) its total."""
+def rollout_bars(log_path):
+    """Return the step, count, and elapsed time for each completed rollout bar."""
     out, cur, step = [], None, None
     try:
         with open(log_path, encoding="utf-8", errors="replace") as fh:
             for ln in fh:
                 ln = ANSI.sub("", ln.rstrip("\n"))
                 ms = STEP.search(ln)
-                if ms and "pilot rollouts:" not in ln:
+                if ms:
                     step = int(ms.group(1))
                 m = BAR.match(ln)
                 if not m:
                     continue
                 k, n, el = int(m.group(4)), int(m.group(5)), _secs(m.group(6))
-                if cur is None or k < cur["k"] or n != cur["n"]:
+                if cur is None or step != cur["step"] or k < cur["k"] or n != cur["n"]:
                     cur = {"step": step, "k": k, "n": n, "el": el}
                     out.append(cur)
                 else:
                     cur["k"], cur["el"] = k, el
     except OSError:
         return []
-    return [(b["step"], b["n"], b["el"]) for b in out if b["k"] >= b["n"] - 2 and b["el"] > 0]
+    return [(b["step"], b["n"], b["el"]) for b in out if b["k"] == b["n"] and b["el"] > 0]
 
 
 def scan_run(run_dir):
@@ -107,7 +104,8 @@ def scan_run(run_dir):
     fam = family(cfg, name)
     toks = {}          # effort -> [ntok]
     qual = {}          # effort -> [valid, beat parent, total] over scored first-attempt rollouts
-    pilot = {}         # step -> {effort: tokens} of pilot-phase rollouts (first attempt)
+    planned = Counter()
+    step_tokens = {}
     files = {}         # effort -> [text path] for the thinking-share sample
     for mf in sorted(glob.glob(os.path.join(run_dir, "step*", "step*_group*_rollout*.meta.json"))):
         try:
@@ -116,7 +114,15 @@ def scan_run(run_dir):
         except (OSError, ValueError):
             continue
         n, eff = m.get("n_response_tokens"), m.get("coder_reasoning_effort")
-        if not n or not eff or "valid" not in m:
+        if "valid" not in m:
+            continue
+        if not m.get("retry_attempt"):
+            step = int(m.get("step", -1))
+            planned[step] += 1
+            if n:
+                d = step_tokens.setdefault(step, Counter())
+                d[eff or "default"] += n
+        if not n or not eff:
             continue
         toks.setdefault(eff, []).append(n)
         if not m.get("retry_attempt"):
@@ -126,9 +132,6 @@ def scan_run(run_dir):
                 pv, rw = m.get("parent_value"), m.get("reward")
                 if pv is not None and rw is not None and rw > pv + 1e-12:
                     q[1] += 1
-        if (m.get("strategy_rollout_phase") or "pilot") == "pilot" and not m.get("retry_attempt"):
-            d = pilot.setdefault(int(m.get("step", -1)), {})
-            d[eff] = d.get(eff, 0) + n
         files.setdefault(eff, []).append(mf[:-len(".meta.json")] + ".txt")
     if not toks:
         return None
@@ -147,9 +150,9 @@ def scan_run(run_dir):
     gpus = [g for g in str(cfg.get("gpu_ids") or cfg.get("available_gpu_ids") or "").split(",") if g.strip()]
     hw = cfg.get("hardware_profile") or cfg.get("gpu_type") or ""
     rates = []
-    for step, total, el in pilot_bars(os.path.join(run_dir, "temirnal.log")):
-        t = pilot.get(step)
-        if not t or not gpus:
+    for step, total, el in rollout_bars(os.path.join(run_dir, "temirnal.log")):
+        t = step_tokens.get(step)
+        if not t or not gpus or planned[step] != total:
             continue
         tok = sum(t.values())
         rates.append({"step": step, "rollouts": total, "tokens": tok, "elapsed_s": el, "tps_total": round(tok / el, 1), "tps_gpu": round(tok / el / len(gpus), 1),
@@ -164,7 +167,7 @@ def collect(run_dirs, log=print):
         r = scan_run(d)
         if r:
             runs.append(r)
-            log("  effort stats: %-46s %s, %d rollouts, %d pilot timings" % (r["run"], r["model"], sum(m["n"] for m in r["modes"].values()), len(r["rates"])))
+            log("  effort stats: %-46s %s, %d rollouts, %d generation timings" % (r["run"], r["model"], sum(m["n"] for m in r["modes"].values()), len(r["rates"])))
         else:
             log("  effort stats: skipped %s (no config / no scored rollouts)" % os.path.basename(d))
     # pooled token statistics per (model, effort, problem)
@@ -195,7 +198,7 @@ def collect(run_dirs, log=print):
         pure = [x for x in xs if len(x["mix"]) == 1 or max(x["mix"].values()) > 0.97]
         use = pure or xs
         speed_out[model] = {"tps_gpu_median": round(st.median(x["tps_gpu"] for x in use), 1), "tps_gpu_min": min(x["tps_gpu"] for x in use), "tps_gpu_max": max(x["tps_gpu"] for x in use),
-                            "n_timings": len(use), "n_runs": len({x["run"] for x in use}), "basis": "steps whose pilot phase was (almost) all one effort" if pure else "all pilot phases (mixed efforts)",
+                            "n_timings": len(use), "n_runs": len({x["run"] for x in use}), "basis": "steps with one predominant effort" if pure else "all measured steps",
                             "samples": use}
     # derived cost per rollout: mean tokens of the pooled group / measured aggregate speed of that model on B200
     derived = []

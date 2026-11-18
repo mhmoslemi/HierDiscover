@@ -11,7 +11,6 @@ from contextlib import contextmanager
 from datetime import timedelta
 from functools import partial
 import math
-from pathlib import Path
 from types import MethodType, SimpleNamespace
 
 import torch
@@ -109,7 +108,7 @@ def initialize_groups(world_size):
 def availability(model, cfg, world_size):
     """Never substitute independent sequence chunks or a slow recurrent kernel."""
     if (getattr(cfg, "coder_model_profile", "") != "qwen3.8-27b"
-            or getattr(cfg, "advantage_mode", "") not in {"spo-rs", "spo-rs-v2"}
+            or getattr(cfg, "advantage_mode", "") != "spo-rs"
             or world_size < 2 or world_size & (world_size - 1)):
         return False, "not a supported hybrid Qwen replicated SPO-RS layout"
     try:
@@ -297,7 +296,7 @@ def hybrid_context(model, group):
         set_gradient_checkpointing(model, checkpointed)
 
 
-def token_logprobs(model, example, tokenizer, cfg, context, *, with_grad=True, measure=False):
+def token_logprobs(model, example, tokenizer, cfg, context, *, with_grad=True):
     """Preserve every response target, its predecessor and its global position."""
     import training.trainers as training
     from training.training_checkpointing import grouped_qwen_hidden
@@ -321,21 +320,13 @@ def token_logprobs(model, example, tokenizer, cfg, context, *, with_grad=True, m
                              attention_mask=None, use_cache=False, return_dict=True).last_hidden_state
         first, last = max(start, prompt.numel() - 1), min(end, total)
         scores = hidden.sum() * 0.0 + hidden.new_zeros((part,), dtype=torch.float32)
-        entropies = torch.zeros_like(scores, requires_grad=False) if measure else None
         if first < last:
             targets = response[first - prompt.numel() + 1:last - prompt.numel() + 1].to(device)
-            result = training._score_hidden_token_chunks(
+            chosen = training._score_hidden_token_chunks(
                 hidden[0, first - start:last - start], targets, head,
-                chunk=cfg.logprob_chunk, with_grad=with_grad,
-                return_entropy="measure" if measure else False)
-            chosen, entropy = result if measure else (result, None)
+                chunk=cfg.logprob_chunk, with_grad=with_grad)
             scores = scores.index_copy(0, torch.arange(first - start, last - start, device=device), chosen)
-            if measure:
-                entropies[first - start:last - start] = entropy.detach()
-        scores = gather(scores, context.group)[prompt.numel() - 1:total]
-        if measure:
-            entropies = gather(entropies, context.group)[prompt.numel() - 1:total]
-        return scores, entropies
+        return gather(scores, context.group)[prompt.numel() - 1:total]
 
 
 @_stable_bf16_matmul()
@@ -358,19 +349,16 @@ def compute_context_work(backend, tokenizer, example, cfg, group, ranks, *, vali
         if not hasattr(backend, "_validated_context_groups"):
             backend._validated_context_groups = set()
         backend._validated_context_groups.add(ranks)
-    descriptor = example.get("_entropy_measurement")
-    measure = bool(descriptor and not Path(descriptor["path"]).exists())
     with hybrid_context(model, group) as context:
         with training._policy_dropout_disabled(model):
             missing = training._initialize_behavior_logprobs([example])
             old = example.get("old_policy_logprobs")
             if missing:
-                old, _ = token_logprobs(model, example, tokenizer, cfg, context, with_grad=False)
-            current, entropy = token_logprobs(model, example, tokenizer, cfg, context, measure=measure)
+                old = token_logprobs(model, example, tokenizer, cfg, context, with_grad=False)
+            current = token_logprobs(model, example, tokenizer, cfg, context)
             epsilon, low, high, kl = training._clipped_policy_options(cfg)
             loss, metrics = training.clipped_policy_loss(
                 cfg, current, old.to(device), None, example["advantage"],
-                forced_token_indices=example.get("forced_token_indices", ()),
                 clip_epsilon=epsilon, clip_epsilon_low=low,
                 clip_epsilon_high=high, kl_coef=kl)
             if not torch.isfinite(loss).all():
@@ -379,12 +367,6 @@ def compute_context_work(backend, tokenizer, example, cfg, group, ranks, *, vali
             # Every rank sees the gathered loss. Its gather backward sums those
             # copies; divide here, then SUM parameter gradients across the group.
             (weight * loss / context.size).backward()
-            if measure and context.rank == 0:
-                from analysis.entropy_tools import _record_tensor, _warn_once
-                try:
-                    _record_tensor(descriptor, entropy)
-                except (OSError, ValueError, RuntimeError) as error:
-                    _warn_once("could not record policy entropy", error)
     from training.fast_distributed import reduce_trainable_gradients
 
     reduce_trainable_gradients(model, destination_rank=ranks[0], group=group)
@@ -393,13 +375,12 @@ def compute_context_work(backend, tokenizer, example, cfg, group, ranks, *, vali
                  if parameter.requires_grad and parameter.grad is not None}
     model.zero_grad(set_to_none=True)
     totals = {name: weight * float(metrics[name]) for name in
-              ("policy_loss", "kl_estimate", "entropy_estimate", "ratio")}
+              ("policy_loss", "kl_estimate", "ratio")}
     totals.update(loss=weight * float(loss.detach()),
                   clipped_fraction=weight * float(metrics["clipped"]))
     result = dict(completed=True, stats=dict(
         totals=totals, max_ratio=float(metrics["ratio"]),
-        max_prefix_ratio=float(metrics["prefix_ratio_max"]),
-        entropy_examples=0, backward_batches=1))
+        max_prefix_ratio=float(metrics["prefix_ratio_max"]), backward_batches=1))
     if dist.get_rank(group) == 0:
         result["gradient_pack"] = pack_cpu_gradients(gradients)
         if not validate:
@@ -431,9 +412,7 @@ def _validate_context_group(backend, tokenizer, example, cfg, group, ranks):
     mini = dict(example, prompt_ids=example["prompt_ids"][:, :17],
                 response_ids=example["response_ids"][:, :64 * len(ranks) - 33],
                 advantage=1.0, sample_weight=1.0)
-    mini.pop("_entropy_measurement", None)
     size = mini["response_ids"].shape[1]
-    mini["forced_token_indices"] = [index for index in mini.get("forced_token_indices", ()) if index < size]
     old = torch.empty(size, dtype=torch.float32, device=device)
     reference_gradients = None
     if leader:
@@ -448,12 +427,11 @@ def _validate_context_group(backend, tokenizer, example, cfg, group, ranks):
                 source, (0, padded - total), value=tokenizer.pad_token_id)
             scores = training._decoder_token_logprobs(
                 model, source, None, [(prompt.numel() - 1, total)], [response[0]],
-                with_grad=True, chunk=cfg.logprob_chunk, return_entropy=False)[0]
+                with_grad=True, chunk=cfg.logprob_chunk)[0]
             old.copy_(scores.detach())
             epsilon, low, high, kl = training._clipped_policy_options(cfg)
             loss, _ = training.clipped_policy_loss(
                 cfg, scores, old, None, 1.0, clip_epsilon=epsilon,
-                forced_token_indices=mini.get("forced_token_indices", ()),
                 clip_epsilon_low=low, clip_epsilon_high=high, kl_coef=kl)
             loss.backward()
         reference_gradients = {name: parameter.grad.detach().cpu().clone()
@@ -635,7 +613,6 @@ def complete_context_overflow(trainer, examples, cfg, step_idx, state):
                     totals={name: sum(row["totals"][name] for row in stats) for name in METRICS},
                     max_ratio=max(row["max_ratio"] for row in stats),
                     max_prefix_ratio=max(row["max_prefix_ratio"] for row in stats),
-                    entropy_examples=sum(row["entropy_examples"] for row in stats),
                     backward_batches=len(successful))
                 training._commit_exact_spo_rs_overflow_batch(
                     trainer.model, state, step_idx, successful, combined,
@@ -670,8 +647,7 @@ def complete_context_overflow(trainer, examples, cfg, step_idx, state):
         trainer._collect_event("updated", range(1, trainer.world_size))
         trainer.model.zero_grad(set_to_none=True)
         trainer._workers_idle = True
-        result.update(training_parallel_gpus=trainer.world_size, training_fast=True,
-                      training_fast_processes=True, exact_overflow_inprocess=True,
+        result.update(training_parallel_gpus=trainer.world_size, exact_overflow_inprocess=True,
                       exact_overflow_context_parallel=True, exact_overflow_waves=waves,
                       exact_overflow_completed_examples=processed)
         return result

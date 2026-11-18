@@ -37,8 +37,7 @@ import uuid
 import numpy as np
 from dataclasses import asdict, dataclass, field
 
-
-PARENT_SELECTION_MODES = ("puct", "uct", "llm", "puct-jev")
+from config_validation import PARENT_SELECTION_MODES
 
 
 def parent_selection_mode(config):
@@ -47,22 +46,18 @@ def parent_selection_mode(config):
     if mode is None:
         mode = "uct" if config.get("uct", False) else "puct"
     if not isinstance(mode, str) or mode.lower() not in PARENT_SELECTION_MODES:
-        raise ValueError("parent_selection must be 'puct', 'uct', 'llm', or 'puct-jev'")
+        raise ValueError(f"parent_selection must be one of {PARENT_SELECTION_MODES}")
     return mode.lower()
 
 
 def can_migrate_parent_selection(source, target):
-    return (target == "llm" and source in ("puct", "uct")
-            or source == "puct" and target == "puct-jev")
+    return source == "puct" and target == "puct-jev"
 
 
 def make_sampler(*, parent_selection="puct", group_size=1, seed=0,
                  exp_dir=None, problem=None, jev_model_path=None,
                  jev_candidate_multiplier=3, jev_same_core_threshold=0.68, **kwargs):
     mode = parent_selection_mode({"parent_selection": parent_selection})
-    if mode == "llm":
-        from search.llm_sampler import LLMSampler
-        return LLMSampler(exp_dir=exp_dir, problem=problem, **kwargs)
     if mode == "puct-jev":
         from search.jev_sampler import PUCTJevSampler
         return PUCTJevSampler(exp_dir=exp_dir, problem=problem,

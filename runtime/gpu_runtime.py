@@ -15,7 +15,6 @@ from pathlib import Path
 import re
 import subprocess
 from typing import Dict, Iterable, List, Optional
-from models.strategist_models import strategist_profile, strategist_memory_per_rank
 
 
 GPU_PROBLEM_NAMES = {
@@ -78,10 +77,9 @@ def allocate_gpu_roles(available: Iterable[int], problem: str,
     """Apply the phase-sharing role table defined by the launcher contract.
 
     The first card owns the differentiable trainer, but it is not a
-    training-only card: it rejoins every rollout phase. TriMul uses every card
-    for pilot/phase-2 generation, then releases the last independent TP=1
-    engine for serialized benchmarking. Other GPU-mode tasks keep their
-    evaluator reserved throughout the step.
+    training-only card: it rejoins rollout generation. TriMul generates on
+    every card, then releases the pool for one benchmark at a time per GPU.
+    Other GPU-mode tasks keep their evaluator reserved throughout the step.
     """
     ids = parse_gpu_ids(list(available))
     gpu_problem = str(problem or "").strip().lower() in GPU_PROBLEM_NAMES
@@ -173,9 +171,6 @@ def _auto(value) -> bool:
 
 def _model_size_billions(model_name: str) -> float:
     name = str(model_name or "").lower()
-    profile = strategist_profile(model_name)
-    if profile:
-        return 180.0 if profile["family"] == "qwen3.8-flash-next" else 304.0
     # Some sparse models omit their total parameter count from the repository
     # name. These totals matter for weight residency even though only a small
     # fraction of experts is active for each token.
@@ -222,9 +217,6 @@ def _known_vllm_runtime_weight_floor_gib(model_name: str) -> Optional[float]:
         # The parameter-count fallback is only 59.60 GiB and can therefore
         # admit a TP=1 layout that has no room for its configured KV cache.
         return 62.0
-    if "qwen3-30b-a3b-thinking-2507" in name:
-        # 30.5B checkpoint in BF16, plus small serialization/alignment slack.
-        return 57.0
     if "qwen3.8-27b" in name:
         # The published checkpoint index is about 51.75 GiB; the simple 27B
         # parameter-name estimate is slightly smaller than the real files.
@@ -242,9 +234,6 @@ def _kv_bytes_per_token(model_name: str) -> int:
         # generation even though vLLM's hybrid KV manager stores the windowed
         # layers at their bounded size.
         return 36_864
-    if "qwen3-30b-a3b-thinking-2507" in name:
-        # 48 layers * 4 KV heads * 128 head dim * BF16 K+V.
-        return 98_304
     if "qwen3.8-27b" in name:
         # Only the full-attention layers grow a KV cache with sequence length;
         # the interleaved Gated DeltaNet layers use fixed recurrent state.
@@ -273,10 +262,6 @@ def _checkpoint_weight_gib(model_name: str) -> Optional[float]:
 
 
 def _estimated_weight_gib(model_name: str, quantization: str) -> float:
-    profile = strategist_profile(model_name)
-    if profile:
-        return max(_checkpoint_weight_gib(model_name) or 0.0,
-                   profile["weights_gib"])
     quant = str(quantization or "").strip().lower()
     if quant in ("", "auto", "none"):
         exact = _checkpoint_weight_gib(model_name)
@@ -339,26 +324,19 @@ def uses_bounded_gpt_oss_repack(model_name, quantization=None) -> bool:
             in ("", "auto", "none", "mxfp4", "gpt_oss_mxfp4"))
 
 
-def _vllm_memory_per_rank(cfg, parallel_size, max_length=None):
+def _vllm_memory_per_rank(cfg, model_name, parallel_size, max_length=None):
     max_length = _effective_max_length(cfg) if max_length is None else max_length
-    if cfg.get("strategy_inference_profile"):
-        weight, kv = strategist_memory_per_rank(
-            cfg["model_name"], parallel_size, max_length)
-        if cfg.get("hardware_profile") == "B200":
-            weight += strategist_profile(cfg["model_name"])["ple_gib"] / parallel_size
-        return weight, kv
     return (
-        _estimated_weight_gib(cfg.get("model_name", ""),
+        _estimated_weight_gib(model_name,
                               cfg.get("vllm_quantization", "")) / parallel_size,
-        _kv_bytes_per_token(cfg.get("model_name", "")) * max_length
+        _kv_bytes_per_token(model_name) * max_length
         / parallel_size / 2**30,
     )
 
 
-def _minimum_vllm_gib_per_gpu(cfg: dict, parallel_size: int) -> float:
+def _minimum_vllm_gib_per_gpu(cfg: dict, model_name: str, parallel_size: int) -> float:
     parallel_size = max(1, int(parallel_size))
-    model_name = cfg.get("model_name", "")
-    weight_gib, kv_gib = _vllm_memory_per_rank(cfg, parallel_size)
+    weight_gib, kv_gib = _vllm_memory_per_rank(cfg, model_name, parallel_size)
     required = weight_gib + 4.0 + kv_gib
 
     # GPT-OSS-120B's native MXFP4 checkpoint can reside on a 95-GiB card once
@@ -381,7 +359,7 @@ def _minimum_vllm_gib_per_gpu(cfg: dict, parallel_size: int) -> float:
 
 
 def resolve_memory_settings(cfg: dict, roles: GPURoles,
-                            memory: Dict[int, GPUMemory]) -> List[str]:
+                            memory: Dict[int, GPUMemory], *, model_name: str) -> List[str]:
     """Resolve auto knobs in-place and return human-readable decisions.
 
     These are admission limits, not promises that arbitrary generated programs
@@ -410,13 +388,13 @@ def resolve_memory_settings(cfg: dict, roles: GPURoles,
         cfg["vllm_gpu_memory_utilization"] = util
 
     max_len = _effective_max_length(cfg)
-    size_b = _model_size_billions(cfg.get("model_name", ""))
+    size_b = _model_size_billions(model_name)
     tp = max(1, int(cfg.get("vllm_tensor_parallel_size")
                     or len(roles.generation)))
     pp = max(1, int(cfg.get("vllm_pipeline_parallel_size") or 1))
     parallel_size = tp * pp
     weight_gib_per_gpu, kv_gib_per_seq_gpu = _vllm_memory_per_rank(
-        cfg, parallel_size)
+        cfg, model_name, parallel_size)
     effective_budget = _effective_vllm_budget_gib(
         cfg, min_total, float(cfg["vllm_gpu_memory_utilization"]))
     reserve_gib = max(
@@ -436,7 +414,7 @@ def resolve_memory_settings(cfg: dict, roles: GPURoles,
     if using_vllm and selected and estimated_sequences < 1:
         required = weight_gib_per_gpu + 4.0 + kv_gib_per_seq_gpu
         raise ValueError(
-            f"{cfg.get('model_name')} is estimated to require at least "
+            f"{model_name} is estimated to require at least "
             f"{required:.1f} GiB per generation GPU for one "
             f"{max_len}-token request, but the vLLM budget is "
             f"{effective_budget:.1f} GiB. "
@@ -463,11 +441,11 @@ def resolve_memory_settings(cfg: dict, roles: GPURoles,
         # B200 needs wider decode batches; use a 32K active target there
         # (16K for GPT-OSS). This changes admission, never the output limit.
         active_target = (16_384 if using_vllm and uses_bounded_gpt_oss_repack(
-            cfg.get("model_name"), cfg.get("vllm_quantization"))
+            model_name, cfg.get("vllm_quantization"))
             else (32_768 if b200 else 65_536))
         active_tokens = min(max_len, active_target)
         _, kv_gib_per_active_seq_gpu = _vllm_memory_per_rank(
-            cfg, parallel_size, active_tokens)
+            cfg, model_name, parallel_size, active_tokens)
         estimated_active_sequences = int(
             kv_budget / max(kv_gib_per_active_seq_gpu, 0.01))
         # Keep CUDA graph/admission metadata bounded even when short responses
@@ -562,13 +540,8 @@ def derive_vllm_tensor_parallel_size(num_gpus: int,
 
 def known_attention_heads(model_name: str) -> Optional[int]:
     """Fast preflight for the model families explicitly supported here."""
-    profile = strategist_profile(model_name)
-    if profile:
-        return profile["heads"]
     name = str(model_name or "").lower()
     if "deepseek-r1-0528-qwen3-8b" in name:
-        # Qwen3-8B architecture: exact TP=1 replicas use all cards in
-        # parallel instead of collapsing the strategist into one TP=8 engine.
         return 32
     if "qwen2.5-coder-7b" in name:
         return 28
@@ -578,8 +551,6 @@ def known_attention_heads(model_name: str) -> Optional[int]:
         return 32
     if "qwen3-32b" in name:
         return 64
-    if "qwen3-30b-a3b-thinking-2507" in name:
-        return 32
     if "qwen3.8-27b" in name:
         return 24
     if "deepseek-r1-distill-qwen-32b" in name:
@@ -587,8 +558,6 @@ def known_attention_heads(model_name: str) -> Optional[int]:
         # Knowing its 40 query heads lets eight GPUs form four independent
         # TP=2 engines instead of conservatively forcing one TP=8 engine.
         return 40
-    if "qwen3-8b" in name:
-        return 32
     if "gpt-oss-20b" in name:
         return 64
     if "gpt-oss-120b" in name:
@@ -620,7 +589,7 @@ def detect_attention_heads(model_name: str) -> Optional[int]:
 
 def derive_vllm_parallel_layout(cfg: dict, roles: GPURoles,
                                 memory: Dict[int, GPUMemory],
-                                num_attention_heads: Optional[int]
+                                num_attention_heads: Optional[int], *, model_name: str
                                 ) -> VLLMParallelLayout:
     """Use the smallest fitting TP group so rollout replicas stay parallel.
 
@@ -656,23 +625,17 @@ def derive_vllm_parallel_layout(cfg: dict, roles: GPURoles,
     budget = _effective_vllm_budget_gib(cfg, min_total, util)
 
     tp = compatible_tp[-1]
-    required = _minimum_vllm_gib_per_gpu(cfg, tp)
+    required = _minimum_vllm_gib_per_gpu(cfg, model_name, tp)
     pp = num_gpus // tp
     replicas = 1
     for candidate_tp in compatible_tp:
-        candidate_required = _minimum_vllm_gib_per_gpu(cfg, candidate_tp)
+        candidate_required = _minimum_vllm_gib_per_gpu(cfg, model_name, candidate_tp)
         if candidate_required <= budget:
             tp = candidate_tp
             required = candidate_required
             pp = 1
             replicas = num_gpus // candidate_tp
             break
-
-    if cfg.get("strategy_inference_profile") and pp != 1:
-        raise ValueError(
-            f"{cfg['model_name']}: no fitting all-GPU TP layout; these "
-            "strategists require PP=1. Use a compatible GPU inventory or "
-            "checkpoint; context is not reduced automatically.")
 
     return VLLMParallelLayout(
         tensor_parallel_size=tp,
@@ -685,7 +648,7 @@ def derive_vllm_parallel_layout(cfg: dict, roles: GPURoles,
 
 def align_vllm_layout_to_concurrency(
         cfg: dict, layout: VLLMParallelLayout, num_gpus: int,
-        num_attention_heads: Optional[int], max_concurrency: int,
+        num_attention_heads: Optional[int], max_concurrency: int, *, model_name: str,
         ) -> VLLMParallelLayout:
     """Fold strategist replicas above the live chain frontier into TP ranks.
 
@@ -728,9 +691,7 @@ def align_vllm_layout_to_concurrency(
             if tp < 1:
                 continue
             pp = world_size // tp
-            if cfg.get("strategy_inference_profile") and pp != 1:
-                continue
-            required = _minimum_vllm_gib_per_gpu(cfg, tp)
+            required = _minimum_vllm_gib_per_gpu(cfg, model_name, tp)
             if required > float(layout.budget_gib):
                 continue
             return VLLMParallelLayout(

@@ -3,7 +3,6 @@
 let _stageSel = "select", _walk = null;
 
 function parentsOf(step) { return (ST[step] && ST[step].parents) || []; }
-function allocOf(step, g, s) { return ((ST[step] && ST[step].alloc) || []).find(a => a.parent_group === g && a.strategy_index === s); }
 function slotsOf(step) { // from the strategist blob: keyed "step:g:s"
   const out = [];
   if (!D.strat) return out;
@@ -17,19 +16,18 @@ registerTab({
     await lazy("strat");
     const step = S.step, st = ST[step], rs = RS[step] || [];
     root.append(pageHead(`How step ${step} was produced`,
-      `One training step runs <b>eight stages</b>. The numbers below are the real counts for the selected step; click a stage for the mechanism, the exact formula, the code that does it, and the data it produced. ` +
+      `One training step runs <b>${STAGES.length} stages</b>. The numbers below are the real counts for the selected step; click a stage for the mechanism, the exact formula, the code that does it, and the data it produced. ` +
       (st.completed ? "" : st.provisional ? `<span class="pill warn">step ${step}: all rollouts are scored (its best counts for best-so-far), the adapter update and summary are not written yet - training numbers are missing</span>` : `<span class="pill warn">step ${step} is still in progress on disk - only the stages that already wrote files are filled in</span>`)));
 
-    const planned = rs.filter(r => !r.isRetry), retries = rs.filter(r => r.isRetry);
+    const planned = rs.filter(r => r.planned !== false);
     const slots = slotsOf(step);
     const attempts = sum(slots.map(s => s.attempts.length)), fallbacks = slots.filter(s => s.fallback).length;
     const jev = st.jev, rejected = jev ? (jev.decisions || []).filter(d => !d.accepted).length : 0;
     const nums = {
       select: [parentsOf(step).length || "–", jev && jev.candidate_limit ? `${jev.comparisons.length} JEV judgments · ${rejected} rejected` : (RUN.hasJev ? "plain PUCT on the seeds" : "PUCT with lineage blocking")],
       strategist: [slots.length ? `${slots.length}` : "–", `${attempts} attempts · ${fallbacks} fallbacks`],
-      pilot: [planned.filter(r => r.phase === "pilot").length || "–", "programs · 11 per strategy"],
-      alloc: [planned.filter(r => r.phase === "adaptive").length || "–", "programs · 20 per parent"],
-      eval: [rs.length ? fmt.pct(rs.filter(r => r.valid).length / rs.length, 0) : "–", `valid of ${rs.length}${retries.length ? ` (${retries.length} retries)` : ""}`],
+      coder: [planned.length || "–", "planned programs"],
+      eval: [rs.length ? fmt.pct(rs.filter(r => r.valid).length / rs.length, 0) : "–", `valid of ${rs.length}`],
       adv: [st.spo ? "v " + fmt.f(st.spo.value_before, 3) : "–", st.spo ? `→ ${fmt.f(st.spo.value_after, 3)} · η ${fmt.f(st.spo.eta, 2)}` : ""],
       train: [st.training_seconds ? fmt.dur(st.training_seconds) : "–", st.policy_updates && st.policy_updates[0] ? `grad ‖g‖ ${fmt.sci(st.policy_updates[0].grad_norm, 1)}` : ""],
       archive: [st.archive_size || "–", st.archive_size ? `states after step ${step}` : ""],
@@ -45,7 +43,7 @@ registerTab({
         h("div", { class: "model-chip " + sg.chip[1], title: sg.chip[2] }, sg.chip[0])));
     });
     const walkBtn = h("button", { class: "btn" + (_walk ? " on" : ""), onclick: () => walkToggle() }, _walk ? "■ stop walkthrough" : "▶ walk through the stages");
-    root.append(card(null, null, h("div", null, h("div", { class: "row-flex", style: { marginBottom: "6px", justifyContent: "space-between" } }, h("div", { class: "sub" }, `Step ${step}: 8 parents → 32 strategies → 512 programs → one LoRA update`), walkBtn), flow)));
+    root.append(card(null, null, h("div", null, h("div", { class: "row-flex", style: { marginBottom: "6px", justifyContent: "space-between" } }, h("div", { class: "sub" }, `Step ${step}: ${parentsOf(step).length} parents · ${slots.length} plans · ${planned.length} planned programs`), walkBtn), flow)));
 
     // ---- flow diagram of where the programs go (animated)
     if (rs.length) {
@@ -146,52 +144,28 @@ const STAGE_VIZ = {
     box.append(h("p", { class: "sub" }, "Click a cell to read that strategy, its attempts and the prompt anatomy in the Strategist tab."));
   },
 
-  async pilot(box, step) {
-    const rs = (RS[step] || []).filter(r => !r.isRetry && r.phase === "pilot");
+  async coder(box, step) {
+    const rs = (RS[step] || []).filter(r => r.planned !== false);
     if (!rs.length) { box.append(h("div", { class: "empty" }, "No coder rollouts for this step yet.")); return; }
-    const cell = (g, s) => rs.filter(r => r.pg === g && r.sidx === s);
+    const parents = [...new Set(rs.map(r => r.pg))].sort((a, b) => a - b);
+    const strategies = [...new Set(rs.map(r => r.sidx))].sort((a, b) => a - b);
+    const label = s => s == null ? "Direct" : "S" + s;
+    const cell = (i, j) => rs.filter(r => r.pg === parents[i] && r.sidx === strategies[j]);
     const host = h("div", { class: "chart" }); box.append(host);
     heatmap(host, {
-      rows: range(0, 8).map(g => "parent " + g), cols: ["S0", "S1", "S2", "S3"], rowLabelW: 62, maxCell: 90, cellH: 30,
+      rows: parents.map(g => "parent " + g), cols: strategies.map(label), rowLabelW: 62, maxCell: 90, cellH: 30,
       val: (i, j) => { const c = cell(i, j); return c.length ? c.filter(r => r.valid).length / c.length : null; },
       color: v => seqRamp(v), text: (v, i, j) => { const c = cell(i, j); return c.length ? c.filter(r => r.valid).length + "/" + c.length : null; },
       textColor: v => v > 0.55 ? "#fff" : cssVar("--ink"),
-      tip: (i, j) => { const c = cell(i, j); const v = c.filter(r => r.valid); return `<b>parent ${i} · S${j}</b><div>${v.length}/${c.length} valid</div><div>beat parent: ${c.filter(r => r.improved).length}</div><div>best bound: ${v.length ? fmt.raw(Math.min(...v.map(r => r.raw))) : "–"}</div><div class="mut">mean reward ${fmt.f(mean(c.map(r => r.reward)), 4)}</div>`; },
-      onClick: (i, j) => setState({ tab: "rollouts", group: i, sidx: j }),
+      tip: (i, j) => { const c = cell(i, j); const v = c.filter(r => r.valid); return `<b>parent ${parents[i]} · ${label(strategies[j])}</b><div>${v.length}/${c.length} valid</div><div>beat parent: ${c.filter(r => r.improved).length}</div><div>best bound: ${v.length ? fmt.raw(Math.min(...v.map(r => r.raw))) : "–"}</div><div class="mut">mean reward ${fmt.f(mean(c.map(r => r.reward)), 4)}</div>`; },
+      onClick: (i, j) => setState({ tab: "rollouts", group: parents[i], sidx: strategies[j] ?? 0 }),
     });
-    box.append(h("p", { class: "sub", style: { marginTop: "6px" } }, "Color = fraction of the 11 pilot programs that were valid. Each strategy's pilot decides how the 20 spare programs get spent (next stage)."));
+    box.append(h("p", { class: "sub", style: { marginTop: "6px" } }, "Color shows the valid fraction among planned programs for each strategy."));
     const v = rs.filter(r => r.valid);
     box.append(h("div", { class: "kv", style: { marginTop: "8px" }, html:
-      `<div class="k">Pilot programs</div><div class="v">${rs.length}</div><div class="k">Valid</div><div class="v">${v.length} (${fmt.pct(v.length / rs.length)})</div>` +
+      `<div class="k">Planned programs</div><div class="v">${rs.length}</div><div class="k">Valid</div><div class="v">${v.length} (${fmt.pct(v.length / rs.length)})</div>` +
       `<div class="k">Mean response</div><div class="v">${fmt.tok(Math.round(mean(rs.map(r => r.ntok || 0))))} tokens</div>` +
-      `<div class="k">Best pilot bound</div><div class="v">${v.length ? fmt.raw(Math.min(...v.map(r => r.raw))) : "–"}</div>` }));
-  },
-
-  async alloc(box, step) {
-    const al = (ST[step].alloc) || [];
-    if (!al.length) { box.append(h("div", { class: "empty" }, "No allocation recorded for this step.")); return; }
-    box.append(h("div", { class: "sub" }, "Each bar = the 64 programs of one parent: grey = 11 pilot programs per strategy, bright = follow-ups granted by the hurdle allocator."));
-    const wrap = h("div", { style: { display: "grid", gap: "8px", marginTop: "8px" } });
-    for (let g = 0; g < 8; g++) {
-      const row = range(0, 4).map(s => allocOf(step, g, s)).filter(Boolean);
-      if (!row.length) continue;
-      const bar = h("div", { class: "sbar", style: { height: "20px" } });
-      row.forEach(a => {
-        const pil = h("span", { style: { width: (a.pilot_count / 64 * 100) + "%", background: S_COL(a.strategy_index), opacity: 0.38 } });
-        bar.append(pil);
-        if (a.followup_count) bar.append(h("span", { style: { width: (a.followup_count / 64 * 100) + "%", background: S_COL(a.strategy_index) } }));
-        bindTip(pil, () => tipHtmlAlloc(a));
-      });
-      wrap.append(h("div", { style: { display: "grid", gridTemplateColumns: "58px 1fr 120px", gap: "8px", alignItems: "center", fontSize: "12px" }, onclick: () => setState({ tab: "alloc", group: g }), }, h("span", null, "parent " + g), bar,
-        h("span", { class: "sub" }, row.map(a => a.allocated_programs).join(" / "))));
-    }
-    box.append(wrap);
-    box.append(legend(range(0, 4).map(s => ({ color: S_COL(s), label: "S" + s }))));
-    const winners = range(0, 8).map(g => { const r = range(0, 4).map(s => allocOf(step, g, s)).filter(Boolean); return r.length ? Math.max(...r.map(a => a.followup_count)) : null; }).filter(x => x != null);
-    box.append(h("div", { class: "kv", style: { marginTop: "8px" }, html:
-      `<div class="k">Winner-take-all parents</div><div class="v">${winners.filter(x => x === 20).length} of ${winners.length} gave all 20 to one strategy</div>` +
-      `<div class="k">Split parents</div><div class="v">${winners.filter(x => x < 20).length}</div>` }));
-    box.append(h("p", { class: "sub" }, "Click a bar to open the allocation sandbox for that parent."));
+      `<div class="k">Best bound</div><div class="v">${v.length ? fmt.raw(Math.min(...v.map(r => r.raw))) : "–"}</div>` }));
   },
 
   async eval(box, step) {
@@ -291,13 +265,6 @@ const STAGE_VIZ = {
   },
 };
 
-function tipHtmlAlloc(a) {
-  return `<b>parent ${a.parent_group} · S${a.strategy_index}</b><div>pilot valid ${a.pilot_valid_count}/${a.pilot_count} · improved ${a.hurdle ? a.hurdle.improvement_count : "–"}</div>` +
-    `<div>mean reward ${fmt.f(a.pilot_reward_mean, 4)}</div><div>posterior P(improve) ${fmt.f(a.hurdle ? a.hurdle.posterior_improvement_probability : NaN, 3)}</div>` +
-    `<div>expected improvement ${fmt.sci(a.initial_expected_improvement, 2)}</div><div><b>follow-ups ${a.followup_count}</b> → ${a.allocated_programs} programs</div>`;
-}
-
-
 let _lastHi = -1;
 function highlightStageByProgress(f) {
   const idx = f >= 1 ? -1 : Math.min(STAGES.length - 1, Math.floor(f * STAGES.length));
@@ -310,31 +277,30 @@ function highlightStageByProgress(f) {
 /* columns / links of the programs flow for one step (counts from the real rollouts) */
 function flowData(step) {
   const rs = RS[step] || [], strat = (D.strat && D.strat.strategies) || {};
+  const parents = [...new Set(rs.map(r => r.pg))].sort((a, b) => a - b);
   const adv = advIsWhatIf() ? advWhatIf : r => r.adv;
   const plan = r => { const sl = strat[`${step}:${r.pg}:${r.sidx}`]; if (!sl) return "first"; return sl.fallback ? "fallback" : sl.attempts.length > 1 ? "retry" : "first"; };
-  const phase = r => r.isRetry ? "retry" : r.phase === "adaptive" ? "adaptive" : "pilot";
   const result = r => !r.valid ? (r.fail === "timeout" ? "timeout" : "fail") : r.improved ? "beat" : "valid";
   const signal = r => { const a = adv(r); return a == null ? null : a < 0 ? "neg" : "pos"; };
   const NODES = {
     plan: { first: ["Plan accepted 1st try", cssVar("--good")], retry: ["Plan after retries", cssVar("--warn")], fallback: ["No plan (fallback)", cssVar("--crit")] },
-    phase: { pilot: ["Pilot (11 / strategy)", S_COL(0)], adaptive: ["Phase 2 (hurdle)", S_COL(3)], retry: ["Format retry", S_COL(5)] },
     result: { fail: ["Failed: no / broken code", S_COL(1)], timeout: ["Timeout", S_COL(3)], valid: ["Valid, not better", cssVar("--ink-3")], beat: ["Valid, beats parent", cssVar("--good")] },
     signal: { neg: ["A < 0: discouraged", cssVar("--crit")], pos: ["A > 0: reinforced", cssVar("--good")] },
   };
   const cols = [
-    { title: "Parent", nodes: range(0, 8).map(g => ({ id: "p" + g, label: "parent " + g, color: S_COL(g) })) },
+    { title: "Parent", nodes: parents.map(g => ({ id: "p" + g, label: "parent " + g, color: S_COL(g) })) },
     { title: "Strategist plan", nodes: Object.entries(NODES.plan).map(([k, [l, c]]) => ({ id: "plan:" + k, label: l, color: c })) },
-    { title: "Budget phase", nodes: Object.entries(NODES.phase).map(([k, [l, c]]) => ({ id: "phase:" + k, label: l, color: c })) },
+    { title: "Coder", nodes: [{ id: "coder", label: "Programs", color: S_COL(0) }] },
     { title: "Result", nodes: Object.entries(NODES.result).map(([k, [l, c]]) => ({ id: "res:" + k, label: l, color: c })) },
     { title: "Training signal" + (advIsWhatIf() ? " (what-if)" : ""), nodes: Object.entries(NODES.signal).map(([k, [l, c]]) => ({ id: "sig:" + k, label: l, color: c })) },
   ];
   const agg = {};
   const add = (s, t, v, color) => { const k = s + ">" + t; (agg[k] = agg[k] || { s, t, v: 0, color }).v += v; };
   rs.forEach(r => {
-    const a = "p" + r.pg, b = "plan:" + plan(r), c = "phase:" + phase(r), d = "res:" + result(r), sg = signal(r);
+    const a = "p" + r.pg, b = "plan:" + plan(r), d = "res:" + result(r), sg = signal(r);
     add(a, b, 1, S_COL(r.pg));
-    add(b, c, 1, NODES.plan[plan(r)][1]);
-    add(c, d, 1, NODES.phase[phase(r)][1]);
+    add(b, "coder", 1, NODES.plan[plan(r)][1]);
+    add("coder", d, 1, S_COL(0));
     if (sg) add(d, "sig:" + sg, 1, NODES.result[result(r)][1]);
   });
   const nameOf = id => { for (const c of cols) { const n = c.nodes.find(x => x.id === id); if (n) return n.label; } return id; };

@@ -8,26 +8,27 @@ from pathlib import Path
 import re
 from types import SimpleNamespace
 
-import numpy as np
 import yaml
+from config_validation import (
+    ADVANTAGE_MODES, COMMON_OPTIONAL_KEYS, COMMON_REQUIRED_KEYS, LEGACY_CODER_CAP_KEY,
+    PARENT_SELECTION_MODES, RETIRED_BATCH_GROWTH_KEYS, RETIRED_TRAINER_KEYS, reject_retired_coder_cap,
+    validate_problem_config,
+)
 from runtime.hardware_profiles import generation_cpu_ids, local_checkpoint, restore_hardware_settings
 
 from models.strategist_models import (
-    resolve_strategy_effort, resolve_strategy_model, resolve_strategy_token_limits, strategist_profile,
+    STRATEGY_MODEL_NAME, STRATEGY_REASONING_EFFORT, resolve_strategy_token_limits,
 )
 from models.coder_profiles import (
-    _apply_coder_model_profile, _apply_qwen3_8b_thinking_sampling, _apply_strategy_model_profile,
-    _dual_resident_qwen3_8b_strategy_coder_pools, _is_exact_qwen3_30b_a3b, _resolve_coder_token_limits,
+    _apply_coder_model_profile, _is_exact_qwen3_30b_a3b, _resolve_coder_token_limits,
 )
 from training.exact_overflow import (
     _clear_exact_sharded_recovery, _infer_exact_sharded_recovery, _read_exact_sharded_recovery,
-    _write_exact_sharded_recovery,
+    _write_exact_sharded_recovery, supports_warm_overflow,
 )
 
 
-ADVANTAGE_MODES = ("entropic", "spo-rs", "spo-rs-v2")
 SEQUENCE_CLIP_EPSILON_DEFAULT = 0.2
-SPO_RS_UPDATE_EPOCHS_DEFAULT = 1
 SPO_RS_BETA_DEFAULT = 2.0
 SPO_RS_D_HALF_DEFAULT = 0.06
 SPO_RS_RHO_MIN_DEFAULT = 0.875
@@ -35,11 +36,11 @@ SPO_RS_RHO_MAX_DEFAULT = 0.96
 SPO_RS_CLIP_EPSILON_DEFAULT = 0.2
 SPO_RS_CLIP_EPSILON_LOW_DEFAULT = 0.2
 SPO_RS_CLIP_EPSILON_HIGH_DEFAULT = 0.35
-SPO_RS_WIN_ALPHA_DEFAULT = 0.25
+_RETIRED_STRATEGY_RETRY_KEY = "strategy_format_max_retries"
 
 
 def _is_spo_rs_mode(mode):
-    return str(mode or "entropic").lower() in {"spo-rs", "spo-rs-v2"}
+    return str(mode).lower() == "spo-rs"
 
 
 def _uses_clipped_policy_loss(mode):
@@ -52,10 +53,14 @@ def _normalize_saved_advantage_config(saved):
     mode = str(saved.get("advantage_mode") or "entropic").lower()
     if mode not in ADVANTAGE_MODES or saved.get("binary_coder_training", False):
         raise ValueError(
-            'saved run uses an unsupported training objective; only entropic, '
-            'spo-rs, and spo-rs-v2 can be resumed')
-    if _is_spo_rs_mode(mode) and "rank_update_epochs" in saved:
-        saved.setdefault("spo_rs_update_epochs", saved["rank_update_epochs"])
+            'saved run uses an unsupported training objective. '
+            'Choose a run that used entropic or spo-rs.')
+    if _is_spo_rs_mode(mode) and (
+            saved.get("spo_rs_adaptive_beta")
+            or saved.get("spo_rs_reward_shaping") not in (None, "exponential")):
+        raise ValueError("saved run uses retired adaptive SPO-RS reward shaping")
+    for key in RETIRED_TRAINER_KEYS:
+        saved.pop(key, None)
     if mode == "entropic":
         for side in ("low", "high"):
             value = saved.get(f"rank_clip_epsilon_{side}")
@@ -78,7 +83,7 @@ def _resolve_policy_options(merged):
         if not math.isfinite(value) or not 0.0 < value < 1.0:
             raise ValueError(f"{name} must be finite and in (0, 1)")
         merged[name] = value
-    sequence_policy = _is_exact_qwen3_30b_a3b(merged.get("model_name"))
+    sequence_policy = _is_exact_qwen3_30b_a3b(merged["coder_model_name"])
     if _uses_clipped_policy_loss(merged.get("advantage_mode")) or sequence_policy:
         if int(merged["group_size"]) < 2:
             raise ValueError("sequence/clipped policy modes require group_size >= 2")
@@ -92,18 +97,12 @@ def _resolve_policy_options(merged):
         merged["top_p"] = 1.0
         merged["sampling_top_k"] = 0
         merged["sampling_min_p"] = 0.0
-        merged["qwen3_8b_thinking_sampling"] = False
 
 
 def _resolve_spo_rs_options(merged):
     if not _is_spo_rs_mode(merged.get("advantage_mode")):
         return
 
-    epochs = merged.get("spo_rs_update_epochs")
-    epochs = SPO_RS_UPDATE_EPOCHS_DEFAULT if epochs is None else epochs
-    if (isinstance(epochs, bool) or not isinstance(epochs, (int, np.integer)) or epochs < 1):
-        raise ValueError("spo_rs_update_epochs must be a positive integer")
-    merged["spo_rs_update_epochs"] = int(epochs)
     raw_clip_epsilon = merged.get("spo_rs_clip_epsilon")
     defaults = {
         "spo_rs_beta": SPO_RS_BETA_DEFAULT,
@@ -111,7 +110,6 @@ def _resolve_spo_rs_options(merged):
         "spo_rs_rho_min": SPO_RS_RHO_MIN_DEFAULT,
         "spo_rs_rho_max": SPO_RS_RHO_MAX_DEFAULT,
         "spo_rs_clip_epsilon": SPO_RS_CLIP_EPSILON_DEFAULT,
-        "spo_rs_win_alpha": SPO_RS_WIN_ALPHA_DEFAULT,
     }
     for name, default in defaults.items():
         raw = merged.get(name)
@@ -121,19 +119,8 @@ def _resolve_spo_rs_options(merged):
         merged[name] = value
     if merged["spo_rs_beta"] <= 0.0:
         raise ValueError("spo_rs_beta must be positive")
-    adaptive_beta = merged.get("spo_rs_adaptive_beta", False)
-    if not isinstance(adaptive_beta, bool):
-        raise ValueError("spo_rs_adaptive_beta must be true or false")
-    merged["spo_rs_adaptive_beta"] = bool(adaptive_beta)
-    if merged["advantage_mode"] == "spo-rs-v2" and adaptive_beta:
-        raise ValueError("spo-rs-v2 requires fixed exponential SPO-RS shaping")
-    from training.spo_rs import BOUNDED_SHAPING_VERSION
-    # The old adaptive-beta estimator did not have a historical baseline.
-    merged["spo_rs_reward_shaping"] = (BOUNDED_SHAPING_VERSION if adaptive_beta else "exponential")
     if merged["spo_rs_d_half"] <= 0.0:
         raise ValueError("spo_rs_d_half must be positive")
-    if merged["spo_rs_win_alpha"] < 0.0:
-        raise ValueError("spo_rs_win_alpha must be nonnegative")
     if not (0.0 < merged["spo_rs_rho_min"] <= merged["spo_rs_rho_max"] < 1.0):
         raise ValueError("SPO-RS rho bounds must satisfy 0 < rho_min <= rho_max < 1")
     if not 0.0 < merged["spo_rs_clip_epsilon"] < 1.0:
@@ -183,24 +170,9 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         help="Training backend. 'vllm' is shorthand for HF+PEFT training plus "
              "vLLM rollout generation (vLLM itself does not backpropagate).")
     p.add_argument(
-        "--fast", action="store_const", const=True, default=None,
-        help="Use the opt-in process-per-GPU LoRA trainer: work is balanced "
-             "by sequence cost and every GPU independently learns a padded-"
-             "token budget capped at 80%% GPU memory use. "
-             "Without this flag the existing trainer is unchanged.")
-    p.add_argument(
         "--strategies", action="store_const", const=True, default=None,
-        help="Use the opt-in two-stage rollout path: a frozen reasoning model "
-             "first produces sequential strategies, then the trainable coder "
-             "policy produces programs conditioned on those strategies. "
-             "Without this flag ordinary one-stage rollouts are unchanged.")
-    p.add_argument(
-        "--measure-entropy", action="store_const", const=True, default=None,
-        help="Measure detached full-vocabulary coder entropy from existing "
-             "pre-update training forwards, plus code diversity and validity. "
-             "Save entropy.jsonl and a combined entropy PDF each completed step. "
-             "No extra model forward; unscored rollouts have explicit missing "
-             "coverage (--no-train records diversity only).")
+        help=f"Generate sequential plans with frozen {STRATEGY_MODEL_NAME} "
+             f"at {STRATEGY_REASONING_EFFORT} before generating programs with the coder.")
     p.add_argument(
         "--fused-long-attention", action="store_const", const=True,
         default=None,
@@ -221,43 +193,9 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--generation-backend", choices=["hf", "vllm"], default=None,
                    help="Engine used by generation workers. Independent of the "
                         "differentiable training backend.")
-    p.add_argument("--model-name", default=None)
     p.add_argument(
         "--coder-model-name", default=None,
-        help="Policy checkpoint selected as --model-name when --strategies is "
-             "active and --model-name was not explicitly supplied.")
-    p.add_argument(
-        "--coder-training-model-name", default=None,
-        help="Optional trainable checkpoint paired with --coder-model-name. "
-             "Used only by --strategies unless --training-model-name is explicit.")
-    p.add_argument("--strategy-model-name", default=None,
-                   help="Base reasoning checkpoint used only to generate "
-                        "strategies; it never receives or trains the LoRA.")
-    p.add_argument(
-        "--api-strategy", default=None,
-        help="OpenAI strategy model (gpt-6-luna). A nonempty value enables "
-             "strategy rounds through the API; '' keeps local strategy selection.")
-    p.add_argument(
-        "--strategy-backend", choices=["local", "api"], default=None,
-        help="Run the frozen strategist through a local generation pool or "
-             "an OpenAI-compatible remote API.")
-    p.add_argument(
-        "--strategy-api", dest="strategy_backend", action="store_const",
-        const="api",
-        help="Shorthand for --strategy-backend api. No strategist weights or "
-             "tokenizer are loaded locally.")
-    p.add_argument("--strategy-api-base-url", default=None)
-    p.add_argument("--strategy-api-key-env", default=None,
-                   help="Environment-variable name containing the API key; "
-                        "the key itself is never stored in run configuration.")
-    p.add_argument("--strategy-api-concurrency", type=int, default=None)
-    p.add_argument("--strategy-api-timeout-s", type=float, default=None)
-    p.add_argument("--strategy-api-max-retries", type=int, default=None)
-    p.add_argument(
-        "--training-model-name", default=None,
-        help="Optional trainable checkpoint override. Rollout generation still "
-             "uses --model-name. GPT-OSS QLoRA resolves this automatically to "
-             "a trainable BitsAndBytes checkpoint.")
+        help="Base checkpoint for program generation and LoRA training.")
     p.add_argument("--load-in-4bit", action="store_const", const=True, default=None)
     p.add_argument("--max-seq-length", type=int, default=None)
     p.add_argument("--lora-rank", type=int, default=None)
@@ -274,23 +212,15 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--programs-per-strategy", type=int, default=None,
                    help="LoRA-policy code rollouts sampled from each strategy.")
     p.add_argument(
-        "--pilot-programs-per-strategy", type=int, default=None,
-        help="Two-phase rollout allocation: first sample and evaluate this "
-             "many programs per strategy, then dynamically redistribute the "
-             "unchanged remaining per-parent rollout budget from pilot reward "
-             "mean/variance. -1 preserves the existing one-pass generation "
-             "path exactly.")
-    p.add_argument(
         "--strategy-archive-top-r", type=int, default=None,
         help="With --strategies, admit only the top-r valid unique programs "
              "from each generated strategy before applying the existing "
              "topk_children_per_parent archive limit.")
     p.add_argument("--num-seed-states", type=int, default=None)
-    p.add_argument("--parent-selection", choices=("puct", "uct", "llm", "puct-jev"),
-                   default=None, help="Override the YAML picker; on resume, "
-                   "a switch to llm starts at the next fresh step. "
-                   "llm uses GPT-6 Luna with maximum reasoning; puct-jev "
-                   "uses local GLiDE-9B to filter same-idea parents after step 0.")
+    p.add_argument("--parent-selection", choices=PARENT_SELECTION_MODES, default=None,
+                   help="Override the YAML picker. On resume, PUCT can switch "
+                        "to PUCT-JEV at the next fresh step. PUCT-JEV uses local "
+                        "GLiDE-9B to filter same-idea parents after step 0.")
     p.add_argument("--jev-model-path", default=None,
                    help="Complete local GLiDE-9B repository. Defaults to "
                    "GLiDE-9B beside the coder checkpoint (B200 models directory).")
@@ -298,28 +228,10 @@ def _build_arg_parser() -> argparse.ArgumentParser:
                    const="uct", default=None,
                    help="Compatibility alias for --parent-selection uct.")
     p.add_argument("--max-new-tokens", type=int, default=None)
-    p.add_argument(
-        "--coder-retry", action="store_const", const=True, default=None,
-        help="If fewer than 50%% of a coder rollout batch contain complete "
-             "final code blocks, retry only enough incomplete responses once "
-             "to target 60%% valid output. "
-             "Disabled unless this flag is passed; originals are retained "
-             "and retries are extra training examples.")
     p.add_argument("--strategy-max-new-tokens", type=int, default=None)
-    p.add_argument("--strategy-format-max-retries", type=int, default=None,
-                   help="Additional attempts for missing strategy blocks; "
-                        "stop if exhausted (default: 3).")
     p.add_argument("--strategy-max-seq-length", type=int, default=None)
     p.add_argument("--strategy-temperature", type=float, default=None)
     p.add_argument("--strategy-top-p", type=float, default=None)
-    p.add_argument("--strategy-thinking", dest="strategy_thinking", action="store_const", const=True, default=None)
-    p.add_argument("--no-strategy-thinking", dest="strategy_thinking", action="store_const", const=False)
-    p.add_argument("--strategy-reasoning-effort",
-                   choices=["auto", "none", "low", "medium", "high", "xhigh", "max"],
-                   default=None,
-                   help="Model-native reasoning level; auto selects its "
-                        "profile default. Qwen Flash-Next: low/medium/xhigh; "
-                        "DeepSeek V4 0731: low/high/max.")
     p.add_argument("--strategy-vllm-quantization", type=str, default=None)
     p.add_argument("--lr", type=float, default=None)
     p.add_argument("--adam-beta1", type=float, default=None)
@@ -330,35 +242,16 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--advantage-mode", type=str.lower,
                    choices=list(ADVANTAGE_MODES), default=None,
                    help="Objective: entropic (adaptive beta within each group, "
-                        "default), spo-rs (historical entropic value tracking), "
-                        "or spo-rs-v2 (SPO-RS plus a historical win signal).")
-    p.add_argument("--spo-rs-update-epochs", type=int, default=None,
-                   help="SPO-RS updates per rollout batch with a frozen old "
-                        "policy (default 1; --fast requires 1).")
+                        "default) or spo-rs (historical entropic value tracking).")
     p.add_argument("--sequence-clip-epsilon-low", type=float, default=None,
                    help="Entropic Qwen3-30B-A3B sequence-ratio clipping distance "
                         "below 1 (default 0.2).")
     p.add_argument("--sequence-clip-epsilon-high", type=float, default=None,
                    help="Entropic Qwen3-30B-A3B sequence-ratio clipping distance "
                         "above 1 (default 0.2).")
-    beta_mode = p.add_mutually_exclusive_group()
-    beta_mode.add_argument(
-        "--adaptive-beta-spo", "--spo-rs-adaptive-beta",
-        dest="spo_rs_adaptive_beta", action="store_const", const=True,
-        default=None,
-        help="SPO-RS: adaptive historical arctan reward shaping (25%% wider), "
-             "with the run-wide moving-average baseline and all rollouts.")
-    beta_mode.add_argument(
-        "--constant-beta-spo", "--spo-rs-fixed-beta",
-        dest="spo_rs_adaptive_beta", action="store_const", const=False,
-        default=None,
-        help="SPO-RS: use the fixed --spo-rs-beta/YAML value (default mode).")
     p.add_argument("--spo-rs-beta", type=float, default=None,
-                   help="SPO-RS: exponential coefficient and advantage divisor "
+                   help="Fixed exponential coefficient and advantage divisor for SPO-RS "
                         f"(default {SPO_RS_BETA_DEFAULT}).")
-    p.add_argument("--spo-rs-win-alpha", type=float, default=None,
-                   help="SPO-RS-v2: RMS-relative historical win-signal strength "
-                        f"(default {SPO_RS_WIN_ALPHA_DEFAULT}).")
     p.add_argument("--spo-rs-d-half", type=float, default=None,
                    help="SPO-RS: policy-KL half-life D_half "
                         f"(default {SPO_RS_D_HALF_DEFAULT}).")
@@ -505,30 +398,7 @@ def _parse_gpu_ids(value) -> list:
     return ids
 
 
-def _resolve_training_model_name(model_name, requested_name, load_in_4bit):
-    """Keep inference and trainable checkpoint choices independent.
-
-    Explicit legacy QLoRA configurations may still resolve a trainable
-    BitsAndBytes conversion. The supported GPT-OSS coder profile rejects that
-    split-policy setup and trains the original checkpoint's packed MXFP4 base.
-    """
-    if str(requested_name or "").strip():
-        return str(requested_name).strip()
-    generation_name = str(model_name).strip()
-    if not bool(load_in_4bit):
-        return generation_name
-    lowered = generation_name.rstrip("/").lower()
-    basename = lowered.rsplit("/", 1)[-1]
-    if "unsloth-bnb-4bit" in lowered:
-        return generation_name
-    aliases = {
-        "gpt-oss-20b": "unsloth/gpt-oss-20b-unsloth-bnb-4bit",
-        "gpt-oss-120b": "unsloth/gpt-oss-120b-unsloth-bnb-4bit",
-    }
-    return aliases.get(basename, generation_name)
-
-
-def _resolve_training_backend(backend, training_model_name):
+def _resolve_training_backend(backend, model_name):
     """Select the training loader from the checkpoint when backend is auto.
 
     GPT-OSS needs Unsloth for its packed/split expert layouts. All other
@@ -536,7 +406,7 @@ def _resolve_training_backend(backend, training_model_name):
     override, except that an incompatible GPT-OSS BNB/HF pairing is corrected.
     """
     resolved = str(backend).strip().lower()
-    checkpoint = str(training_model_name).strip().lower()
+    checkpoint = str(model_name).strip().lower()
     if resolved == "auto":
         return "unsloth" if "gpt-oss" in checkpoint else "hf"
     requires_unsloth = ("gpt-oss" in checkpoint and "unsloth-bnb-4bit" in checkpoint)
@@ -559,11 +429,11 @@ def _resolve_training_memory_budgets(training_gpu_ids, memory, *, max_fraction=0
     return budgets
 
 
-def _validate_known_training_capacity(training_model_name, budgets, *, replicated=False):
+def _validate_known_training_capacity(model_name, budgets, *, replicated=False):
     """Fail before loading a known giant checkpoint that cannot fit at all."""
     if not budgets:
         return
-    name = str(training_model_name).lower()
+    name = str(model_name).lower()
     required_gib = None
     precision = ""
     if "gpt-oss-120b" in name and "bnb-4bit" in name:
@@ -581,7 +451,7 @@ def _validate_known_training_capacity(training_model_name, budgets, *, replicate
             "Add GPUs or use a smaller trainable checkpoint."
         )
         raise ValueError(
-            f"{training_model_name} needs about {required_gib:.0f} GiB for "
+            f"{model_name} needs about {required_gib:.0f} GiB for "
             f"{precision}, but the selected training GPUs provide only "
             f"{available_gib:.1f} GiB of safe placement budget {placement} "
             f"{budgets}. {remedy}")
@@ -613,6 +483,9 @@ def load_config():
         if not saved_config_path.is_file():
             raise FileNotFoundError(f"--resume directory has no config.json: {resume_dir}")
         saved = _normalize_saved_advantage_config(json.loads(saved_config_path.read_text()))
+        reject_retired_coder_cap(saved, source=saved_config_path)
+        saved.pop(LEGACY_CODER_CAP_KEY, None)
+        saved.pop(_RETIRED_STRATEGY_RETRY_KEY, None)
 
     # The launcher defaults to erdos. Direct Python calls use the same selection
     # when neither --config nor --problem is provided.
@@ -632,7 +505,9 @@ def load_config():
         ydict = yaml.safe_load(f) or {}
     if not isinstance(ydict, dict) or not ydict:
         raise ValueError(f"problem config must be a non-empty mapping: {cfg_path}")
-    from config_validation import (RETIRED_BATCH_GROWTH_KEYS, validate_problem_config)
+    reject_retired_coder_cap(ydict, source=cfg_path)
+    ydict.pop(LEGACY_CODER_CAP_KEY, None)
+    ydict.pop(_RETIRED_STRATEGY_RETRY_KEY, None)
     for key in RETIRED_BATCH_GROWTH_KEYS:
         ydict.pop(key, None)
     # Old external configs may retain the retired repair-feature settings.
@@ -660,6 +535,13 @@ def load_config():
     # 2) Saved config overlay. Retired feature keys are ignored so current runs
     # can resume checkpoints written before those optional systems were removed.
     if saved:
+        # Older runs stored the effective rollout base under model_name.
+        saved_coder = saved.pop("model_name", None) or saved.get("coder_model_name")
+        saved_trainer = saved.pop("training_model_name", None)
+        saved.pop("coder_training_model_name", None)
+        if saved_trainer and saved_trainer != saved_coder:
+            raise ValueError("--resume requires a LoRA trained on the saved coder checkpoint")
+        saved["coder_model_name"] = saved_coder
         saved.pop("_max_seq_length_includes_memory_topup", None)
         saved.pop("model_native_context_length", None)  # Retired diagnostic metadata.
         for key in list(saved):
@@ -695,22 +577,9 @@ def load_config():
                     "strategy_top_k", "strategy_min_p"):
             if key in ydict:
                 merged[key] = ydict[key]
-        # Preserve legacy one-pass generation only when neither source
-        # specifies a pilot budget.
-        if ("pilot_programs_per_strategy" not in saved and "pilot_programs_per_strategy" not in ydict):
-            merged["pilot_programs_per_strategy"] = -1
-        # Runs created before selectable phase-2 allocation used the original
-        # median-quadrant rule.  Do not silently switch a resumed run to a new
-        # allocator merely because its current problem YAML selects one.
-        if "phase2_allocation_method" not in saved:
-            merged["phase2_allocation_method"] = "rule_based"
-        merged["spo_rs_adaptive_beta"] = bool(saved.get("spo_rs_adaptive_beta", False))
         # A new YAML selector must not switch an old resumed run's search.
         from search.sampler import parent_selection_mode
         merged["parent_selection"] = parent_selection_mode(saved)
-        # Introducing an API-enabled preset must not switch an older resumed
-        # run to a paid service. An explicit CLI selector can still opt in.
-        merged["api_strategy"] = saved.get("api_strategy", "")
         print(f"[config] resuming saved configuration from "
               f"{resume_dir / 'config.json'}; current YAML rollout counts, "
               "evaluation resources, and strategy limits/sampling override saved values")
@@ -726,18 +595,10 @@ def load_config():
         merged[key] = value
         if value != parser.get_default(arg_name):
             profile_explicit_keys.add(key)
-    saved_mode = str(saved.get("advantage_mode") or "entropic").lower()
-    requested_mode = str(merged.get("advantage_mode") or "entropic").lower()
-    if (saved and saved_mode == "spo-rs-v2" and requested_mode == "spo-rs"):
-        # The launch scripts default fresh runs to v1. Once explicitly
-        # upgraded, a later plain resume must not silently downgrade the run.
-        merged["advantage_mode"] = requested_mode = saved_mode
-    if (saved and saved_mode != requested_mode
-            and "spo-rs-v2" in {saved_mode, requested_mode}
-            and not (saved_mode == "spo-rs" and requested_mode == "spo-rs-v2")):
-        raise ValueError(
-            "cannot switch to or from spo-rs-v2 while resuming; pass the "
-            "saved advantage mode or start a fresh run")
+    # Drop obsolete SPO-RS options inherited from external or saved configs.
+    for key in merged.keys() - (COMMON_REQUIRED_KEYS | COMMON_OPTIONAL_KEYS):
+        if key.startswith("spo_rs_"):
+            merged.pop(key)
     # Disk parking is launch-local; do not inherit another machine's directory.
     merged["trainer_offload_dir"] = args.trainer_offload_dir
     from search.sampler import can_migrate_parent_selection, parent_selection_mode
@@ -745,60 +606,32 @@ def load_config():
     merged["uct"] = merged["parent_selection"] == "uct"
     if saved and merged["parent_selection"] != parent_selection_mode(saved):
         if not can_migrate_parent_selection(parent_selection_mode(saved), merged["parent_selection"]):
-            raise ValueError('cannot change parent_selection while resuming except PUCT/UCT to LLM or PUCT to PUCT-JEV')
+            raise ValueError("PUCT to PUCT-JEV is the only supported parent_selection change on resume")
         if not (resume_dir / "training_state.pt").is_file():
             raise ValueError('parent-picker migration requires training_state.pt; refusing to reset the trained run')
-    if (saved and args.spo_rs_adaptive_beta is not None
-            and bool(saved.get("spo_rs_adaptive_beta", False))
-            != bool(args.spo_rs_adaptive_beta)):
-        raise ValueError(
-            "cannot change fixed/adaptive SPO beta mode while resuming; "
-            "start a fresh run for a different objective")
-    if saved:
-        from training.spo_rs import validate_shaping_resume
-        validate_shaping_resume(saved)
     if args.spo_rs_clip_epsilon is not None:
         if args.spo_rs_clip_epsilon_low is None:
             merged["spo_rs_clip_epsilon_low"] = args.spo_rs_clip_epsilon
         if args.spo_rs_clip_epsilon_high is None:
             merged["spo_rs_clip_epsilon_high"] = args.spo_rs_clip_epsilon
-    # Trainer/evaluator modes are launch-scoped. A nonempty API selector is
-    # also an explicit opt-in to the strategy hierarchy.
-    merged["fast"] = bool(args.fast)
-    api_strategy = merged.get("api_strategy", "")
-    if not isinstance(api_strategy, str):
-        raise ValueError("api_strategy must be a model name or ''")
-    merged["api_strategy"] = api_strategy.strip()
-    if merged["api_strategy"] not in {"", "gpt-6-luna"}:
-        raise ValueError("api_strategy supports gpt-6-luna or ''")
-    merged["strategies"] = bool(args.strategies) or bool(merged["api_strategy"])
-    if (saved.get("api_strategy") and args.api_strategy == "" and args.strategy_backend is None):
-        merged["strategy_backend"] = ydict.get("strategy_backend", "local")
+    # Trainer/evaluator modes are launch-scoped.
+    merged["strategies"] = bool(args.strategies)
     merged["fused_long_attention"] = bool(args.fused_long_attention)
-    merged["measure_entropy"] = bool(args.measure_entropy)
+    merged.pop("measure_entropy", None)
     merged["no_train"] = bool(args.no_train)
     merged["isolate_eval"] = bool(args.isolate_eval)
-    # Coder recovery is deliberately launch-scoped. A saved run or external
-    # YAML must not silently turn it back on when --coder-retry is absent.
-    merged["coder_retry"] = bool(args.coder_retry)
-    if merged["strategies"]:
-        # Keep the ordinary policy checkpoint untouched unless the opt-in
-        # hierarchy is requested. Explicit CLI model choices remain strongest.
-        if args.model_name is None:
-            merged["model_name"] = str(merged["coder_model_name"]).strip()
-            if args.training_model_name is None:
-                merged["training_model_name"] = str(merged.get('coder_training_model_name') or '').strip()
-
-    # Resolve after the hierarchy chooses its coder and before validating the
-    # resulting training layout and precision.
-    for key in ("model_name", "coder_model_name", "training_model_name", "coder_training_model_name"):
-        merged[key] = local_checkpoint(merged.get(key, ""), merged["hardware_profile"])
+    merged.pop("coder_retry", None)
+    coder_name = merged.get("coder_model_name")
+    if not isinstance(coder_name, str) or not coder_name.strip():
+        raise ValueError("coder_model_name must be a non-empty checkpoint name or path")
+    coder_name = local_checkpoint(coder_name.strip(), merged["hardware_profile"])
+    merged["coder_model_name"] = coder_name
     if merged["parent_selection"] == "puct-jev":
         merged.setdefault("jev_candidate_multiplier", 3)
         merged.setdefault("jev_same_core_threshold", 0.68)
         jev_path = merged.get("jev_model_path")
         if not jev_path:
-            sibling = Path(merged["model_name"]).expanduser().parent / "GLiDE-9B"
+            sibling = Path(coder_name).expanduser().parent / "GLiDE-9B"
             jev_path = (str(sibling.resolve()) if sibling.is_dir() else
                         local_checkpoint("fastino/GLiDE-9B", merged["hardware_profile"]))
         merged["jev_model_path"] = str(Path(jev_path).expanduser())
@@ -811,109 +644,6 @@ def load_config():
             "its maximum native effort")
     _resolve_coder_token_limits(merged)
 
-    exact_sharded_recovery = _read_exact_sharded_recovery(resume_dir)
-    if exact_sharded_recovery is not None:
-        recovery_step = int(exact_sharded_recovery["step"])
-        completed_summary = (Path(resume_dir) / f"step{recovery_step:02d}" / f"step{recovery_step:02d}.summary.json")
-        if completed_summary.is_file():
-            _clear_exact_sharded_recovery(resume_dir)
-            exact_sharded_recovery = None
-            print('[recovery] removed a stale exact sharded marker for an already checkpointed step')
-    if exact_sharded_recovery is None:
-        exact_sharded_recovery = _infer_exact_sharded_recovery(resume_dir)
-        if exact_sharded_recovery is not None:
-            marker = _write_exact_sharded_recovery(
-                resume_dir,
-                exact_sharded_recovery["step"],
-                exact_sharded_recovery["reason"],
-            )
-            exact_sharded_recovery = _read_exact_sharded_recovery(resume_dir)
-            print(
-                "[recovery] recognized the previous exact single-GPU OOM; "
-                f"created {marker.name}; generation and evaluation will not "
-                "be repeated")
-    if exact_sharded_recovery is not None:
-        # This marker is written only after a fully durable SPO-RS rollout
-        # batch proves that an exact trajectory cannot fit in ordinary GPU
-        # memory. New markers retain the already-computed gradients and first
-        # run only the deferred trajectories on RAM-bounded replicas. The
-        # serial model-sharded lane is reserved for a trajectory that also
-        # exhausts that bounded fallback. Legacy markers first replay only
-        # backward on the fast replicas so they can be upgraded likewise.
-        selective_overflow = bool(exact_sharded_recovery.get("overflow_gradient_file"))
-        replicated_layout = bool(
-            merged.get("fast", False)
-            and str(merged.get("training_layout", "")).lower()
-            == "replicated")
-        from training.exact_overflow import supports_warm_overflow
-        warm_recovery = bool(
-            selective_overflow and replicated_layout
-            and supports_warm_overflow(SimpleNamespace(**{
-                **merged,
-                "num_training_gpus": int(merged.get("num_training_gpus") or
-                    len(_parse_gpu_ids(os.environ.get("AVAILABLE_GPUS", "0")))),
-            })))
-        can_recover_on_replicas = bool(
-            selective_overflow
-            and replicated_layout
-            and not exact_sharded_recovery.get("replica_offload_exhausted", False))
-        can_capture_selectively = bool(not selective_overflow and replicated_layout)
-        if warm_recovery:
-            merged["_exact_inprocess_recovery_step"] = int(exact_sharded_recovery["step"])
-            print("[recovery] saved overflow gradients will finish in-process; "
-                  "Qwen checkpoint groups try all GPU replicas before "
-                  "cooperative overflow when the saved work predates that mode")
-        elif can_recover_on_replicas:
-            merged["_exact_replica_recovery_step"] = int(exact_sharded_recovery["step"])
-            print(
-                "[recovery] selective exact overflow will reuse completed "
-                "gradients and dispatch only the remaining trajectories "
-                "across the fast GPU replicas with bounded host-RAM "
-                "activation offload")
-        elif can_capture_selectively:
-            # A marker written by an older build has no saved partial
-            # gradients. Recompute its already-evaluated update once on the
-            # fast replicas; the new overflow path will retain all successful
-            # gradients and send only the oversized tail to sharded recovery.
-            merged["_exact_replica_capture_step"] = int(exact_sharded_recovery["step"])
-            failed_length = re.search(r"(\d+)-token rollout", str(exact_sharded_recovery.get("reason", "")))
-            if (failed_length is not None and merged.get("coder_model_profile") != "qwen3.8-27b"):
-                # Token sidecars are exact for current runs; the tiny margin
-                # also covers legacy text recovery restoring an EOS/control
-                # token without replaying the already-proven OOM workload.
-                merged["_exact_replica_overflow_min_tokens"] = max(1, int(failed_length.group(1)) - 16)
-            print(
-                "[recovery] legacy exact-OOM step will replay only adapter "
-                "backward on the fast replicas; generation and evaluation "
-                "remain skipped, and any oversized trajectories will be "
-                "captured for selective model-sharded overflow")
-        else:
-            merged["training_layout"] = "sharded"
-            merged["fast"] = False
-            merged["_exact_sharded_recovery_step"] = int(exact_sharded_recovery["step"])
-        if selective_overflow and not can_recover_on_replicas and not warm_recovery:
-            print(
-                "[recovery] selective exact overflow will reuse completed "
-                "replica gradients and run only deferred trajectories with "
-                "one model sharded across all training GPUs; ordinary fast "
-                "replicated training resumes after this step")
-        elif not selective_overflow and not can_capture_selectively:
-            print(
-                "[recovery] exact long-context adapter update will use one "
-                "model sharded across all training GPUs; ordinary fast "
-                "replicated training resumes after this step")
-
-    training_layout = str(merged.get("training_layout") or "auto").strip().lower()
-    if training_layout not in {"auto", "replicated", "sharded"}:
-        raise ValueError("training_layout must be 'auto', 'replicated', or 'sharded'")
-    merged["training_layout"] = training_layout
-    if training_layout == "sharded" and merged["fast"]:
-        # --fast is process-per-GPU data parallelism: every process needs one
-        # complete base model. Large MoE checkpoints instead need one trainer
-        # whose frozen base weights are distributed across all selected GPUs.
-        print("[config] training_layout=sharded overrides --fast; using one "
-              "model-parallel LoRA trainer across all training GPUs")
-        merged["fast"] = False
     if args.problem_type is not None:
         merged["problem_type"] = args.problem_type
 
@@ -933,20 +663,6 @@ def load_config():
         raise ValueError(f"advantage_mode must be one of {ADVANTAGE_MODES}")
     merged["advantage_mode"] = advantage_mode
     merged["uct"] = bool(merged.get("uct", False))
-    pilot_effort_counts = {}
-    for effort in ("xhigh", "medium"):
-        key = f"pilot_{effort}_programs_per_strategy"
-        count = merged.get(key, 0)
-        if isinstance(count, bool) or not isinstance(count, int) or count < 0:
-            raise ValueError(f"{key} must be a non-negative integer")
-        merged[key] = count
-        pilot_effort_counts[effort] = count
-    strategy_format_max_retries = merged.get("strategy_format_max_retries", 3)
-    if (isinstance(strategy_format_max_retries, bool)
-            or not isinstance(strategy_format_max_retries, int)
-            or strategy_format_max_retries < 0):
-        raise ValueError("strategy_format_max_retries must be a non-negative integer")
-    merged["strategy_format_max_retries"] = strategy_format_max_retries
     strict_strategy_validation = merged.get("strict_strategy_validation", False)
     if not isinstance(strict_strategy_validation, bool):
         raise ValueError("strict_strategy_validation must be a boolean")
@@ -954,37 +670,13 @@ def load_config():
     if merged["strategies"]:
         merged.setdefault("strategy_temperature", 1.0)
         merged.setdefault("strategy_top_p", 1.0)
-        strategy_model_name = str(merged.get("strategy_model_name") or merged["model_name"]).strip()
-        if not merged["api_strategy"]:
-            strategy_model_name = resolve_strategy_model(strategy_model_name)
-            if str(merged.get("strategy_backend") or "local").lower() == "local":
-                strategy_model_name = local_checkpoint(strategy_model_name, merged["hardware_profile"])
-            _apply_strategy_model_profile(merged, strategy_model_name, profile_explicit_keys)
-        strategy_backend = "api" if merged["api_strategy"] else str(
-            merged.get("strategy_backend") or "local"
-        ).strip().lower()
-        if strategy_backend not in {"local", "api"}:
-            raise ValueError("strategy_backend must be 'local' or 'api'")
-        if (strategy_backend == "local" and strategist_profile(strategy_model_name) and generation_backend != "vllm"):
-            raise ValueError('Flash-Next / DeepSeek V4 local strategists require generation_backend=vllm')
+        strategy_model_name = local_checkpoint(STRATEGY_MODEL_NAME, merged["hardware_profile"])
         strategies_per_parent = int(merged["strategies_per_parent"])
         programs_per_strategy = int(merged["programs_per_strategy"])
-        pilot_programs_per_strategy = int(merged.get("pilot_programs_per_strategy", -1))
-        phase2_allocation_method = str(merged.get("phase2_allocation_method") or "rule_based").strip().lower()
         strategy_archive_top_r = int(merged["strategy_archive_top_r"])
-        native_strategy_context = None
-        if merged["api_strategy"]:
-            from generation.strategy_api import OPENAI_MAX_OUTPUT_TOKENS
-            native_strategy_context = OPENAI_MAX_OUTPUT_TOKENS
         strategy_max_seq_length, strategy_max_new_tokens = resolve_strategy_token_limits(
-            strategy_model_name, merged.get("strategy_max_seq_length", "auto"),
-            merged.get("strategy_max_new_tokens", "auto"),
-            native_context=native_strategy_context)
-        if merged["api_strategy"]:
-            if strategy_max_new_tokens > OPENAI_MAX_OUTPUT_TOKENS:
-                print(f"[config] OpenAI strategy output budget capped at "
-                      f"{OPENAI_MAX_OUTPUT_TOKENS} tokens (including reasoning)")
-                strategy_max_new_tokens = OPENAI_MAX_OUTPUT_TOKENS
+            merged.get("strategy_max_seq_length", "auto"),
+            merged.get("strategy_max_new_tokens", "auto"))
         strategy_temperature = float(merged["strategy_temperature"])
         strategy_top_p = float(merged["strategy_top_p"])
         if (strategies_per_parent < 1 or programs_per_strategy < 1
@@ -992,16 +684,6 @@ def load_config():
                 or strategy_max_new_tokens < 1
                 or strategy_max_seq_length < 1):
             raise ValueError("strategy counts and token limits must be positive")
-        if (pilot_programs_per_strategy == 0 or pilot_programs_per_strategy < -1):
-            raise ValueError('pilot_programs_per_strategy must be -1 (disabled) or a positive integer')
-        if pilot_programs_per_strategy > programs_per_strategy:
-            raise ValueError('pilot_programs_per_strategy cannot exceed programs_per_strategy')
-        if (sum(pilot_effort_counts.values()) > 0 and pilot_programs_per_strategy < 1):
-            raise ValueError('positive pilot medium/xhigh counts require adaptive pilots to be enabled')
-        if (pilot_programs_per_strategy > 0 and sum(pilot_effort_counts.values()) > pilot_programs_per_strategy):
-            raise ValueError('pilot medium + xhigh counts cannot exceed pilot_programs_per_strategy')
-        if phase2_allocation_method not in {"rule_based", "bandit", "hurdle"}:
-            raise ValueError("phase2_allocation_method must be 'rule_based', 'bandit', or 'hurdle'")
         if strategy_temperature <= 0.0:
             raise ValueError("strategy_temperature must be positive")
         if not 0.0 < strategy_top_p <= 1.0:
@@ -1014,78 +696,27 @@ def load_config():
                   f"{effective_group_size}; replacing configured group_size="
                   f"{merged.get('group_size')}")
         merged["strategy_model_name"] = strategy_model_name
-        merged["strategy_backend"] = strategy_backend
         merged["strategies_per_parent"] = strategies_per_parent
         merged["programs_per_strategy"] = programs_per_strategy
-        merged["pilot_programs_per_strategy"] = (pilot_programs_per_strategy)
-        merged["phase2_allocation_method"] = phase2_allocation_method
         merged["strategy_archive_top_r"] = strategy_archive_top_r
         merged["strategy_max_new_tokens"] = strategy_max_new_tokens
         merged["strategy_max_seq_length"] = strategy_max_seq_length
         merged["strategy_temperature"] = strategy_temperature
         merged["strategy_top_p"] = strategy_top_p
-        merged["strategy_thinking"] = bool(merged["strategy_thinking"])
-        strategy_reasoning_effort = resolve_strategy_effort(
-            strategy_model_name if strategy_backend == "local" else "",
-            merged.get("strategy_reasoning_effort") or "high")
-        if strategy_reasoning_effort not in {"none", "low", "medium", "high", "xhigh", "max"}:
-            raise ValueError("strategy_reasoning_effort must be none, low, medium, high, xhigh, or max")
-        if (strategy_backend == "local" and "gpt-oss" in strategy_model_name.lower()
-                and strategy_reasoning_effort not in {"low", "medium", "high"}):
-            raise ValueError("local GPT-OSS strategy reasoning supports low, medium, or high")
-        merged["strategy_reasoning_effort"] = strategy_reasoning_effort
-        if (strategist_profile(strategy_model_name)
-                and "deepseek-v4-flash-0731" in strategy_model_name.lower()
-                and strategy_reasoning_effort == "max"
-                and strategy_max_seq_length < 393_216):
-            print("[config] DeepSeek Think Max recommends at least 393216 "
-                  "context tokens; keeping the configured strategy "
-                  f"limit {strategy_max_seq_length} unchanged")
+        merged["strategy_thinking"] = True
+        merged["strategy_reasoning_effort"] = STRATEGY_REASONING_EFFORT
         merged["strategy_vllm_quantization"] = str(merged.get('strategy_vllm_quantization') or '').strip()
-        merged["strategy_api_base_url"] = str(
-            merged.get("strategy_api_base_url")
-            or "https://api.deepseek.com").strip().rstrip("/")
-        merged["strategy_api_key_env"] = str(merged.get("strategy_api_key_env") or "DEEPSEEK_API_KEY").strip()
-        if merged["api_strategy"]:
-            merged["strategy_api_base_url"] = "https://api.openai.com/v1"
-            merged["strategy_api_key_env"] = "OPENAI_API_KEY"
-        merged["strategy_api_concurrency"] = int(merged.get("strategy_api_concurrency") or merged["groups_per_step"])
-        merged["strategy_api_timeout_s"] = float(merged.get("strategy_api_timeout_s") or 1800.0)
-        merged["strategy_api_max_retries"] = int(
-            merged.get("strategy_api_max_retries")
-            if merged.get("strategy_api_max_retries") is not None else 5)
-        if not merged["strategy_api_base_url"]:
-            raise ValueError("strategy_api_base_url cannot be empty")
-        if not merged["strategy_api_key_env"]:
-            raise ValueError("strategy_api_key_env cannot be empty")
-        if merged["strategy_api_concurrency"] < 1:
-            raise ValueError("strategy_api_concurrency must be >= 1")
-        if merged["strategy_api_timeout_s"] <= 0.0:
-            raise ValueError("strategy_api_timeout_s must be positive")
-        if merged["strategy_api_max_retries"] < 0:
-            raise ValueError("strategy_api_max_retries must be >= 0")
-        if strategy_backend == "api":
-            from generation.strategy_api import strategy_api_key
-            strategy_api_key(merged["strategy_api_key_env"])
         merged["group_size"] = effective_group_size
-    # This ablation intentionally keeps two independent Qwen3-8B engines per
-    # card resident together: a permanently base/no-LoRA strategist and a
-    # coder that receives the current LoRA adapter. Keep the switch derived
-    # rather than user-configurable so every other model pairing retains the
-    # existing alternating-pool behavior.
-    merged["dual_resident_qwen3_8b_strategy_coder_pools"] = (_dual_resident_qwen3_8b_strategy_coder_pools(merged))
-    # This profile is derived after coder/strategist selection. Clipped-policy
-    # resolvers below remain authoritative when they require full-policy
-    # sampling for an exact likelihood ratio.
-    _apply_qwen3_8b_thinking_sampling(merged, profile_explicit_keys)
-    from generation.thinking_budget import validate_thinking_budget
-    validate_thinking_budget(merged)
+    # Use zero in config to disable top-k filtering in both backends.
+    merged["sampling_top_k"] = 0
+    if "min_p" in merged:
+        merged["sampling_min_p"] = float(merged["min_p"])
+    else:
+        merged.setdefault("sampling_min_p", None)
+    merged["strategy_sampling_top_k"] = 0
+    merged["strategy_sampling_min_p"] = float(merged.get("strategy_min_p", 0.0))
     _resolve_policy_options(merged)
     _resolve_spo_rs_options(merged)
-    train_microbatch = int(merged["train_examples_per_microbatch"])
-    if train_microbatch < 1:
-        raise ValueError("train_examples_per_microbatch must be >= 1")
-    merged["train_examples_per_microbatch"] = train_microbatch
     raw_tp = merged["vllm_tensor_parallel_size"]
     tp = (0 if str(raw_tp or '').strip().lower() in ('', 'auto') else int(raw_tp))
     pp = int(merged["vllm_pipeline_parallel_size"] or 1)
@@ -1204,79 +835,76 @@ def load_config():
         print(f'[config] gpu_mode uses {merged["reward_workers"]} evaluation '
               'worker(s), one benchmark at a time per GPU')
 
-        if trimul and len(roles.available) < 2:
-            raise ValueError(
-                "TriMul pilot-barrier scheduling requires at least two GPUs: "
-                "all generate rollouts, then all are released for "
-                "one benchmark at a time per GPU")
-
     memory = query_gpu_memory()
     validate_selected_gpus(roles, memory)
 
-    merged["training_model_name"] = _resolve_training_model_name(
-        merged.get("model_name", ""), merged.get("training_model_name"),
-        merged.get("load_in_4bit", False),
-    )
-    if merged["training_model_name"] != merged.get("model_name"):
-        print(f"[precision] trainable checkpoint: "
-              f"{merged['training_model_name']} (generation remains "
-              f"{merged.get('model_name')})")
     requested_backend = str(merged["backend"]).strip().lower()
-    merged["backend"] = _resolve_training_backend(requested_backend, merged["training_model_name"])
-    if merged["backend"] != requested_backend:
+    merged["backend"] = _resolve_training_backend(requested_backend, coder_name)
+    if requested_backend not in ("auto", merged["backend"]):
         print("[backend] GPT-OSS Unsloth BNB checkpoints require the patched "
               f"expert loader; switching {requested_backend} -> "
               f"{merged['backend']}")
     if merged.get("coder_model_profile") == "gpt-oss-120b":
-        if (merged["training_model_name"] != merged.get("model_name") or bool(merged.get("load_in_4bit", False))):
-            raise ValueError(
-                "GPT-OSS-120B rollout and training must use the same original "
-                "checkpoint. Remove coder_training_model_name and set "
-                "load_in_4bit: false; modern Unsloth keeps the checkpoint's "
-                "native MXFP4 experts packed during LoRA training.")
-        if merged["backend"] != "unsloth":
-            raise ValueError("GPT-OSS-120B aligned training requires backend: unsloth")
-        if merged["training_layout"] != "replicated":
-            raise ValueError('GPT-OSS-120B packed-MXFP4 training requires training_layout: replicated')
-    if merged["training_layout"] == "sharded":
-        if merged["backend"] != "hf":
-            raise ValueError("training_layout=sharded currently requires backend=hf")
-        if int(merged["num_training_gpus"]) < 2:
-            raise ValueError("training_layout=sharded requires at least two training GPUs")
         if bool(merged.get("load_in_4bit", False)):
             raise ValueError(
-                "training_layout=sharded expects an unquantized trainable "
-                "checkpoint; set load_in_4bit: false")
+                "GPT-OSS-120B uses packed MXFP4 for LoRA training. Set load_in_4bit: false.")
+        if merged["backend"] != "unsloth":
+            raise ValueError("GPT-OSS-120B aligned training requires backend: unsloth")
     training_memory_fraction = float(merged.get("training_memory_fraction", 0.80))
     if not 0.0 < training_memory_fraction <= 0.90:
         raise ValueError("training_memory_fraction must be in (0, 0.90]")
     merged["training_memory_fraction"] = training_memory_fraction
-    replicated_weight_budget = bool(merged["fast"] or merged["training_layout"] == "replicated")
     training_budgets = _resolve_training_memory_budgets(
-        training_gpu_ids, memory,
-        max_fraction=(training_memory_fraction if replicated_weight_budget else 0.90))
+        training_gpu_ids, memory, max_fraction=training_memory_fraction)
     _validate_known_training_capacity(
-        merged["training_model_name"], training_budgets,
-        replicated=replicated_weight_budget)
+        coder_name, training_budgets, replicated=not merged["no_train"])
     merged["training_max_memory_gib"] = training_budgets
     if training_budgets:
         print(f'[memory] training weight budgets by logical GPU: {training_budgets} GiB')
 
-    if merged["fast"] and not merged["no_train"]:
-        fast_clipped_policy = bool(_uses_clipped_policy_loss(merged['advantage_mode']))
-        if (fast_clipped_policy and int(merged["spo_rs_update_epochs"]) != 1):
-            raise ValueError("--fast requires one clipped-policy update epoch")
-        fast_backend_supported = bool(
+    if not merged["no_train"]:
+        process_backend_supported = (
             merged["backend"] == "hf"
-            or (merged["backend"] == "unsloth" and merged.get("coder_model_profile") == "gpt-oss-120b")
-        )
-        if not (int(merged["num_training_gpus"]) > 1
-                and fast_backend_supported
-                and merged["generation_backend"] == "vllm"):
+            or (merged["backend"] == "unsloth"
+                and merged.get("coder_model_profile") == "gpt-oss-120b"))
+        if (len(training_gpu_ids) < 2 or not process_backend_supported
+                or generation_backend != "vllm"):
             raise ValueError(
-                "--fast requires replicated HF LoRA training (or the "
-                "profiled GPT-OSS-120B Unsloth QLoRA trainer) with vLLM "
-                "generation on at least two training GPUs")
+                "Training requires vLLM generation and at least two training GPUs "
+                "with an HF LoRA or GPT-OSS-120B packed-MXFP4 Unsloth replica on each GPU.")
+
+    if (resume_dir is not None and not merged["no_train"]
+            and _is_spo_rs_mode(merged["advantage_mode"])):
+        recovery = _read_exact_sharded_recovery(resume_dir)
+        if recovery is not None:
+            step = int(recovery["step"])
+            summary = resume_dir / f"step{step:02d}" / f"step{step:02d}.summary.json"
+            if summary.is_file():
+                _clear_exact_sharded_recovery(resume_dir)
+                recovery = None
+                print("[recovery] cleared exact-overflow state for an already checkpointed step")
+        if recovery is None:
+            recovery = _infer_exact_sharded_recovery(resume_dir)
+            if recovery is not None:
+                _write_exact_sharded_recovery(resume_dir, recovery["step"], recovery["reason"])
+        if recovery is not None:
+            step = int(recovery["step"])
+            if not recovery.get("overflow_gradient_file"):
+                merged["_exact_replica_capture_step"] = step
+                failed_length = re.search(r"(\d+)-token rollout", str(recovery.get("reason", "")))
+                if failed_length is not None and merged.get("coder_model_profile") != "qwen3.8-27b":
+                    merged["_exact_replica_overflow_min_tokens"] = max(1, int(failed_length.group(1)) - 16)
+                print("[recovery] replaying only backward for the saved step on the GPU replicas")
+            elif supports_warm_overflow(SimpleNamespace(**merged)):
+                merged["_exact_inprocess_recovery_step"] = step
+                print("[recovery] saved overflow gradients will finish on the process trainer")
+            elif not recovery.get("replica_offload_exhausted", False):
+                merged["_exact_replica_recovery_step"] = step
+                print("[recovery] retrying only deferred trajectories with bounded replica activation offload")
+            else:
+                raise ValueError(
+                    "Exact SPO-RS overflow exhausted replica recovery. Cooperative recovery "
+                    "requires unquantized HF training. The unfinished step and gradients are saved.")
 
     # Consume every rollout GPU. Prefer compatible TP replicas for throughput.
     # If a complete model plus one full-context request would not fit per
@@ -1285,11 +913,11 @@ def load_config():
     if generation_backend == "vllm":
         separate_local_strategy_pool = bool(
             merged["strategies"]
-            and merged.get("strategy_backend", "local") == "local"
-            and (str(merged.get("strategy_model_name") or merged.get("model_name"))
-                 != str(merged.get("model_name"))
+            and (merged["strategy_model_name"] != coder_name
                  or merged["hardware_profile"] == "B200"
-                 or merged["dual_resident_qwen3_8b_strategy_coder_pools"]))
+                 or merged["strategy_max_seq_length"] != merged["max_seq_length"]
+                 or merged["strategy_vllm_quantization"] != str(merged.get("vllm_quantization") or "").strip()
+                 or merged["load_in_4bit"]))
         # This must match GenerationPool's two runtime flags.  The old layout
         # used the uncapped 90% allocator budget, then process startup lowered
         # it for scoring/sleep residency; Qwen3-32B consequently selected
@@ -1304,37 +932,13 @@ def load_config():
             if profile_runtime_reserve is None else
             float(profile_runtime_reserve)
         )
-        known_heads = detect_attention_heads(merged.get("model_name", ""))
-        layout = derive_vllm_parallel_layout(merged, roles, memory, known_heads)
-        if merged["dual_resident_qwen3_8b_strategy_coder_pools"]:
-            # The coder needs one independent TP=1 engine per selected card;
-            # the strategy topology is derived separately below from its own
-            # model and context memory needs. Refuse an unsafe host rather than silently
-            # weakening coder rollout parallelism.
-            if (layout.tensor_parallel_size != 1 or layout.pipeline_parallel_size != 1):
-                raise ValueError(
-                    "the dual-resident Qwen3-8B strategy/coder ablation "
-                    "requires one coder engine per GPU (TP=1, PP=1), but "
-                    "the available memory cannot fit that layout "
-                    "at the configured context")
+        known_heads = detect_attention_heads(coder_name)
+        layout = derive_vllm_parallel_layout(
+            merged, roles, memory, known_heads, model_name=coder_name)
         merged["vllm_tensor_parallel_size"] = layout.tensor_parallel_size
         merged["vllm_pipeline_parallel_size"] = layout.pipeline_parallel_size
-        if (roles.gpu_problem
-                and str(merged.get("problem_type") or "").lower() == "trimul"
-                and (layout.tensor_parallel_size != 1
-                     or layout.pipeline_parallel_size != 1)):
-            raise ValueError(
-                "TriMul pilot-barrier scheduling requires independent TP=1, "
-                "PP=1 coder engines so each GPU can be released for "
-                "benchmarking; the selected model/context does not fit that "
-                "layout")
-        validate_attention_heads(known_heads, merged["vllm_tensor_parallel_size"], merged.get("model_name", ""))
-        if merged["dual_resident_qwen3_8b_strategy_coder_pools"]:
-            print(f"[config] Qwen3-8B strategist/coder ablation: two "
-                  "independent co-resident pools; coder keeps "
-                  f"{len(gpu_ids)} TP=1 engines and strategist topology is "
-                  "set to maximum memory-safe replica parallelism")
-        elif layout.pipeline_parallel_size > 1:
+        validate_attention_heads(known_heads, merged["vllm_tensor_parallel_size"], coder_name)
+        if layout.pipeline_parallel_size > 1:
             print(f"[config] compatible TP={layout.tensor_parallel_size} "
                   f"replicas need about "
                   f"{layout.unsharded_stage_required_gib:.1f} GiB/GPU, above "
@@ -1351,20 +955,18 @@ def load_config():
                   f"about {layout.unsharded_stage_required_gib:.1f} GiB/GPU "
                   f"within the {layout.budget_gib:.1f} GiB budget")
 
-        if (merged["strategies"] and merged.get("strategy_backend", "local") == "local"):
-            strategy_name = str(merged.get("strategy_model_name") or merged.get("model_name"))
+        if merged["strategies"]:
+            strategy_name = merged["strategy_model_name"]
             strategy_layout_cfg = dict(merged)
             strategy_layout_cfg.update({
-                "model_name": strategy_name,
-                "frozen_strategy": True,
-                "strategy_inference_profile": bool(strategist_profile(strategy_name)),
                 "max_seq_length": int(merged["strategy_max_seq_length"]),
                 "load_in_4bit": False,
                 "vllm_quantization": merged.get("strategy_vllm_quantization", ""),
                 "vllm_runtime_reserve_gib": vllm_runtime_reserve_gib(co_resident_sleep=True, token_scoring=False),
             })
             strategy_heads = detect_attention_heads(strategy_name)
-            memory_strategy_layout = derive_vllm_parallel_layout(strategy_layout_cfg, roles, memory, strategy_heads)
+            memory_strategy_layout = derive_vllm_parallel_layout(
+                strategy_layout_cfg, roles, memory, strategy_heads, model_name=strategy_name)
             # Strategies inside one parent are sequential, so the number of
             # parents, rather than strategies_per_parent, is the largest live
             # request frontier. Fold replicas above it into TP/PP ranks rather
@@ -1376,10 +978,12 @@ def load_config():
                 len(gpu_ids),
                 strategy_heads,
                 strategy_frontier,
+                model_name=strategy_name,
             )
             strategy_layout_cfg["vllm_tensor_parallel_size"] = (strategy_layout.tensor_parallel_size)
             strategy_layout_cfg["vllm_pipeline_parallel_size"] = (strategy_layout.pipeline_parallel_size)
-            for note in resolve_memory_settings(strategy_layout_cfg, roles, memory):
+            for note in resolve_memory_settings(
+                    strategy_layout_cfg, roles, memory, model_name=strategy_name):
                 print(f"[memory] auto strategy: {note}")
             merged["strategy_vllm_tensor_parallel_size"] = (strategy_layout.tensor_parallel_size)
             merged["strategy_vllm_pipeline_parallel_size"] = (strategy_layout.pipeline_parallel_size)
@@ -1388,9 +992,7 @@ def load_config():
             merged["strategy_vllm_runtime_reserve_gib"] = float(strategy_layout_cfg["vllm_runtime_reserve_gib"])
             merged["strategy_generation_frontier"] = strategy_frontier
             merged["separate_strategy_inference_pool"] = bool(
-                strategy_name != str(merged.get("model_name"))
-                or merged["hardware_profile"] == "B200"
-                or merged["dual_resident_qwen3_8b_strategy_coder_pools"]
+                separate_local_strategy_pool
                 or strategy_layout.tensor_parallel_size
                 != layout.tensor_parallel_size
                 or strategy_layout.pipeline_parallel_size
@@ -1409,13 +1011,11 @@ def load_config():
                   f"TP={strategy_layout.tensor_parallel_size}, "
                   f"PP={strategy_layout.pipeline_parallel_size}"
                   f"{frontier_note}")
-    elif (merged["strategies"]
-          and merged.get("strategy_backend", "local") == "local"
-          and str(merged.get("strategy_model_name") or merged.get("model_name"))
-          != str(merged.get("model_name"))):
-        raise ValueError('a distinct strategy_model_name currently requires generation_backend=vllm')
+    elif merged["strategies"] and merged["strategy_model_name"] != coder_name:
+        raise ValueError(f"Using the {STRATEGY_MODEL_NAME} strategist with a different coder "
+                         "requires generation_backend=vllm")
 
-    for note in resolve_memory_settings(merged, roles, memory):
+    for note in resolve_memory_settings(merged, roles, memory, model_name=coder_name):
         print(f"[memory] auto: {note}")
 
     if (merged.get("problem") in {"ac1", "ac2"}

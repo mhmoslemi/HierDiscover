@@ -16,7 +16,6 @@ Filenames:
 
 Directory name (problem-agnostic):
     runs/erdos_gpt-oss-120b_0602-2201/
-    runs/circle_packing_n26_Qwen3-8B_0527-2201/
 
 A config.json is also dumped at the root of the run dir.
 """
@@ -30,21 +29,18 @@ import zlib
 from dataclasses import asdict
 from pathlib import Path
 
+from config_validation import reject_retired_coder_cap
+
 
 _ROLLOUT_TOKEN_MAGIC = b"TTTtok1\0"
 _ROLLOUT_LOGPROB_MAGIC = b"TTTlp1\0\0"
 _ROLLOUT_IO_RETRY_SECONDS = 5.0
 _ROLLOUT_IO_RETRY_TIMEOUT_SECONDS = 2 * 60 * 60
 
-ROLLOUT_CONFIG_KEYS = (
-    "groups_per_step", "group_size", "strategies_per_parent",
-    "programs_per_strategy", "pilot_programs_per_strategy",
-    "pilot_medium_programs_per_strategy", "pilot_xhigh_programs_per_strategy",
-    "phase2_low_programs_per_strategy", "phase2_medium_programs_per_strategy",
-    "phase2_xhigh_programs_per_strategy",
-    "coder_thinking_budget",
+ROLLOUT_BUDGET_KEYS = (
+    "groups_per_step", "group_size", "strategies_per_parent", "programs_per_strategy",
 )
-ROLLOUT_BUDGET_KEYS = ROLLOUT_CONFIG_KEYS[:5]
+ROLLOUT_CONFIG_KEYS = ROLLOUT_BUDGET_KEYS
 
 
 def _retry_rollout_filesystem(operation, path):
@@ -302,7 +298,7 @@ def make_experiment_dir(cfg, root: str = "runs", resume_dir=None,
         name_parts.append(f"n{num_circles}")
 
     name_parts += [
-        _model_short(cfg.model_name),
+        _model_short(cfg.coder_model_name),
         time.strftime("%m%d-%H%M"),
     ]
     name = "_".join(name_parts)
@@ -329,23 +325,21 @@ def restart_changed_rollout_step(cfg, exp_dir, step):
     run = Path(exp_dir)
     directory = run / f"step{step:02d}"
     parents_path = directory / f"step{step:02d}.parents.json"
-    request_path = directory / f"step{step:02d}.sampler.request.json"
     jev_path = directory / f"step{step:02d}.jev.json"
     if ((directory / f"step{step:02d}.summary.json").is_file()
-            or not (parents_path.is_file() or request_path.is_file() or jev_path.is_file())):
+            or not (parents_path.is_file() or jev_path.is_file())):
         return None
     if parents_path.is_file():
         event = json.loads(parents_path.read_text())
         saved = event.get("rollout_config")
     else:
         saved = None
+    source = parents_path
     if saved is None:
-        saved = json.loads((run / "config.json").read_text())
+        source = run / "config.json"
+        saved = json.loads(source.read_text())
+    reject_retired_coder_cap(saved, source=source)
     values = {key: int(saved[key]) for key in ROLLOUT_BUDGET_KEYS if key in saved}
-    values.setdefault("pilot_programs_per_strategy", -1)
-    if request_path.is_file():
-        values["groups_per_step"] = int(
-            json.loads(request_path.read_text())["num_parents"])
     jev = json.loads(jev_path.read_text()) if jev_path.is_file() else None
     if jev is not None:
         values["groups_per_step"] = int(jev["requested"])
@@ -358,8 +352,7 @@ def restart_changed_rollout_step(cfg, exp_dir, step):
     if not (budget_changed or threshold_changed):
         return None
 
-    # Partial gradients and a prefetched next-step decision belong to the
-    # discarded trajectories, not to the last completed policy checkpoint.
+    # Partial gradients belong to the discarded trajectories.
     sidecars = [run / f".exact_spo_rs_overflow_step{step:04d}.pt"]
     marker = run / ".exact_sharded_recovery.json"
     if marker.is_file():
@@ -371,13 +364,6 @@ def restart_changed_rollout_step(cfg, exp_dir, step):
                 if Path(filename).name != filename:
                     raise ValueError("invalid overflow gradient filename")
                 sidecars.append(run / filename)
-    next_directory = run / f"step{step + 1:02d}"
-    next_request = next_directory / f"step{step + 1:02d}.sampler.request.json"
-    move_prefetch = (
-        next_request.is_file()
-        and not (next_directory / f"step{step + 1:02d}.parents.json").exists()
-        and not (next_directory / f"step{step + 1:02d}.summary.json").exists()
-        and not any(next_directory.glob(f"step{step + 1:02d}_group*")))
     backup_root = run / "_restarted_steps"
     backup_root.mkdir(exist_ok=True)
     backup = Path(tempfile.mkdtemp(prefix=f"step{step:02d}_", dir=backup_root))
@@ -386,8 +372,6 @@ def restart_changed_rollout_step(cfg, exp_dir, step):
     for path in dict.fromkeys(sidecars):
         if path.is_file():
             path.rename(backup / path.name)
-    if move_prefetch:
-        next_directory.rename(backup / next_directory.name)
     directory.rename(backup / directory.name)
 
     if threshold_changed and not budget_changed:
@@ -508,27 +492,20 @@ def save_rollout_artifacts(
 
 def save_strategy_response(exp_dir: Path, step: int, parent_group: int,
                            strategy: int,
-                           response_text: str, *, attempt=None,
-                           prompt_text=None, extraction_issue=None) -> Path:
-    """Persist one planning response immediately after generation returns."""
+                           response_text: str, *, prompt_text,
+                           response_chars: int, extraction_issue=None) -> Path:
+    """Persist the effective response and format verdict for one strategy slot."""
     step_dir = Path(exp_dir) / f"step{step:02d}"
-    step_dir.mkdir(exist_ok=True)
-    suffix = "" if attempt is None else f"_attempt{int(attempt):02d}"
-    # Retain the existing filename layout for resumed two-stage runs.
-    base = (f"step{step:02d}_group{parent_group:02d}_fold00_"
-            f"strategy{strategy:02d}{suffix}.txt")
-    path = step_dir / base
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(str(response_text or ""), errors="replace")
-    tmp.replace(path)
-    if attempt is not None:
-        prompt = (prompt_text if isinstance(prompt_text, str)
-                  else json.dumps(prompt_text, ensure_ascii=False, indent=2))
-        path.with_suffix(".prompt.txt").write_text(prompt, errors="replace")
-        path.with_suffix(".meta.json").write_text(json.dumps({
-            "attempt": int(attempt), "extraction_issue": extraction_issue,
-            "accepted": extraction_issue is None,
-        }, indent=2))
+    path = step_dir / (f"step{step:02d}_group{parent_group:02d}_fold00_"
+                       f"strategy{strategy:02d}.txt")
+    _atomic_write_text(path.with_suffix(".prompt.txt"), prompt_text, errors="replace")
+    _atomic_write_text(path.with_suffix(".meta.json"), json.dumps({
+        "extraction_issue": extraction_issue,
+        "accepted": extraction_issue is None,
+        "response_chars": response_chars,
+    }, indent=2))
+    # The response file is the completion marker used by resume.
+    _atomic_write_text(path, response_text, errors="replace")
     return path
 
 
@@ -593,7 +570,6 @@ def save_parent_selections(exp_dir: Path, step: int, sampler_type: str,
                                   if info.get("bonus") is not None else None),
             "selection_score": (float(info["score"])
                                 if info.get("score") is not None else None),
-            **({"llm": info["llm"]} if "llm" in info else {}),
             **({"jev": info["jev"]} if "jev" in info else {}),
         })
     payload = {
@@ -753,7 +729,7 @@ if __name__ == "__main__":
     # Self-test
     from types import SimpleNamespace
     cfg = SimpleNamespace(
-        model_name="openai/gpt-oss-120b",
+        coder_model_name="openai/gpt-oss-120b",
         problem="erdos", problem_type=None,
         num_steps=50, groups_per_step=8, group_size=64,
         learning_rate=4e-5, temperature=1.0, kl_penalty_coef=0.1,

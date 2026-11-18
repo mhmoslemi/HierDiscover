@@ -5,12 +5,11 @@ const _ssCache = {};
 function stepStats(step) {
   if (_ssCache[step]) return _ssCache[step];
   const rs = RS[step] || [];
-  const o = { n: rs.length, valid: 0, code: 0, constraint: 0, timeout: 0, improved: 0, retries: 0, tokens: 0, fallback: 0 };
+  const o = { n: rs.length, valid: 0, code: 0, constraint: 0, timeout: 0, improved: 0, tokens: 0, fallback: 0 };
   const raws = [];
   rs.forEach(r => {
     if (r.valid) { o.valid++; raws.push(r.raw); } else if (r.fail === "timeout") o.timeout++; else if (r.fail === "constraint") o.constraint++; else o.code++;
     if (r.improved) o.improved++;
-    if (r.isRetry) o.retries++;
     o.tokens += r.ntok || 0;
   });
   o.raws = raws.sort((a, b) => a - b);
@@ -175,12 +174,13 @@ function recipeNode() {
   const nm = p => (p || "").split("/").filter(Boolean).pop();
   const rows = [
     ["Problem", `${c.problem} · ${PROB.recipeProblem} · prompt target ${c.target}`],
-    ["Coder (trained)", `${nm(c.coder_model_name || c.model_name)} + LoRA r=${c.lora_rank}, lr ${c.learning_rate}, reasoning "${c.coder_reasoning_effort}"`],
-    ["Strategist (frozen)", `${nm(c.strategy_model_name)}${c.strategy_reasoning_effort ? ` · reasoning "${c.strategy_reasoning_effort}"` : ""}${c.strategy_format_max_retries != null ? ` · up to ${c.strategy_format_max_retries + 1} attempts` : ""}`],
+    ["Coder (trained)", `${nm(c.model_name || c.coder_model_name)} + LoRA r=${c.lora_rank}, lr ${c.learning_rate}, reasoning "${c.coder_reasoning_effort}"`],
+    ...(c.strategies !== false && c.strategy_model_name ? [["Strategist (frozen)",
+      [nm(c.strategy_model_name), c.strategy_reasoning_effort].filter(Boolean).join(" · ")]] : []),
     ...(RUN.hasJev ? [["JEV judge", (nm((c.jev_model_path || "").replace(/\/snapshots.*/, "")) || "models--fastino--GLiDE-9B").replace(/^models--/, "").replace(/--/g, "/")]] : []),
     ["Parent selection", `${c.parent_selection || RUN.sampler} · c=${c.puct_c} · ${c.num_seed_states} seeds${RUN.hasJev ? ` · window ×${c.jev_candidate_multiplier}` : ""}`],
     ["Per step", `${c.groups_per_step} parents × (${c.strategies_per_parent} strategies × ${c.programs_per_strategy}) = ${c.groups_per_step * c.group_size} programs`],
-    ["Pilot / phase 2", `${c.pilot_programs_per_strategy} pilot per strategy, then ${c.strategies_per_parent * (c.programs_per_strategy - c.pilot_programs_per_strategy)} per parent by "${c.phase2_allocation_method}"`],
+    ["Programs per strategy", c.programs_per_strategy],
     ["Advantage", `${c.advantage_mode} · β=${c.spo_rs_beta} · clip [${c.spo_rs_clip_epsilon_low}, ${c.spo_rs_clip_epsilon_high}]`],
     ["Archive", `top-${c.strategy_archive_top_r}/strategy · top-${c.topk_children_per_parent}/parent · cap ${c.max_buffer_size}`],
     PROB.kernel ? ["Kernel evaluation", `on ${c.gpu_type || "the GPU"} (GPU ${c.kernel_gpu_id != null ? c.kernel_gpu_id : "?"}), killed after ${c.kernel_timeout_s || c.sandbox_timeout_s}s${c.max_new_tokens ? `, up to ${fmt.n(c.max_new_tokens)} tokens` : ""}`]

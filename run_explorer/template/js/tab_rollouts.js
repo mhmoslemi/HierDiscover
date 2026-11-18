@@ -1,12 +1,12 @@
 "use strict";
 /* ---- Rollouts explorer ---------------------------------------------------------------------- */
-let _rl = { step: "cur", group: "all", sidx: "all", phase: "all", status: "all", q: "", x: "ntok", y: "gap", page: 0, sortCol: 6, sortDir: 1, retries: "include" };
+let _rl = { step: "cur", group: "all", sidx: "all", status: "all", q: "", x: "ntok", y: "gap", page: 0, sortCol: 5, sortDir: 1 };
 
 registerTab({
   id: "rollouts", label: "Rollouts explorer", ico: "▦",
   async render(root) {
     root.append(pageHead("Rollouts: every program the coder wrote",
-      `Filter the ${fmt.n(R.length)} scored programs by step, parent, strategy, phase and outcome; plot any two quantities; click a dot or a row to read the program, the strategy it was given, its sandbox output, its construction and how its advantage was computed.`));
+      `Filter the ${fmt.n(R.length)} scored programs by step, parent, strategy and outcome; plot any two quantities; click a dot or a row to read the program, the strategy it was given, its sandbox output, its construction and how its advantage was computed.`));
     const bar = h("div", { class: "card", style: { marginBottom: "14px" } });
     const mkSel = (label, key, opts) => {
       const s = h("select", null, opts.map(([v, l]) => h("option", { value: v, selected: String(_rl[key]) === String(v) }, l)));
@@ -19,9 +19,7 @@ registerTab({
       mkSel("Step", "step", [["cur", "selected (" + S.step + ")"], ["all", "all steps"]].concat(ALL_STEPS.filter(s => RS[s]).map(s => [String(s), "step " + s]))),
       mkSel("Parent", "group", [["all", "all"]].concat(range(0, 8).map(g => [String(g), "parent " + g]))),
       mkSel("Strategy", "sidx", [["all", "all"]].concat(range(0, 4).map(s => [String(s), "S" + s]))),
-      mkSel("Phase", "phase", [["all", "all"], ["pilot", "pilot"], ["adaptive", "phase 2"]]),
       mkSel("Outcome", "status", [["all", "all"], ["valid", "valid"], ["improved", "beat parent"], ["invalid", "invalid"], ["timeout", "timeout"]]),
-      mkSel("Retries", "retries", [["include", "include"], ["exclude", "exclude"], ["only", "only format retries"]]),
       q));
     root.append(bar);
 
@@ -30,9 +28,6 @@ registerTab({
       if (_rl.step !== "all" && r.step !== +curStep) return false;
       if (_rl.group !== "all" && r.pg !== +_rl.group) return false;
       if (_rl.sidx !== "all" && r.sidx !== +_rl.sidx) return false;
-      if (_rl.phase !== "all" && r.phase !== _rl.phase) return false;
-      if (_rl.retries === "exclude" && r.isRetry) return false;
-      if (_rl.retries === "only" && !r.isRetry) return false;
       const st = _rl.status;
       if (st === "valid" && !r.valid) return false;
       if (st === "improved" && !r.improved) return false;
@@ -63,14 +58,13 @@ registerTab({
     const ax = AX[_rl.x], ay = AX[_rl.y];
     const pts = rows.map(r => ({ x: ax[1](r), y: ay[1](r), c: S_COL(r.sidx), a: 0.7, r: r.valid ? 3.2 : 2.4, ring: r.improved, id: r.id, rr: r })).filter(p => p.x != null && p.y != null);
     scatterChart(host, { height: 380, points: pts, xLabel: ax[0], yLabel: ay[0], margin: { l: 62 }, xFmt: ax[2], yFmt: ay[2], yTicks: _rl.y === "gap" ? gapTicks() : null, yDomain: _rl.y === "gap" && pts.length ? gapDomain(pts.map(p => p.y)) : null,
-      tip: p => `<b>step ${p.rr.step} · parent ${p.rr.pg} · S${p.rr.sidx} · #${p.rr.rollout}</b><div>${p.rr.valid ? PROB.metric + " " + fmt.raw(p.rr.raw) : "<span style='opacity:.8'>invalid: " + esc(p.rr.fail) + "</span>"}</div><div class="mut">${p.rr.phase} · ${fmt.tok(p.rr.ntok)} tokens · A=${fmt.f(p.rr.adv, 3)}</div>`, onPoint: p => openRollout(p.id) });
+      tip: p => `<b>step ${p.rr.step} · parent ${p.rr.pg} · S${p.rr.sidx} · #${p.rr.rollout}</b><div>${p.rr.valid ? PROB.metric + " " + fmt.raw(p.rr.raw) : "<span style='opacity:.8'>invalid: " + esc(p.rr.fail) + "</span>"}</div><div class="mut">${fmt.tok(p.rr.ntok)} tokens · A=${fmt.f(p.rr.adv, 3)}</div>`, onPoint: p => openRollout(p.id) });
 
     // ----- table
     const cols = [
       { label: "step", get: r => String(r.step), num: true, key: r => r.step },
       { label: "parent", get: r => String(r.pg), num: true, key: r => r.pg },
       { label: "S", get: r => h("span", null, h("span", { class: "dot", style: { background: S_COL(r.sidx) } }), String(r.sidx)), key: r => r.sidx },
-      { label: "phase", get: r => r.phase === "adaptive" ? "phase 2" : "pilot" + (r.isRetry ? " (retry)" : ""), key: r => r.phase },
       { label: "#", get: r => String(r.rollout), num: true, key: r => r.rollout },
       { label: "result", get: r => r.valid ? (r.improved ? pill("beats parent", "good") : pill("valid")) : pill(r.fail || "failed", "bad"), key: r => r.valid ? (r.improved ? 0 : 1) : 2 },
       { label: PROB.metric, get: r => r.valid ? fmt.raw(r.raw) : "–", num: true, key: r => r.valid ? r.raw : 99 },

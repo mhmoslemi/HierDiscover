@@ -1,7 +1,7 @@
 "use strict";
 /* ---- SPO² & training tab ------------------------------------------------------------------- */
 /* All parameters (β, d_half, ρ bounds, per-step baseline override, clip ε) live in the shared store P,
-   so every change here is also visible in the Pipeline tab (stage 6/7 + flow diagram) and the Rollouts tab. */
+   so changes appear in the Pipeline advantage and training stages, flow diagram, and Rollouts tab. */
 let _trainLocal = { D: null, Dstep: null };
 
 function spoAdv(r, v, beta) { return (Math.exp(beta * r) / v - 1) / beta; }
@@ -71,7 +71,7 @@ function playground(root, step) {
     if (rs.length && logged) {
       const err = Math.max(...rs.filter(r => r.adv != null).map(r => Math.abs(spoAdv(r.reward, v, 2) - r.adv)));
       info.append(h("div", { class: "hint", style: { marginTop: "8px" } }, `Check: recomputing every logged advantage of step ${step} with β = 2 and v = ${fmt.f(v, 4)} reproduces them to max |Δ| = ${fmt.sci(err, 1)}.`));
-    } else info.append(h("div", { class: "what-if", style: { display: "inline-block", marginTop: "8px" } }, "what-if values - also shown in the Pipeline flow, stage 6 and the Rollouts tab"));
+    } else info.append(h("div", { class: "what-if", style: { display: "inline-block", marginTop: "8px" } }, "What-if values also appear in the Pipeline advantage stage, flow diagram, and Rollouts tab."));
   };
   ctl.append(paramSlider("β (risk sensitivity)", 0.1, 8, 0.1, x => x.toFixed(1), () => P.beta, (x, row) => setParam({ beta: x }, row)));
   const vmax = Math.max(4, st.spo.value_before * 1.8);
@@ -86,7 +86,7 @@ function playground(root, step) {
 /* ------------------------------------------------------------ SPO² vs entropic group baseline ---- */
 function compareModes(root, step) {
   const st = ST[step], g = S.group;
-  const rs = (RS[step] || []).filter(r => r.pg === g && !r.isRetry);
+  const rs = (RS[step] || []).filter(r => r.pg === g && r.planned !== false);
   if (!rs.length) return;
   const rewards = rs.map(r => r.reward);
   const ent = entropicAdv(rewards);

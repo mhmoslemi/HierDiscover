@@ -5,7 +5,7 @@ Nothing in the code base or in the run directory is modified - everything lives 
 
 **Problems supported out of the box:** `ac1` (first autocorrelation inequality) and `erdos` (Erdős minimum-overlap constant C₅). The problem is read from the run's `config.json`;
 the explorer then switches wording, the construction plots (autoconvolution f*f vs. overlap profile C(s)), the gap scale, the reference values and the Published SOTA tab accordingly.
-It also copes with older runs (no JEV gate, no `best.json`, missing allocation summaries - these are rebuilt from the rollout files).
+It also reads older runs without a JEV gate or a `best.json` snapshot.
 
 ```bash
 cd run_explorer
@@ -39,7 +39,7 @@ the HTML is a snapshot of the directory at build time. (`python3 build_explorer.
   a normalised **"progress toward the published reference"** chart (0 % = best of the first step, 100 % = the reference) that puts different problems on one axis; a side-by-side table and a **Hardware used** table (card, memory, compute capability, vLLM engines / tensor-parallel, evaluation CPUs).
 * A pill per problem in the top bar that opens that run's complete explorer (all tabs, what-ifs, constructions ...). Every explorer lives in its own frame, is inflated only when first opened, and keeps its state while you switch between problems.
   The theme button is shared; `↗ new tab` opens the current explorer on its own.
-* **⚡ Effort & speed** (separate page, second pill): tokens per rollout at every reasoning effort (Qwen3.8-27B low / medium / xhigh, gpt-oss-120b high), the estimated share that is thinking, the measured generation speed per GPU of both models on the B200 setup, and the generation time one rollout costs. Numbers come from `effort_stats.py` over the runs listed in `effort_runs.txt` (meta files for tokens, the pilot-phase progress bar of `temirnal.log` for speed). Per-effort speed cannot be read from the logs - the efforts run together in one batch - so that bar is derived (mean tokens ÷ the model's measured speed) and labelled as such.
+* **⚡ Effort & speed** (separate page, second pill): tokens per rollout at every reasoning effort (Qwen3.8-27B low / medium / xhigh, gpt-oss-120b high), the estimated share that is thinking, the measured generation speed per GPU of both models on the B200 setup, and the generation time one rollout costs. Numbers come from `effort_stats.py` over the runs listed in `effort_runs.txt` (meta files for tokens, the `rollouts` progress bar in `temirnal.log` for speed). The per-effort time estimate divides mean tokens by the model's measured generation speed.
 * Every run card, the side-by-side table and the explorer's top bar carry a coloured **reasoning-effort chip** (low = orange, medium = teal, high = violet, xhigh = crimson) with the effort mix of the scored rollouts on hover.
 * Add a problem by adding its run directory to `unified_runs.txt` (or on the command line) - problems without a profile still get the landing card and the pipeline tabs.
 
@@ -48,10 +48,9 @@ the HTML is a snapshot of the directory at build time. (`python3 build_explorer.
 | Tab | What you can do |
 |---|---|
 | **Overview** | **hardware used (GPU card, memory, vLLM layout, GPU-hours)**, best-so-far vs a reference, **league table against published AC1 results**, failure breakdown, score distribution, wall-clock per phase, per-step table |
-| **Pipeline (one step)** | the 8 stages with real counts; **animated flow diagram** (parents → plan → budget → result → training signal); click a stage for mechanism, formula, code references and live data; ▶ walkthrough |
+| **Pipeline (one step)** | the 7 stages with real counts; **animated flow diagram** (parents → plan → coder attempt → result → training signal); click a stage for mechanism, formula, code references and live data; ▶ walkthrough |
 | **Search: PUCT + JEV** | PUCT components with a live *c* slider; **JEV on the search tree** (the scanned candidates as tree nodes labelled with their upper bound, accept / reject recoloured live as you move the threshold, rejection arcs with the similarity, a zoomed upper-bound strip, and threshold sweeps); JEV comparison matrix with an **animated scan**; **genealogy that grows step by step**; score landscape |
-| **Strategist** | every strategy slot (attempts / fallbacks), the chain of any parent, plan text, reasoning, prompt anatomy, what the coder did with it |
-| **Allocation (hurdle)** | pilot outcomes vs the hurdle, the allocator's decision, a Monte-Carlo replica (agrees with the run on 96 % of parents) |
+| **Strategist** | each slot's plan or fallback and validation verdict, historical attempts when available, parent chains, reasoning, prompt anatomy, and coder results |
 | **SPO² & training** | advantage function with β / baseline sliders, SPO² vs entropic baseline, tracker simulation (reproduces the logged baseline to 1e-10), PPO-clip plot, loss / gradient / timing curves |
 | **Rollouts explorer** | filter + scatter + sortable table; click any program for code, strategy, stdout, construction plot, **diff vs parent**, advantage derivation |
 | **Solution (AC1)** | step function and autoconvolution recomputed in the browser; compare any two constructions (this run's best after each step **or the published ones**: AlphaEvolve, ThetaEvolve, TTT-Discover, Together AI, SimpleTES, best human); ▶ morph through the steps; **step function and f*f after every step** (small multiples) plus an overlay of all steps; sequence lengths |
@@ -66,7 +65,7 @@ The logs never print the card's *name*, so it is taken from `hardware_profile` w
 
 ### Linked what-ifs
 All parameters live in one shared store, so a change made anywhere shows up everywhere:
-`β`, `d_half`, `ρ_min/ρ_max`, the per-step baseline override and `ε_low/ε_high` (SPO² tab ⇄ Pipeline stage 6/7 ⇄ flow diagram ⇄ Rollouts advantages),
+`β`, `d_half`, `ρ_min/ρ_max`, the per-step baseline override and `ε_low/ε_high` (SPO² tab ⇄ Pipeline advantage and training stages ⇄ flow diagram ⇄ Rollouts advantages),
 the PUCT constant `c` (Search ⇄ Pipeline stage 1), the JEV threshold (Search replay and rejection chart ⇄ Pipeline stage 1) and the **Reference** value (every gap, line and the league table).
 A `↺ reset what-ifs` button appears in the top bar while anything differs from the logged run.
 
@@ -107,7 +106,6 @@ Reference data: `data/published_gpu_mode.json`, written by `data/build_published
 ## Caveats worth knowing
 * For runs with a JEV gate, `config.json` is stale for the threshold: the real value is stored per step (the AC1 run used 0.9 for steps 0-3 and 0.68 from step 4).
 * Wall-clock phases are reconstructed from the HH:MM:SS timestamps of `temirnal.log` (no dates; resumed steps include restart time).
-* The allocation sandbox samples the allocator's model instead of integrating it, so expected-improvement numbers differ slightly.
 * The tracker simulation holds the measured policy shift D fixed when you change β.
 * The partially written step shows only the stages that already wrote files.
 * **JEV substitutes.** `jev.json` only stores the candidates GLiDE actually compared (the scan stops after the 8th acceptance), but lowering the threshold would push the scan further down the PUCT ranking. `archive_sim.py` therefore rebuilds the candidate window (top 24 states) of every step by replaying the rules of `search/sampler.py` on the saved rollouts (exact-code dedupe, top-2 per parent×strategy, top-8 per parent, rank prior, visit counts). It is checked against the run: the rebuilt archive size equals the logged `archive_size` at every step and the rebuilt scan reproduces the recorded one (programs with exactly equal reward may swap places, which never changes who is selected). In the JEV tree view the programs that would fill the vacated slots are shown as **substitutes** (blue, marked *): GLiDE never compared them, so they are assumed to pass. If a step's window cannot be validated the view falls back to the record-only replay.

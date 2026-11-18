@@ -153,24 +153,23 @@ def dashboard_sections(fields, run_dir, *, resuming=False):
             row("Search selection", "Seed", "Deterministic"),
         ]),
         ("MODELS & SAMPLING", 95, [
-            row("Model"), row("Training model"), row("Coder sampling"),
+            row("Coder model"), row("Coder sampling"),
             row("Coder reasoning"), row("Max new tokens", "Max seq length"),
             row("Strategy model"), row("Strategy sampling"),
         ]),
-        ("ROLLOUTS & ALLOCATION", 93, [
+        ("ROLLOUTS", 93, [
             row("Groups per step", "Group size", "Total rollouts/step"),
-            row("Rollout hierarchy"), row("Rollout pilot"),
-            row("Strategy archive"), row("Output retries"),
+            row("Rollout hierarchy"),
+            row("Strategy archive"), row("Strategy validation"),
         ]),
         ("TRAINING", 92, [
             row("Advantage mode", "LR", "KL coef", "Reference KL"),
             row("Training layout"), row("Training scheduler"), row("LoRA"),
-            row("Train microbatch", "Logprob chunk"),
+            row("Logprob chunk"),
             row("Training memory cap"), row("Fused long attention"),
             row("MoE policy ratio"), row("Sequence clip eps low/high"),
             row("SPO-RS beta", "SPO-RS D_half"),
-            row("SPO-RS shaping"),
-            row("SPO-RS rho min/max", "SPO-RS update epochs"),
+            row("SPO-RS rho min/max"),
             row("SPO-RS clip eps low/high"),
         ]),
         ("HARDWARE & EVALUATION", 94, [

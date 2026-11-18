@@ -300,13 +300,12 @@ def local_spo_rs_update(backend, model, tokenizer, examples, cfg, logical_id,
     parameters = trainable_parameters(model)
     gradient_accumulators = [None for _ in parameters]
     metric_keys = (
-        "loss", "policy_loss", "kl_estimate", "entropy_estimate",
+        "loss", "policy_loss", "kl_estimate",
         "ratio", "clipped_fraction",
     )
     totals = {key: 0.0 for key in metric_keys}
     max_ratio = 0.0
     max_prefix_ratio = 0.0
-    entropy_examples = 0
     quarantined_examples = 0
     deferred_keys = []
     deferred_token_lengths = []
@@ -501,7 +500,6 @@ def local_spo_rs_update(backend, model, tokenizer, examples, cfg, logical_id,
                 attempt_values = {key: [] for key in metric_keys}
                 attempt_ratio_values = []
                 attempt_prefix_ratio_values = []
-                attempt_entropy_examples = 0
 
                 with training._policy_dropout_disabled(model):
                     for batch in active_batches:
@@ -536,7 +534,6 @@ def local_spo_rs_update(backend, model, tokenizer, examples, cfg, logical_id,
                                 example["old_policy_logprobs"],
                                 None,
                                 example["advantage"],
-                                forced_token_indices=example.get("forced_token_indices", ()),
                                 clip_epsilon=epsilon,
                                 clip_epsilon_low=epsilon_low,
                                 clip_epsilon_high=epsilon_high,
@@ -551,7 +548,7 @@ def local_spo_rs_update(backend, model, tokenizer, examples, cfg, logical_id,
                                 weight * loss.detach())
                             for key in (
                                     "policy_loss", "kl_estimate",
-                                    "entropy_estimate", "ratio"):
+                                    "ratio"):
                                 attempt_values[key].append(
                                     weight * metrics[key])
                             attempt_values["clipped_fraction"].append(
@@ -583,7 +580,6 @@ def local_spo_rs_update(backend, model, tokenizer, examples, cfg, logical_id,
                 return (
                     dict(zip(metric_keys, packed[:len(metric_keys)])),
                     packed[len(metric_keys)], packed[len(metric_keys) + 1],
-                    attempt_entropy_examples,
                 )
 
             result, effective_batches, unprocessed = (
@@ -635,7 +631,6 @@ def local_spo_rs_update(backend, model, tokenizer, examples, cfg, logical_id,
                     totals[key] += result[0][key]
                 max_ratio = max(max_ratio, result[1])
                 max_prefix_ratio = max(max_prefix_ratio, result[2])
-                entropy_examples += result[3]
 
             model.zero_grad(set_to_none=True)
             if defer_exact_oom:
@@ -698,7 +693,6 @@ def local_spo_rs_update(backend, model, tokenizer, examples, cfg, logical_id,
         "totals": totals,
         "max_ratio": max_ratio,
         "max_prefix_ratio": max_prefix_ratio,
-        "entropy_examples": entropy_examples,
         "quarantined_examples": quarantined_examples,
         "deferred_examples": len(deferred_keys),
         "deferred_keys": deferred_keys,
@@ -716,14 +710,11 @@ def local_spo_rs_update(backend, model, tokenizer, examples, cfg, logical_id,
 def local_policy_update(backend, model, tokenizer, examples, cfg, logical_id,
                         token_budget, total_examples, *,
                         memory_fraction=0.80, work_queue=None,
-                        adaptive_batches=True,
                         activation_offload_semaphore=None):
     """Accumulate one rank's exact entropic gradients.
 
-    This is the process-per-GPU counterpart of
-    ``ReplicatedDataParallelTrainer.train_policy``.  The global example count
-    is supplied by rank 0 so summing LoRA gradients across ranks reproduces the
-    original global mean loss exactly, independent of dynamic work stealing.
+    Rank 0 supplies the global example count so summing LoRA gradients
+    across ranks reproduces the global mean loss.
     """
     from contextlib import nullcontext
     import torch
@@ -806,10 +797,7 @@ def local_policy_update(backend, model, tokenizer, examples, cfg, logical_id,
             return training._FUSED_LONG_SINGLETON_MIN_TOKENS
         return None
 
-    configured_example_cap = max(
-        1, int(getattr(cfg, "train_examples_per_microbatch", 1) or 1))
-    max_examples_per_batch = (
-        64 if adaptive_batches else configured_example_cap)
+    max_examples_per_batch = 64
     if work_queue is None:
         pending = sorted(examples, key=example_length)
         max_examples_per_batch = min(
@@ -965,9 +953,6 @@ def local_policy_update(backend, model, tokenizer, examples, cfg, logical_id,
                         for example, current_lp, base_lp in zip(
                                 batch, current_logprobs, base_logprobs):
                             base_lp = base_lp.to(current_lp.device)
-                            forced = example.get("forced_token_indices", ())
-                            current_lp, base_lp = training.policy_token_values(
-                                current_lp, base_lp, forced_token_indices=forced)
                             advantage = example["advantage"]
                             logp_difference = (
                                 current_lp - base_lp).detach()
@@ -984,9 +969,6 @@ def local_policy_update(backend, model, tokenizer, examples, cfg, logical_id,
                                 example["behavior_logprobs"].to(
                                     current_lp.device)
                                 if has_behavior else None)
-                            if has_behavior and forced:
-                                behavior_lp, = training.policy_token_values(
-                                    behavior_lp, forced_token_indices=forced)
                             if sequence_policy:
                                 loss, policy_metrics = (
                                     training.
@@ -1096,13 +1078,13 @@ def local_policy_update(backend, model, tokenizer, examples, cfg, logical_id,
                  for batch in effective_batches for example in batch),
                 default=1)
             backed_off = bool(len(effective_batches) > 1 or quarantined)
-            if adaptive_batches and not effective_batches:
+            if not effective_batches:
                 budget = max(1, budget // 2)
-            elif adaptive_batches and backed_off:
+            elif backed_off:
                 budget = max(
                     longest_successful,
                     min(budget, successful_padded_tokens))
-            elif adaptive_batches:
+            else:
                 active_bytes = max(1, peak_allocated - base_allocated)
                 target_process_bytes = max(
                     base_allocated + 1,
@@ -1298,8 +1280,6 @@ def worker_main(rank, world_size, cfg_dict, init_method, work_queue,
                     command["total_examples"],
                     memory_fraction=command.get("memory_fraction", 0.80),
                     work_queue=work_queue,
-                    adaptive_batches=bool(command.get(
-                        "adaptive_batches", True)),
                     activation_offload_semaphore=(
                         activation_offload_semaphore))
                 result_queue.put({

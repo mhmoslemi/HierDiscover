@@ -54,7 +54,7 @@ reward = 1 / raw          (failure ⇒ 0)     seeds: raw = 2.0 ⇒ reward 0.5`,
     evalBody: `<p>Each program runs in its own subprocess (pinned to one CPU, BLAS threads = 1, memory-limited, hard timeout 1900 s). It must return a non-empty finite list; the evaluator computes the AC1 upper bound.</p>
       <p><b>Reward = 1 / raw upper bound</b> (higher is better); every failure gets reward 0. Failure kinds: <code>code</code> (no code block / unclosed fence / runtime error / bad return), <code>constraint</code> (invalid score), <code>timeout</code>.</p>
       <p>The target upper bound only appears in the prompt; it does not enter the reward.</p>`,
-    evalRefs: ["problems/ac_inequalities.py:71-94 (raw score), :376-409 (score), :405-406 (reward = 1/raw)", "evaluation/sandbox.py:211", "train_multy_CVaR.py:1126 (sandbox timeout)"],
+    evalRefs: ["problems/ac_inequalities.py:71-94 (raw score), :376-409 (score), :405-406 (reward = 1/raw)", "evaluation/sandbox.py:211", "orchestrator.py (train_step, sandbox_timeout_s)"],
     glossRaw: "2·n·max(a*a)/(Σa)² - the quantity to minimise.",
     sizeHint: "n",
   },

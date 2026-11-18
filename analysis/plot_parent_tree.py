@@ -155,8 +155,8 @@ def load_plot_genealogy(run_dir, max_step=None):
     return nodes, edges
 
 
-def write_tree_log(run_dir, max_step=None, *, output_path=None):
-    """Write an LLM-friendly, bidirectionally linked complete search tree."""
+def write_tree_log(run_dir, max_step=None):
+    """Write the complete search tree with links in both directions."""
     run_dir = Path(run_dir)
     nodes = {}
     try:
@@ -276,8 +276,7 @@ def write_tree_log(run_dir, max_step=None, *, output_path=None):
     }
     if errors:
         payload["source_errors"] = errors
-    output = (Path(output_path) if output_path is not None
-              else run_dir / "search_tree.json")
+    output = run_dir / "search_tree.json"
     temporary = output.with_suffix(".json.tmp")
     temporary.write_text(json.dumps(payload, indent=2, ensure_ascii=False),
                          encoding="utf-8")

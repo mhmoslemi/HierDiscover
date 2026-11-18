@@ -136,11 +136,6 @@ def set_gradient_checkpointing(model, enabled):
     return True
 
 
-def _training_model_name(cfg):
-    return str(getattr(cfg, "training_model_name",
-                       getattr(cfg, "model_name", "")))
-
-
 def _lora_rank(cfg):
     return int(cfg.lora_rank)
 
@@ -151,12 +146,12 @@ def _requires_unsloth_gpt_oss_loader(model_name):
 
 
 def _training_device_map(cfg):
-    """Choose replicated data parallelism or single-process model sharding."""
+    """Place a training replica or a generation-only model."""
     replica_device = getattr(cfg, "training_replica_device", None)
     if replica_device is not None:
         return {"": int(replica_device)}
     count = int(getattr(cfg, "num_training_gpus", 1) or 1)
-    return "balanced" if count > 1 else {"": 0}
+    return "balanced" if getattr(cfg, "no_train", False) and count > 1 else {"": 0}
 
 
 def _training_max_memory(cfg):
@@ -220,7 +215,7 @@ def _is_packed_mxfp4(model):
 def _use_training_4bit(
         cfg, *, native_quantization=False, prequantized_bnb=False):
     """Resolve the requested QLoRA mode without affecting vLLM."""
-    model_name = _training_model_name(cfg)
+    model_name = cfg.coder_model_name
     if prequantized_bnb:
         if importlib.util.find_spec("bitsandbytes") is None:
             raise RuntimeError(
@@ -596,7 +591,7 @@ def _register_ttt_attention_backend(*, fused_long_attention=False):
 
 
 class _ModelPlacementBackend:
-    """Move a possibly sharded trainer out for an all-GPU vLLM phase."""
+    """Park a model during vLLM phases and restore its device placement."""
 
     def _remember_training_placement(self, loaded_model):
         self._placement_model = loaded_model
@@ -1082,8 +1077,7 @@ def _validate_gpt_oss_training_attention(model, cfg):
 def _validate_hf_training_attention(model, cfg):
     """Validate the structural assumptions behind exact fused Qwen training."""
     profile = str(getattr(cfg, "coder_model_profile", ""))
-    if profile not in {
-            "qwen3-30b-a3b-thinking-2507", "qwen3.8-27b"}:
+    if profile != "qwen3.8-27b":
         return
 
     config = getattr(model, "config", None)
@@ -1124,23 +1118,14 @@ def _validate_hf_training_attention(model, cfg):
             "generic Flash-SDPA cannot preserve their normalization")
 
     layer_types = tuple(getattr(text_config, "layer_types", ()) or ())
-    if profile == "qwen3.8-27b":
-        if not ({"linear_attention", "full_attention"} <= set(layer_types)):
-            raise RuntimeError(
-                "Qwen3.8 training config lost its expected hybrid "
-                "Gated-DeltaNet/full-attention layout")
-        detail = (
-            "Flash-SDPA for eligible full-attention layers; exact FLA "
-            "Gated-DeltaNet; independent rollout states")
-    else:
-        if "linear_attention" in layer_types:
-            raise RuntimeError(
-                f"{profile} unexpectedly contains stateful linear-attention "
-                "layers")
-        detail = "Flash-SDPA for eligible full-attention calls"
+    if not ({"linear_attention", "full_attention"} <= set(layer_types)):
+        raise RuntimeError(
+            "Qwen3.8 training config lost its expected hybrid "
+            "Gated-DeltaNet/full-attention layout")
 
     model._ttt_attention_backend = f"qwen-exact:{implementation}"
-    print(f"[memory] {profile} exact long attention: {detail}; "
+    print(f"[memory] {profile} exact long attention: Flash-SDPA for eligible "
+          "full-attention layers; exact FLA Gated-DeltaNet; independent rollout states; "
           "exact bounded fallback retained", flush=True)
 
 
@@ -1200,7 +1185,7 @@ class UnslothBackend(_ModelPlacementBackend):
         from unsloth import FastLanguageModel
         self._FastLanguageModel = FastLanguageModel
 
-        training_name = _training_model_name(self.cfg)
+        training_name = self.cfg.coder_model_name
         prequantized_bnb = "bnb-4bit" in training_name.lower()
         use_4bit = _use_training_4bit(
             self.cfg, prequantized_bnb=prequantized_bnb)
@@ -1218,9 +1203,8 @@ class UnslothBackend(_ModelPlacementBackend):
             max_seq_length=self.cfg.max_seq_length,
             load_in_4bit=use_4bit,
             dtype=torch.bfloat16,
-            # Keep GPT-OSS on the exact checkpoint used by vLLM. Modern
-            # Unsloth leaves its published MXFP4 experts packed for backward.
-            use_exact_model_name=local_files_only or packed_mxfp4,
+            # Resolve the base once for both LoRA training and rollout workers.
+            use_exact_model_name=True,
             local_files_only=local_files_only,
             device_map=device_map,
             **({"max_memory": _training_max_memory(self.cfg)}
@@ -1310,7 +1294,7 @@ class HFBackend(_ModelPlacementBackend):
         from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
         from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
 
-        training_name = _training_model_name(self.cfg)
+        training_name = self.cfg.coder_model_name
         device_map = _training_device_map(self.cfg)
         replica_device = getattr(self.cfg, "training_replica_device", None)
         if replica_device is None:
@@ -1459,11 +1443,10 @@ def load_backend(name: str, cfg):
     Importing Unsloth mutates Transformers classes globally, so a failed
     Unsloth load cannot safely fall back to HF in the same interpreter.
     """
-    requires_unsloth = _requires_unsloth_gpt_oss_loader(
-        _training_model_name(cfg))
+    requires_unsloth = _requires_unsloth_gpt_oss_loader(cfg.coder_model_name)
     if name == "hf" and requires_unsloth:
         raise RuntimeError(
-            f"{_training_model_name(cfg)} uses Unsloth's split quantized "
+            f"{cfg.coder_model_name} uses Unsloth's split quantized "
             "GPT-OSS expert layout and cannot be loaded safely by vanilla "
             "Transformers. Select backend: unsloth; normal configuration "
             "loading performs this routing automatically.")

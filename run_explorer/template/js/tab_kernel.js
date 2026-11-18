@@ -21,7 +21,7 @@ async function kernelSolution(root, heavy, pub) {
   if (!snaps.length) { root.append(h("div", { class: "hint" }, "No best-so-far kernel snapshot is saved yet (stepNN.best.json is written when a step finishes).")); return; }
 
   const last = snaps[snaps.length - 1], first = snaps[0], best = last.raw;
-  const valid = R.filter(r => r.valid), failed = R.filter(r => !r.valid && !r.isRetry);
+  const valid = R.filter(r => r.valid), failed = R.filter(r => !r.valid && r.planned !== false);
   const constraint = R.filter(r => r.fail === "constraint").length;
   const lead = refs[0], sel = REF();
   const ratio = (v, w) => (v / w >= 10 ? (v / w).toFixed(1) : (v / w).toFixed(2)) + "×";

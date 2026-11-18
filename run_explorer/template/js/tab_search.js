@@ -319,7 +319,7 @@ function treeSection(root) {
       if (nowSel.has(id)) sv("circle", { cx: X(i), cy: Y(i), r: 8, fill: "none", stroke: cssVar("--accent"), "stroke-width": 2, class: "ring-pulse" }, svg);
       const c = sv("circle", { cx: X(i), cy: Y(i), r: n[0] < 0 ? 6 : (isSel ? 6 : 4), fill: colOf(i), stroke: G.path.has(i) ? cssVar("--s2") : (isSel ? cssVar("--ink") : cssVar("--surface")), "stroke-width": G.path.has(i) ? 2.4 : (isSel ? 1.4 : 1), style: "cursor:pointer" }, svg);
       if (ANIM) { c.setAttribute("class", "a-fade"); c.style.animationDelay = (0.05 * (n[2] + 1)) + "s"; }
-      c.addEventListener("mousemove", ev => tipShow(`<b>${n[0] < 0 ? "seed" : "step " + n[2]}</b> <span class="mut">${fmt.id(id)}</span><div>upper bound <b>${fmt.raw(n[1])}</b></div>${r ? `<div class="mut">parent group ${r.pg} · S${r.sidx} · ${r.phase}</div>` : ""}${isSel ? `<div>chosen as parent ${isSel}×</div>` : ""}<div class="mut">${(TREE.kids[i] || []).length} programs derived (total)</div>`, ev));
+      c.addEventListener("mousemove", ev => tipShow(`<b>${n[0] < 0 ? "seed" : "step " + n[2]}</b> <span class="mut">${fmt.id(id)}</span><div>upper bound <b>${fmt.raw(n[1])}</b></div>${r ? `<div class="mut">parent group ${r.pg} · S${r.sidx}</div>` : ""}${isSel ? `<div>chosen as parent ${isSel}×</div>` : ""}<div class="mut">${(TREE.kids[i] || []).length} programs derived (total)</div>`, ev));
       c.addEventListener("mouseleave", tipHide);
       c.addEventListener("click", () => openNode(id));
     });
@@ -335,18 +335,18 @@ function treeSection(root) {
 function landscapeSection(root) {
   const host = h("div", { class: "chart" });
   const ctl = h("div", { class: "row-flex", style: { marginBottom: "8px" } },
-    seg([{ value: "valid", label: "all valid" }, { value: "improved", label: "beat their parent" }, { value: "adaptive", label: "phase-2 only" }], _searchOpts.landscape, v => { _searchOpts.landscape = v; draw(); }),
+    seg([{ value: "valid", label: "all valid" }, { value: "improved", label: "beat their parent" }], _searchOpts.landscape, v => { _searchOpts.landscape = v; draw(); }),
     h("span", { class: "sub" }, `colour = parent group of the current step selection is emphasised: group ${S.group}`));
   root.append(card("Score landscape of every valid program", "x = step (jittered), y = gap to the reference value (log scale) · click a dot to open the program", h("div", null, ctl, host)));
   const draw = () => {
     const f = _searchOpts.landscape;
-    const pts = R.filter(r => r.valid && r.raw > 0 && r.raw < 5 && (f === "valid" || (f === "improved" && r.improved) || (f === "adaptive" && r.phase === "adaptive"))).map(r => ({
+    const pts = R.filter(r => r.valid && r.raw > 0 && r.raw < 5 && (f === "valid" || (f === "improved" && r.improved))).map(r => ({
       x: r.step + ((r.id * 2654435761 % 1000) / 1000 - 0.5) * 0.7, y: gapOf(r.raw), c: S_COL(r.pg), a: r.pg === S.group ? 0.85 : 0.35, r: r.pg === S.group ? 3.2 : 2.4, id: r.id, rr: r,
     }));
     scatterChart(host, {
       height: 380, points: pts, xLabel: "step", yLabel: "gap to reference (symlog)", margin: { l: 62 }, yTicks: gapTicks(), yFmt: gapFmt, xDomain: [-0.7, Math.max(...ALL_STEPS) + 0.7], yDomain: gapDomain(pts.map(p => p.y)),
       xTicks: ALL_STEPS, xFmt: v => String(Math.round(v)),
-      tip: p => `<b>step ${p.rr.step} · parent ${p.rr.pg} · S${p.rr.sidx}</b><div>upper bound ${fmt.raw(p.rr.raw)}</div><div class="mut">${p.rr.phase}${p.rr.improved ? " · beat parent" : ""}</div>`,
+      tip: p => `<b>step ${p.rr.step} · parent ${p.rr.pg} · S${p.rr.sidx}</b><div>upper bound ${fmt.raw(p.rr.raw)}</div><div class="mut">${p.rr.improved ? "Beat parent" : "Valid"}</div>`,
       onPoint: p => openRollout(p.id), hlines: [],
     });
   };

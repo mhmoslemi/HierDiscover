@@ -135,10 +135,6 @@ evaluate_sequence_ac2 = evaluate_sequence
 class ACInequalities(Problem):
     two_stage_rollouts = True
     saves_construction = True
-    # A malformed AC answer commonly ends after a long mathematical
-    # derivation.  Give the recovery turn that work so it completes the
-    # program instead of repeating the derivation from the beginning.
-    coder_retry_uses_failed_response = True
     name = "ac_inequalities"
 
     def __init__(self, cfg: dict):

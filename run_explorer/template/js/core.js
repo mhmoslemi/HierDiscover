@@ -34,7 +34,7 @@ function effortInfo() {
   const mix = {}; let n = 0;
   R.forEach(r => { if (r.effort) { mix[r.effort] = (mix[r.effort] || 0) + 1; n++; } });
   const base = CFG.coder_reasoning_effort || (n ? Object.keys(mix).sort((a, b) => mix[b] - mix[a])[0] : "");
-  const model = String(CFG.coder_model_name || CFG.model_name || "coder").split("/").filter(Boolean).pop().replace(/^Qwen3\.8-27B.*/i, "Qwen3.8-27B").replace(/^gpt-oss-120b.*/i, "gpt-oss-120b");
+  const model = String(CFG.model_name || CFG.coder_model_name || "coder").split("/").filter(Boolean).pop().replace(/^Qwen3\.8-27B.*/i, "Qwen3.8-27B").replace(/^gpt-oss-120b.*/i, "gpt-oss-120b");
   const order = ["low", "medium", "high", "xhigh"];
   const text = Object.keys(mix).sort((a, b) => order.indexOf(a) - order.indexOf(b)).map(e => `${e} ${(100 * mix[e] / n).toFixed(mix[e] / n < 0.1 ? 1 : 0)}%`).join(" · ");
   return { base, mix, n, model, text };
@@ -103,7 +103,6 @@ function prepare() {
     r.reward = r.reward == null ? 0 : r.reward;
     r.improved = !!(r.valid && r.pval != null && r.reward > r.pval + 1e-12);
     r.pg = r.pgroup != null ? r.pgroup : r.group;
-    r.isRetry = (r.retry || 0) > 0 || r.counts === false;
   }
   ST = {};
   for (const s of m.steps) ST[s.step] = s;
@@ -313,7 +312,7 @@ async function openRollout(rid) {
   const advCalc = v ? (G / v - 1) / beta : null;
   const kv = [
     ["Outcome", r.valid ? `<span class="pill good">valid</span> ${esc(PROB.metric)} <b>${fmt.raw(r.raw)}</b> (reward ${fmt.f(r.reward, 6)})` : `<span class="pill bad">invalid</span> ${esc(r.fail || "failed")} - ${esc(r.msg)}`],
-    ["Phase", `${r.phase === "adaptive" ? "phase 2 (hurdle-allocated)" : "pilot"} · strategy S${r.sidx}${r.isRetry ? ' · <span class="pill warn">format retry</span>' : ""}${r.fallback ? ' · <span class="pill warn">strategist fallback</span>' : ""}`],
+    ["Rollout", `${r.sidx == null ? "Direct rollout" : "Strategy S" + r.sidx}${r.fallback ? ' · <span class="pill warn">strategist fallback</span>' : ""}`],
     ["Node / parent", `<span class="mono">${esc(fmt.id(r.node))}</span> ← <a href="javascript:void 0" class="mono" id="lnkParent">${esc(fmt.id(r.parent))}</a>`],
     ["Parent score", `raw ${fmt.raw(r.praw)} (reward ${fmt.f(r.pval, 6)}) ${r.valid ? (r.improved ? '<span class="pill good">beats parent</span>' : '<span class="pill">not better than parent</span>') : ""}`],
     ["Response tokens", `${fmt.n(r.ntok)}${r.think_chars != null ? ` · reasoning ${fmt.n(r.think_chars)} chars` : ""}`],
@@ -328,7 +327,7 @@ async function openRollout(rid) {
   const sk = strat.strategies[`${r.step}:${r.pg}:${r.sidx}`];
   if (sk) {
     root.append(h("h3", { style: { marginTop: "16px" } }, "Strategy given to the coder (from the strategist)"));
-    root.append(sk.fallback ? h("div", { class: "warnbox" }, "The strategist failed all 4 format attempts - the coder got the fallback text and had to derive the approach itself.") : null);
+    root.append(sk.fallback ? h("div", { class: "warnbox" }, "The slot had no usable plan. The coder received the direct-solve fallback.") : null);
     root.append(textBlock(sk.block || "(not available)"));
   }
   // construction

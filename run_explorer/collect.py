@@ -112,7 +112,7 @@ def parse_construction(s, limit=None):
 def _scan_step(args):
     run_dir, step = args
     sd = os.path.join(run_dir, "step%02d" % step)
-    out = {"step": step, "rollouts": [], "strategies": {}, "files": 0, "slots": {}}
+    out = {"step": step, "rollouts": [], "strategies": {}, "files": 0}
     names = os.listdir(sd)
     out["files"] = len(names)
 
@@ -135,7 +135,6 @@ def _scan_step(args):
             "pgroup": meta.get("parent_group"),
             "rollout": meta.get("rollout"),
             "sidx": meta.get("strategy_index"),
-            "phase": meta.get("strategy_rollout_phase") or "pilot",
             "node": meta.get("node_id"),
             "parent": meta.get("parent_id"),
             "raw": _sig(meta.get("raw_score"), 9),
@@ -150,8 +149,7 @@ def _scan_step(args):
             "ntok": meta.get("n_response_tokens"),
             "effort": meta.get("coder_reasoning_effort"),
             "n": n_len,
-            "retry": meta.get("retry_attempt") or 0,
-            "counts": bool(meta.get("counts_toward_allocation", True)),
+            "planned": not meta.get("retry_attempt"),
             "pval": _sig(meta.get("parent_value"), 9),
             "praw": _sig(meta.get("parent_raw_score"), 9),
             "fallback": FALLBACK_MARK in strat,
@@ -159,14 +157,8 @@ def _scan_step(args):
             "arch": bool(meta.get("archive_eligible")),
         }
         out["rollouts"].append(rec)
-        sk = "%s:%s" % (meta.get("parent_group"), meta.get("strategy_index"))
-        if sk not in out["slots"] and meta.get("strategy_rollout_phase") is not None and not meta.get("retry_attempt"):
-            out["slots"][sk] = {k: meta.get(k) for k in (
-                "strategy_hurdle", "strategy_pilot_reward_mean", "strategy_pilot_reward_variance", "strategy_pilot_valid_count",
-                "strategy_posterior_valid_probability", "strategy_initial_expected_improvement", "strategy_pilot_followup_count",
-                "strategy_allocated_programs", "strategy_pilot_scenario", "strategy_phase2_allocation_method", "pilot_programs_per_strategy")}
 
-    # --- strategist attempts + final strategies -----------------------------------------
+    # --- strategist responses and historical attempt records --------------------------
     attempts = defaultdict(list)
     for name in names:
         m = ATTEMPT_META_RE.search(name)
@@ -192,18 +184,27 @@ def _scan_step(args):
         if not m:
             continue
         g, fo, s = (int(x) for x in m.groups()[1:])
-        txt = debyte(_read(os.path.join(sd, name)))
+        path = os.path.join(sd, name)
+        base = path[:-len(".txt")]
+        txt = debyte(_read(path))
         think, ans = split_think(txt)
         sm = STRAT_RE.search(txt)
         block = sm.group(1).strip() if sm else ""
         fallback = FALLBACK_MARK in block
-        # strategy prompt anatomy (character offsets of the pieces) from the last attempt
-        att = sorted(attempts.get((g, s), []), key=lambda r: r["a"])
-        anat = None
-        if att:
-            ptxt = _read(os.path.join(sd, "step%02d_group%02d_fold%02d_strategy%02d_attempt%02d.prompt.txt"
-                                      % (step, g, fo, s, att[-1]["a"])))
-            anat = prompt_anatomy(ptxt)
+        verdict = _jload(base + ".meta.json")
+        if isinstance(verdict, dict):
+            ptxt = _read(base + ".prompt.txt")
+            att = [{
+                "a": 0,
+                "ok": bool(verdict.get("accepted")),
+                "issue": verdict.get("extraction_issue"),
+                "rc": verdict.get("response_chars", len(txt)),
+                "pc": len(ptxt),
+            }]
+        else:
+            att = sorted(attempts.get((g, s), []), key=lambda r: r["a"])
+            ptxt = _read(base + "_attempt%02d.prompt.txt" % att[-1]["a"]) if att else ""
+        anat = prompt_anatomy(ptxt) if ptxt else None
         out["strategies"]["%d:%d" % (g, s)] = {
             "g": g, "s": s,
             "block": block,
@@ -215,36 +216,6 @@ def _scan_step(args):
             "attempts": att,
             "anat": anat,
         }
-    return out
-
-
-def _literal(txt):
-    import ast
-    try:
-        v = ast.literal_eval(txt) if isinstance(txt, str) else txt
-        return v if isinstance(v, dict) else {}
-    except Exception:
-        return {}
-
-
-def alloc_from_slots(slots):
-    out = []
-    for key in sorted(slots, key=lambda k: tuple(int(x) for x in k.split(":"))):
-        g, s = (int(x) for x in key.split(":"))
-        m = slots[key]
-        hur = _literal(m.get("strategy_hurdle"))
-        hur.setdefault("parent_reward", None)
-        for k in ("improvement_count", "posterior_improvement_probability", "mean_positive_improvement", "best_positive_improvement"):
-            hur.setdefault(k, 0 if k == "improvement_count" else 0.0)
-        out.append({
-            "parent_group": g, "strategy_index": s, "pilot_count": m.get("pilot_programs_per_strategy") or 11,
-            "pilot_reward_mean": m.get("strategy_pilot_reward_mean"), "pilot_reward_variance": m.get("strategy_pilot_reward_variance"),
-            "pilot_valid_count": m.get("strategy_pilot_valid_count") or 0, "posterior_valid_probability": m.get("strategy_posterior_valid_probability"),
-            "initial_expected_improvement": m.get("strategy_initial_expected_improvement"), "final_marginal_expected_improvement": None,
-            "projected_expected_gain": None, "followup_count": m.get("strategy_pilot_followup_count") or 0,
-            "allocated_programs": m.get("strategy_allocated_programs"), "scenario": m.get("strategy_pilot_scenario"),
-            "allocation_method": m.get("strategy_phase2_allocation_method"), "hurdle": hur, "rebuilt_from_rollouts": True,
-        })
     return out
 
 
@@ -325,17 +296,15 @@ def parse_terminal_log(path, max_lines=4000):
         elif "[puct-jev] step" in clean and "parents;" in clean:
             kind = "jev"
             stn = int(re.search(r"\[puct-jev\] step (\d+)", clean).group(1))
-        elif "two-stage coding" in clean or "continuous coder queue" in clean:
+        elif "two-stage coding" in clean:
             kind = "coding_start"
         elif "vLLM logprobs" in clean:
             kind = "logprobs"
         elif "SPO-RS evaluation/training overlap started" in clean:
             kind = "train_start"
-        elif "rollout pilot:" in clean and "programs x" in clean:
-            kind = "pilot_start"
         elif "parents picked:" in clean:
             kind = "pick"
-        elif "coder format recovery" in clean:
+        elif "coder generation complete:" in clean:
             kind = "gen_done"
         if kind and stn is not None:
             anchors.append((i, secs, kind, stn))
@@ -369,9 +338,10 @@ def parse_terminal_log(path, max_lines=4000):
         a = by_step[stn]
         start = prev_ckpt if prev_ckpt else first_ts
         jev = a.get("jev") or a.get("pick")
-        cs = a.get("coding_start") or a.get("pilot_start")
+        cs = a.get("coding_start")
         gd = a.get("gen_done")
         lp = a.get("logprobs")
+        gen_end = gd or lp
         tr = a.get("train_start")
         ck = a.get("ckpt")
         if start and jev:
@@ -385,10 +355,10 @@ def parse_terminal_log(path, max_lines=4000):
                 ph["select"] = delta(start[1], jev[1])
             if jev and cs:
                 ph["strategist"] = delta(jev[1], cs[1])
-            if cs and lp:
-                ph["coder"] = delta(cs[1], lp[1])
-            if jev and lp and not cs:
-                ph["strategist+coder"] = delta(jev[1], (gd or lp)[1])
+            if cs and gen_end:
+                ph["coder"] = delta(cs[1], gen_end[1])
+            if jev and gen_end and not cs:
+                ph["strategist+coder"] = delta(jev[1], gen_end[1])
             if lp and tr:
                 ph["scoring"] = delta(lp[1], tr[1])
             elif gd and lp:
@@ -467,7 +437,8 @@ def parse_hardware(run_dir, config, steps):
     m = re.search(r"from a (\d+)-GiB", tlog)
     if m:
         hw["host_offload_gib"] = int(m.group(1))
-    hw["training_layout"] = c.get("training_layout")
+    layout = re.search(r"Training layout:[ \t]*([^\r\n]+)", setting)
+    hw["training_layout"] = layout.group(1).strip() if layout else c.get("training_layout")
     hw["backend"] = c.get("generation_backend")
     # naming: the logs never print the card name, so infer it from the hardware profile and the device facts
     prof = (hw["profile"] or "").upper()
@@ -547,6 +518,9 @@ def collect(run_dir, code_per_step=25, all_code=False, think_full=False, progres
             progress("[collect %5.1fs] %s" % (time.time() - t0, msg))
 
     config = _jload(os.path.join(run_dir, "config.json"), {})
+    legacy_coder_cap = "coder_thinking_budget"
+    if isinstance(config, dict):
+        config.pop(legacy_coder_cap, None)
     step_dirs = sorted(d for d in os.listdir(run_dir) if re.fullmatch(r"step\d+", d) and
                        os.path.isdir(os.path.join(run_dir, d)))
     steps_idx = [int(d[4:]) for d in step_dirs]
@@ -575,7 +549,7 @@ def collect(run_dir, code_per_step=25, all_code=False, think_full=False, progres
         rec = {"step": s, "completed": bool(summ and summ.get("completed")), "partial": summ is None}
         if summ:
             keep = ["next_step", "archive_size", "groups_per_step", "group_size", "planned_rollouts",
-                    "coder_format_retries", "coder_format_retries_still_missing", "step_best_raw_score",
+                    "step_best_raw_score",
                     "step_best_reward", "best_seen_raw_score", "best_seen_reward", "best_seen_step",
                     "valid_fraction", "code_valid_fraction", "evaluation_workers", "evaluation_cpu_count",
                     "spo_rs_divergence", "spo_rs_context_divergences", "training_seconds",
@@ -593,16 +567,13 @@ def collect(run_dir, code_per_step=25, all_code=False, think_full=False, progres
                                                     "divergence", "rho", "eta", "updates", "initialized",
                                                     "context_divergences", "missing_policy_scores")}
             rec["policy_updates"] = summ.get("policy_updates") or []
-            alloc = []
-            for a in summ.get("strategy_pilot_allocation") or []:
-                alloc.append({k: v for k, v in a.items()})
-            if not alloc and scans[s].get("slots"):
-                alloc = alloc_from_slots(scans[s]["slots"])   # some runs / steps do not write strategy_pilot_allocation: rebuild it from the rollout metas
-            rec["alloc"] = alloc
         if parents:
             rec["sampler_type"] = parents.get("sampler_type")
             rec["parents"] = parents.get("parents", [])
-            rec["rollout_config"] = parents.get("rollout_config")
+            rollout_config = parents.get("rollout_config")
+            if isinstance(rollout_config, dict):
+                rollout_config.pop(legacy_coder_cap, None)
+            rec["rollout_config"] = rollout_config
         if jev:
             for nid, code in (jev.get("sources") or {}).items():
                 jev_sources.setdefault(nid, code)
@@ -806,7 +777,7 @@ def collect(run_dir, code_per_step=25, all_code=False, think_full=False, progres
 
     # slim rollouts into columnar form
     cols = ["id", "step", "group", "pgroup", "rollout", "sidx", "phase", "node", "parent", "raw", "reward",
-            "valid", "parsed", "ran", "fail", "msg", "adv", "ntok", "n", "retry", "counts", "pval", "praw",
+            "valid", "parsed", "ran", "fail", "msg", "adv", "ntok", "n", "planned", "counts", "pval", "praw",
             "fallback", "arch", "think_chars", "effort"]
     rows = []
     for r in rollouts:

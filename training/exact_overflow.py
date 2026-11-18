@@ -18,8 +18,7 @@ import sys
 import time
 
 
-METRICS = ("loss", "policy_loss", "kl_estimate", "entropy_estimate",
-           "ratio", "clipped_fraction")
+METRICS = ("loss", "policy_loss", "kl_estimate", "ratio", "clipped_fraction")
 
 
 def supports_warm_overflow(cfg):
@@ -28,8 +27,7 @@ def supports_warm_overflow(cfg):
     return (str(getattr(cfg, "backend", "")) == "hf"
             and not bool(getattr(cfg, "load_in_4bit", False))
             and not bool(getattr(cfg, "effective_load_in_4bit", False))
-            and int(getattr(cfg, "num_training_gpus", 1)) > 1
-            and str(getattr(cfg, "training_layout", "")) == "replicated")
+            and int(getattr(cfg, "num_training_gpus", 1)) > 1)
 
 
 def trajectory_key(example):
@@ -234,13 +232,11 @@ def backward_overflow_example(backend, tokenizer, example, cfg, gpu_ids):
                 def attempt(_batches):
                     result = training.compute_batched_token_logprobs(
                         model, [item], True, cfg.logprob_chunk,
-                        pad_token_id=tokenizer.pad_token_id,
-                        measure_entropy=True)
+                        pad_token_id=tokenizer.pad_token_id)
                     current = result[0]
                     loss, metrics = training.clipped_policy_loss(
                         cfg, current, item["old_policy_logprobs"],
                         None, item["advantage"],
-                        forced_token_indices=item.get("forced_token_indices", ()),
                         clip_epsilon=epsilon, clip_epsilon_low=low,
                         clip_epsilon_high=high, kl_coef=kl)
                     if not torch.isfinite(loss).all():
@@ -248,12 +244,12 @@ def backward_overflow_example(backend, tokenizer, example, cfg, gpu_ids):
                     weight = float(item["sample_weight"])
                     (weight * loss).backward()
                     totals = {name: weight * float(metrics[name]) for name in (
-                        "policy_loss", "kl_estimate", "entropy_estimate", "ratio")}
+                        "policy_loss", "kl_estimate", "ratio")}
                     totals.update(loss=weight * float(loss.detach()),
                                   clipped_fraction=weight * float(metrics["clipped"]))
                     return dict(totals=totals, max_ratio=float(metrics["ratio"]),
                                 max_prefix_ratio=float(metrics["prefix_ratio_max"]),
-                                entropy_examples=0, backward_batches=1)
+                                backward_batches=1)
 
                 stages = iter((0.98, 0.99))
 
@@ -465,7 +461,6 @@ def complete_warm_overflow(trainer, examples, cfg, step_idx, state):
                                    for name in METRICS},
                         "max_ratio": max(item["max_ratio"] for item in stats),
                         "max_prefix_ratio": max(item["max_prefix_ratio"] for item in stats),
-                        "entropy_examples": sum(item["entropy_examples"] for item in stats),
                         "backward_batches": len(successful),
                     }
                     training._commit_exact_spo_rs_overflow_batch(
@@ -505,8 +500,7 @@ def complete_warm_overflow(trainer, examples, cfg, step_idx, state):
         trainer.model.zero_grad(set_to_none=True)
         trainer._workers_idle = True
         result.update(
-            training_parallel_gpus=trainer.world_size, training_fast=True,
-            training_fast_processes=True, exact_overflow_inprocess=True,
+            training_parallel_gpus=trainer.world_size, exact_overflow_inprocess=True,
             exact_overflow_waves=waves, exact_overflow_completed_examples=initial_pending,
             training_seconds=float(state["normal_stats"]["training_seconds"])
                 + previous_overflow_seconds + time.time() - started)
@@ -524,7 +518,7 @@ _EXACT_OVERFLOW_GRADIENT_FILE = ".exact_spo_rs_overflow_step{step:04d}.pt"
 
 
 class ExactLongContextTrainingOOM(RuntimeError):
-    """One exact trajectory needs the automatic multi-GPU training path."""
+    """A trajectory exhausted the memory available for an exact update."""
 
 
 def _exact_sharded_recovery_path(run_dir):
@@ -643,15 +637,10 @@ def _save_exact_spo_rs_overflow(run_dir, step, model, rank_stats, *, normal_trai
             "exact SPO-RS overflow keys are missing or duplicated: "
             f"count={deferred_count}, unique={len(deferred_keys)}")
 
-    metric_keys = (
-        "loss", "policy_loss", "kl_estimate", "entropy_estimate",
-        "ratio", "clipped_fraction",
-    )
     normal_stats = {
-        "totals": {key: sum(float(stats["totals"][key]) for stats in rank_stats) for key in metric_keys},
+        "totals": {key: sum(float(stats["totals"][key]) for stats in rank_stats) for key in METRICS},
         "max_ratio": max(float(stats["max_ratio"]) for stats in rank_stats),
         "max_prefix_ratio": max(float(stats["max_prefix_ratio"]) for stats in rank_stats),
-        "entropy_examples": sum(int(stats["entropy_examples"]) for stats in rank_stats),
         "trained_examples": sum(int(stats["trained_examples"]) for stats in rank_stats),
         "backward_batches": sum(int(stats["backward_batches"]) for stats in rank_stats),
         "training_seconds": max(0.0, float(normal_train_seconds)),
@@ -684,10 +673,9 @@ def _save_exact_spo_rs_overflow(run_dir, step, model, rank_stats, *, normal_trai
             for module in model.modules()),
         "normal_stats": normal_stats,
         "overflow_stats": {
-            "totals": {key: 0.0 for key in metric_keys},
+            "totals": {key: 0.0 for key in METRICS},
             "max_ratio": 0.0,
             "max_prefix_ratio": 0.0,
-            "entropy_examples": 0,
             "trained_examples": 0,
             "backward_batches": 0,
             "training_seconds": 0.0,
@@ -731,8 +719,7 @@ def _load_exact_spo_rs_overflow(run_dir, step):
     path = Path(run_dir) / filename
     if not path.is_file():
         print(
-            f"[warn] exact SPO-RS overflow gradients are missing ({path}); "
-            "falling back to the complete exact model-sharded update",
+            f"[warn] exact SPO-RS overflow gradients are missing ({path})",
             flush=True,
         )
         return None
@@ -743,9 +730,7 @@ def _load_exact_spo_rs_overflow(run_dir, step):
             payload = torch.load(path, map_location="cpu")
     except Exception as error:
         print(
-            f"[warn] exact SPO-RS overflow gradients could not be loaded "
-            f"({error}); falling back to the complete exact model-sharded "
-            "update",
+            f"[warn] exact SPO-RS overflow gradients could not be loaded ({error})",
             flush=True,
         )
         return None
@@ -753,18 +738,14 @@ def _load_exact_spo_rs_overflow(run_dir, step):
             or int(payload.get("version", -1)) not in (1, 2)
             or int(payload.get("step", -1)) != int(step)):
         print(
-            f"[warn] invalid exact SPO-RS overflow gradient checkpoint "
-            f"({path}); falling back to the complete exact model-sharded "
-            "update",
+            f"[warn] invalid exact SPO-RS overflow gradient checkpoint ({path})",
             flush=True,
         )
         return None
     deferred_keys = sorted({(int(key[0]), int(key[1])) for key in payload.get("deferred_keys", ())})
     if not deferred_keys:
         print(
-            f"[warn] exact SPO-RS overflow checkpoint has no deferred keys "
-            f"({path}); falling back to the complete exact model-sharded "
-            "update",
+            f"[warn] exact SPO-RS overflow checkpoint has no deferred keys ({path})",
             flush=True,
         )
         return None
@@ -776,16 +757,10 @@ def _load_exact_spo_rs_overflow(run_dir, step):
     completed_keys = sorted({(int(key[0]), int(key[1])) for key in payload.get("completed_keys", ())})
     if (set(remaining_keys) & set(completed_keys) or set(remaining_keys) | set(completed_keys) != set(deferred_keys)):
         print(
-            f"[warn] exact SPO-RS overflow progress keys are inconsistent "
-            f"({path}); falling back to the complete exact model-sharded "
-            "update",
+            f"[warn] exact SPO-RS overflow progress keys are inconsistent ({path})",
             flush=True,
         )
         return None
-    metric_keys = (
-        "loss", "policy_loss", "kl_estimate", "entropy_estimate",
-        "ratio", "clipped_fraction",
-    )
     overflow_stats = payload.get("overflow_stats")
     if not isinstance(overflow_stats, dict):
         overflow_stats = {}
@@ -796,19 +771,16 @@ def _load_exact_spo_rs_overflow(run_dir, step):
     payload["remaining_keys"] = remaining_keys
     payload["completed_keys"] = completed_keys
     payload["overflow_stats"] = {
-        "totals": {key: float(overflow_totals.get(key, 0.0)) for key in metric_keys},
+        "totals": {key: float(overflow_totals.get(key, 0.0)) for key in METRICS},
         "max_ratio": float(overflow_stats.get("max_ratio", 0.0)),
         "max_prefix_ratio": float(overflow_stats.get("max_prefix_ratio", 0.0)),
-        "entropy_examples": int(overflow_stats.get("entropy_examples", 0)),
         "trained_examples": int(overflow_stats.get("trained_examples", len(completed_keys))),
         "backward_batches": int(overflow_stats.get("backward_batches", len(completed_keys))),
         "training_seconds": max(0.0, float(overflow_stats.get("training_seconds", 0.0))),
     }
     if payload["overflow_stats"]["trained_examples"] != len(completed_keys):
         print(
-            f"[warn] exact SPO-RS overflow progress count is inconsistent "
-            f"({path}); falling back to the complete exact model-sharded "
-            "update",
+            f"[warn] exact SPO-RS overflow progress count is inconsistent ({path})",
             flush=True,
         )
         return None
@@ -880,19 +852,14 @@ def _commit_exact_spo_rs_overflow_batch(
             saved = saved_gradients[name]
             saved.add_(gradient.detach().to(device="cpu", dtype=saved.dtype))
 
-    metric_keys = (
-        "loss", "policy_loss", "kl_estimate", "entropy_estimate",
-        "ratio", "clipped_fraction",
-    )
     overflow_stats = overflow_state["overflow_stats"]
     totals = batch_stats["totals"]
-    for key in metric_keys:
+    for key in METRICS:
         overflow_stats["totals"][key] += float(totals[key])
     overflow_stats["max_ratio"] = max(float(overflow_stats["max_ratio"]), float(batch_stats["max_ratio"]))
     overflow_stats["max_prefix_ratio"] = max(
         float(overflow_stats["max_prefix_ratio"]),
         float(batch_stats["max_prefix_ratio"]))
-    overflow_stats["entropy_examples"] += int(batch_stats["entropy_examples"])
     overflow_stats["trained_examples"] += len(trajectory_keys)
     overflow_stats["backward_batches"] += int(batch_stats.get("backward_batches", len(trajectory_keys)))
     overflow_stats["training_seconds"] += max(0.0, float(training_seconds))
@@ -917,15 +884,6 @@ def _commit_exact_spo_rs_overflow_batch(
         # committed. A stale human-readable marker does not invalidate it.
         print(f'[warn] exact overflow progress marker could not be refreshed: {error}', flush=True)
     return len(remaining)
-
-
-def _commit_exact_spo_rs_overflow_progress(
-        model, overflow_state, step_idx, trajectory_key, trajectory_stats,
-        *, training_seconds):
-    """Merge one finished oversized gradient and make it restart-durable."""
-    return _commit_exact_spo_rs_overflow_batch(
-        model, overflow_state, step_idx, [trajectory_key], trajectory_stats,
-        training_seconds=training_seconds)
 
 
 def _clip_sharded_grad_norm_(parameters, max_norm, *, error_if_nonfinite):
@@ -975,7 +933,7 @@ def _resume_process_argv(run_dir):
         index += 1
     return [
         sys.executable,
-        str(Path(__file__).resolve().parents[1] / "train_multy_CVaR.py"),
+        str(Path(__file__).resolve().parents[1] / "orchestrator.py"),
         *filtered,
         "--resume",
         str(Path(run_dir).resolve()),

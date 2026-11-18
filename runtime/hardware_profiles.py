@@ -10,10 +10,7 @@ B200_LOCAL_MODELS = {
     "fastino/GLiDE-9B": "GLiDE-9B",
     "openai/gpt-oss-120b": "gpt-oss-120b",
     "Qwen/Qwen3.8-27B": "Qwen3.8-27B",
-    "nvidia/Qwen3.8-Flash-Next-NVFP4": "Qwen3.8-Flash-Next-NVFP4",
     "deepseek-ai/DeepSeek-R1-Distill-Qwen-32B": "DeepSeek-R1-Distill-Qwen-32B",
-    "nvidia/DeepSeek-V4-Flash-0731-NVFP4": "DeepSeek-V4-Flash-0731-NVFP4",
-    "Qwen/Qwen3-8B": "Qwen3-8B",
     "deepseek-ai/DeepSeek-R1-0528-Qwen3-8B": "DeepSeek-R1-0528-Qwen3-8B",
 }
 
@@ -26,14 +23,6 @@ def local_checkpoint(model_name, profile):
                 if path.is_dir():
                     print(f"[hardware] local checkpoint: {path}")
                     return str(path)
-    return model_name
-
-
-def checkpoint_identity(model_name):
-    """Retain identity-based model behavior after resolving the NAS path."""
-    for model_id, folder in B200_LOCAL_MODELS.items():
-        if str(model_name).rstrip("/") == str(B200_MODEL_DIR / folder):
-            return model_id
     return model_name
 
 

@@ -28,7 +28,7 @@ from collect import collect  # noqa: E402
 JS_ORDER = [
     "core.js", "charts.js", "problems.js", "knowledge.js",
     "tab_overview.js", "tab_pipeline.js", "tab_search.js", "tab_strategist.js",
-    "tab_rollouts.js", "tab_alloc.js", "tab_train.js", "jev_tree.js",
+    "tab_rollouts.js", "tab_train.js", "jev_tree.js",
     "tab_kernel.js", "tab_solution.js", "tab_published.js", "tab_concepts.js", "tab_logs.js", "main.js",
 ]
 PROBLEM_TITLES = {"ac1": "First autocorrelation inequality (AC1)", "erdos": "Erdős minimum-overlap problem (C₅)"}
@@ -111,7 +111,7 @@ def summarize(main, pub):
         "problem": pid, "title": title, "short": short, "kind": "kernel" if pid in KERNEL_PROBLEMS else "construction",
         "metric": metric, "lower_is_better": True, "effort": effort_summary(main), "gpu_type": cfg.get("gpu_type"),
         "run_name": main["meta"]["run_name"], "generated_at": main["meta"]["generated_at"],
-        "coder": nm(cfg.get("coder_model_name") or cfg.get("model_name")), "strategist": nm(cfg.get("strategy_model_name")),
+        "coder": nm(cfg.get("model_name") or cfg.get("coder_model_name")), "strategist": nm(cfg.get("strategy_model_name")),
         "steps_done": len(done), "steps_total": cfg.get("num_steps"), "rollouts": len(rows), "valid_fraction": (n_valid / len(rows)) if rows else None,
         "best": best, "curve": curve, "pending": pending, "pub_results": pub_results, "ref_default": (pub or {}).get("default_ref"), "target": cfg.get("target"),
         "stopped": bool(el.get("stopped")), "elapsed_s": el.get("total"), "hardware": hw,

@@ -45,7 +45,7 @@ def validate_memory_handoff_runtime(training_file):
 
     root = Path(training_file).resolve().parent
     components = {
-        "train_multy_CVaR.py": Path(training_file).resolve(),
+        "orchestrator.py": Path(training_file).resolve(),
         'runtime/host_memory.py': Path(__file__).resolve(),
         'generation/gen_workers.py': Path(gen_workers.__file__).resolve(),
         "vllm_compat/sleep_memory.py": Path(sleep_memory.__file__).resolve(),
@@ -63,7 +63,7 @@ def validate_memory_handoff_runtime(training_file):
             or not callable(getattr(sleep_memory.SleepMemoryExtension,
                                     "ttt_host_memory", None))):
         raise RuntimeError(
-            "incomplete memory-handoff update: update train_multy_CVaR.py, "
+            "incomplete memory-handoff update: update orchestrator.py, "
             "generation/gen_workers.py, runtime/host_memory.py and "
             "vllm_compat/sleep_memory.py "
             "together, then launch a fresh process")

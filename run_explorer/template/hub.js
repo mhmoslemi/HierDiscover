@@ -179,7 +179,7 @@ function effChip(model, effort, title) { return h("span", { class: "effort-chip 
 function effortChipOf(r) {
   const e = r.effort || {}; if (!e.base) return null;
   const mix = effText(e.mix);
-  return effChip(r.coder, e.base, `The coder (${r.coder}) ran at reasoning effort "${e.base}".` + (mix ? ` Effort of its scored rollouts: ${mix}.` : "") + (Object.keys(e.mix || {}).length > 1 ? " The other efforts are a few pilot programs per strategy." : ""));
+  return effChip(r.coder, e.base, `The coder (${r.coder}) ran at reasoning effort "${e.base}".` + (mix ? ` Effort of its scored rollouts: ${mix}.` : ""));
 }
 
 function runCard(r) {
@@ -373,22 +373,22 @@ function renderEffort() {
     const sbars = hbars({
       label: "generation speed per GPU", max: sm, ticks: ticksTo(sm, ss), tickFmt: v => int(v), left: 270, right: 190,
       rows: models.map(m => ({
-        label: m + (/gpt-oss/i.test(m) ? " · high" : " · low (pure steps)"), color: colOf(m), segs: [{ v: SP[m].tps_gpu_median, op: 0.85 }], dots: SP[m].samples.map(x => x.tps_gpu),
-        end: int(SP[m].tps_gpu_median) + " tokens/s per GPU", tip: `<b>${esc(m)}</b><br>median <b>${int(SP[m].tps_gpu_median)}</b> tokens/s per GPU (range ${int(SP[m].tps_gpu_min)} - ${int(SP[m].tps_gpu_max)})<br><span class="mut">${SP[m].n_timings} pilot phases from ${SP[m].n_runs} run${SP[m].n_runs > 1 ? "s" : ""} · ${esc(SP[m].basis)}</span>`,
+        label: m, color: colOf(m), segs: [{ v: SP[m].tps_gpu_median, op: 0.85 }], dots: SP[m].samples.map(x => x.tps_gpu),
+        end: int(SP[m].tps_gpu_median) + " tokens/s per GPU", tip: `<b>${esc(m)}</b><br>median <b>${int(SP[m].tps_gpu_median)}</b> tokens/s per GPU (range ${int(SP[m].tps_gpu_min)} - ${int(SP[m].tps_gpu_max)})<br><span class="mut">${SP[m].n_timings} measured steps from ${SP[m].n_runs} run${SP[m].n_runs > 1 ? "s" : ""} · ${esc(SP[m].basis)}</span>`,
       })),
     });
     const q = SP["Qwen3.8-27B"], o = SP["gpt-oss-120b"];
     const trows = [];
     models.forEach(m => SP[m].samples.forEach(x => trows.push([m, x.run, x.step, x.rollouts, x.tokens, x.elapsed_s, x.tps_gpu, effText(x.mix)])));
     root.append(h("div", { class: "card", style: { marginTop: "14px" } },
-      h("div", { class: "card-head" }, h("h2", null, "How fast tokens are generated (2 × B200)"), h("span", { class: "sub" }, "tokens per second per GPU during the pilot phase (median of the measured steps)")),
+      h("div", { class: "card-head" }, h("h2", null, "How fast tokens are generated (2 × B200)"), h("span", { class: "sub" }, "Median tokens per second per GPU during the coding pass")),
       sbars,
       q && o ? h("p", { class: "sub", style: { margin: "4px 0 8px" } }, h("b", null, "gpt-oss-120b generates ≈ " + (o.tps_gpu_median / q.tps_gpu_median).toFixed(1) + "× more tokens per second per GPU than Qwen3.8-27B"), " on the same GPUs (a mixture-of-experts model with a few billion active parameters against a dense 27B model).") : null,
       h("details", null, h("summary", { class: "sub", style: { cursor: "pointer" } }, "show the individual measurements"),
         h("div", { class: "scroll", style: { maxHeight: "260px", marginTop: "6px" } }, h("table", { class: "t" },
           h("thead", null, h("tr", null, ["model", "run", "step", "rollouts", "tokens", "seconds", "tokens/s/GPU", "effort mix"].map((c, i) => h("th", { class: i > 1 && i < 7 ? "num" : "" }, c)))),
           h("tbody", null, trows.map(r => h("tr", null, r.map((c, i) => h("td", { class: i > 1 && i < 7 ? "num" : "" }, typeof c === "number" ? int(c) : c)))))))),
-      h("div", { class: "sub", style: { marginTop: "8px" } }, "Measured from the log's pilot-phase progress bar: the tokens of all pilot rollouts of a step divided by the time the bar took. The pilot phase generates everything at once and the evaluation of finished programs does not hold it back, so this is the effective speed of the generation GPUs - including the ramp-up and the tail where only the longest sequences are still running. Only runs on the B200 setup are used so both models share the hardware.")));
+      h("div", { class: "sub", style: { marginTop: "8px" } }, "Measured from the completed rollouts progress bar and the token counts of the planned attempts in that step. The estimate includes ramp-up and the time for the longest sequences to finish. Speed comparisons use B200 runs.")));
 
     /* ---- derived cost */
     const dr = rows.filter(g => gpuSec(g) != null);

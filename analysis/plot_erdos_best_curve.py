@@ -361,7 +361,7 @@ def config_caption(run_dir, valid_count, metric_name, maximize):
         config = json.loads(config_path.read_text()) if config_path.is_file() else {}
     except (OSError, json.JSONDecodeError):
         config = {}
-    model = Path(str(config.get("model_name", "?"))).name
+    model = Path(str(config.get("model_name") or config.get("coder_model_name") or "?")).name
     groups = config.get("groups_per_step", "?")
     size = config.get("group_size", "?")
     problem = config.get("problem", "unknown")

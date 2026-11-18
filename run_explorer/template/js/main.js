@@ -2,7 +2,7 @@
 /* ---- main.js: boot, navigation, theme ---------------------------------------------------- */
 const TAB_GROUPS = [
   ["Understand", ["overview", "pipeline"]],
-  ["Search & strategy", ["search", "strategist", "alloc"]],
+  ["Search & strategy", ["search", "strategist"]],
   ["Learning", ["train"]],
   ["Data", ["rollouts", "solution"]],
   ["Reference", ["published", "concepts", "logs"]],
@@ -111,7 +111,7 @@ async function boot() {
     { const ef = effortInfo(), chip = $("#effortChip");
       if (ef.base) {
         chip.hidden = false; chip.className = "effort-chip eff-" + ef.base; chip.innerHTML = ""; chip.append(ef.model, h("small", null, "· " + ef.base + " effort"));
-        chip.title = `The coder (${ef.model}) ran at reasoning effort "${ef.base}".` + (ef.n ? ` Effort of the ${ef.n.toLocaleString("en-US")} scored rollouts: ${ef.text}.` : "") + (Object.keys(ef.mix).length > 1 ? " The other efforts are a few pilot programs per strategy." : "");
+        chip.title = `The coder (${ef.model}) ran at reasoning effort "${ef.base}".` + (ef.n ? ` Effort of the ${ef.n.toLocaleString("en-US")} scored rollouts: ${ef.text}.` : "");
       }
     }
     $("#runName").textContent = D.main.meta.run_name + "  ·  " + ((D.main.hardware || {}).label || "") + "  ·  generated " + D.main.meta.generated_at;
