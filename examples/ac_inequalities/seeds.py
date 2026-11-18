@@ -1,3 +1,6 @@
+"""Seed programs for the autocorrelation tasks."""
+
+
 def example_ae_program_random_init(num_seconds):
     return f'''
 import numpy as np
@@ -39,63 +42,6 @@ def propose_candidate(seed=42, budget_s={num_seconds}, **kwargs):
 
     return [float(x) for x in best]
 '''
-
-
-AC1_LITERATURE = r"""A previous state of the art used the following approach. You can use it as inspiration, but you are not required to use it, and you are encouraged to explore.
-```latex
-Starting from a nonnegative step function $f=(a_0,\dots,a_{n-1})$ normalized so that $\sum_j a_j=\sqrt{2n}$, set $M=\|f*f\|_\infty$. Next compute $g_0=(b_0,\dots,b_{n-1})$ by solving a linear program, i.e.\ maximizing $\sum_j b_j$ subject to $b_j\ge0$ and $\|f*g_0\|_\infty\le M$; as is standard, the optimum is attained at an extreme point determined by an active set of binding inequalities, here corresponding to important constraints where the convolution bound $(f*g_0)(x)\le M$ is tight and limiting. Rescale $g_0$ to match the normalization, $g=\frac{\sqrt{2n}}{\sum_j b_j}g_0$, and update $f\leftarrow (1-t)f+t g$ for a small $t>0$. Repeating this step produces a sequence with nonincreasing $\|f*f\|_\infty$, and the iteration is continued until it stabilizes.
-```"""
-
-
-AC1_EVAL_FUNCTION = '''```python
-import numpy as np
-
-def evaluate_sequence(sequence: list[float]) -> float:
-    """
-    Evaluates a sequence of coefficients with enhanced security checks.
-    Returns np.inf if the input is invalid.
-    """
-    # --- Security Checks ---
-
-    # Verify that the input is a list
-    if not isinstance(sequence, list):
-        return np.inf
-
-    # Reject empty lists
-    if not sequence:
-        return np.inf
-
-    # Check each element in the list for validity
-    for x in sequence:
-        # Reject boolean types (as they are a subclass of int) and
-        # any other non-integer/non-float types (like strings or complex numbers).
-        if isinstance(x, bool) or not isinstance(x, (int, float)):
-            return np.inf
-
-        # Reject Not-a-Number (NaN) and infinity values.
-        if np.isnan(x) or np.isinf(x):
-            return np.inf
-
-    # Convert all elements to float for consistency
-    sequence = [float(x) for x in sequence]
-
-    # Protect against negative numbers
-    sequence = [max(0, x) for x in sequence]
-
-    # Protect against numbers that are too large
-    sequence = [min(1000.0, x) for x in sequence]
-
-    n = len(sequence)
-    b_sequence = np.convolve(sequence, sequence)
-    max_b = max(b_sequence)
-    sum_a = np.sum(sequence)
-
-    # Protect against the case where the sum is too close to zero
-    if sum_a < 0.01:
-        return np.inf
-
-    return float(2 * n * max_b / (sum_a**2))
-```'''
 
 
 thetaevolve_initial_program_prev_init = '''
@@ -397,72 +343,3 @@ def construct_function():
     print("This gets a C2 lower bound of", r_value)
     return heights.tolist()
 '''
-
-
-ae_verifier_program = '''
-import numpy as np
-def evaluate_sequence(sequence: list[float]) -> float:
-    # Verify that the input is a list
-    if not isinstance(sequence, list):
-        raise ValueError("Invalid sequence type")
-
-    # Reject empty lists
-    if not sequence:
-        raise ValueError("Empty sequence")
-
-    # Check each element in the list for validity
-    for x in sequence:
-        # Reject boolean types (as they are a subclass of int) and
-        # any other non-integer/non-float types (like strings or complex numbers).
-        if isinstance(x, bool) or not isinstance(x, (int, float)):
-            raise ValueError("Invalid sequence element type")
-
-        # Reject Not-a-Number (NaN) and infinity values.
-        if np.isnan(x) or np.isinf(x):
-            raise ValueError("Invalid sequence element value")
-
-    # Convert all elements to float for consistency
-    sequence = [float(x) for x in sequence]
-
-    # Protect against negative numbers
-    sequence = [max(0, x) for x in sequence]
-
-    # Check if sum of sequence will be too close to zero
-    if np.sum(sequence) < 0.01:
-        raise ValueError("Sum of sequence is too close to zero.")
-    
-    # Protect against numbers that are too large
-    sequence = [min(1000.0, x) for x in sequence]
-
-    convolution_2 = np.convolve(sequence, sequence)
-    # --- Security Checks ---
-
-    # Calculate the 2-norm squared: ||f*f||_2^2
-    num_points = len(convolution_2)
-    x_points = np.linspace(-0.5, 0.5, num_points + 2)
-    x_intervals = np.diff(x_points) # Width of each interval
-    y_points = np.concatenate(([0], convolution_2, [0]))
-    l2_norm_squared = 0.0
-    for i in range(len(convolution_2) + 1):  # Iterate through intervals
-        y1 = y_points[i]
-        y2 = y_points[i+1]
-        h = x_intervals[i]
-        # Integral of (mx + c)^2 = h/3 * (y1^2 + y1*y2 + y2^2) where m = (y2-y1)/h, c = y1 - m*x1, interval is [x1, x2], y1 = mx1+c, y2=mx2+c
-        interval_l2_squared = (h / 3) * (y1**2 + y1 * y2 + y2**2)
-        l2_norm_squared += interval_l2_squared
-
-    # Calculate the 1-norm: ||f*f||_1
-    norm_1 = np.sum(np.abs(convolution_2)) / (len(convolution_2) + 1)
-
-    # Calculate the infinity-norm: ||f*f||_inf
-    norm_inf = np.max(np.abs(convolution_2))
-    C_lower_bound = l2_norm_squared / (norm_1 * norm_inf)
-    return C_lower_bound
-'''
-
-
-# https://arxiv.org/pdf/2506.16750
-AC2_LITERATURE = r"""A previous state of the art used the following approach. You can use it as inspiration, but you are not required to use it, and you are encoraged to explore.
-```latex
-Their procedure is a coarse-to-fine optimization of the score. It starts with a stochastic global search that repeatedly perturbs the current best candidate and keeps the perturbation whenever it improves (Q), with the perturbation scale gradually reduced over time. Once a good basin is found, they switch to a deterministic local improvement step, performing projected gradient ascent (move in the gradient direction and project back to the feasible region). To reach higher resolution, they lift a good low-resolution solution to a higher-dimensional one by simply repeating its entries and then rerun the local refinement. Iterating this explore–refine–upscale cycle yields their final high-resolution maximizer and the improved lower bound.
-```"""

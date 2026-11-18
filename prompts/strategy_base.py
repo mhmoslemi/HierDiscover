@@ -1,26 +1,6 @@
-"""Editable prompts for the local strategist.
-
-The builder replaces {previous_strategies} with the parent's accepted plans.
-The strategist returns its plan inside <strategy>...</strategy>.
-Problem classes supply task constraints and parent context.
-"""
+"""Shared instructions for the strategist."""
 
 
-# Local strategist: XML plan output.
-# Disabled for the local strategist to preserve the 0544 behavior:
-# The coder is a one-shot, text-only LLM with no CPU, GPU, Python interpreter,
-# terminal, tools, or execution environment. It can only reason internally and
-# write one complete program. It cannot execute calculations, run or test code,
-# verify results experimentally, or revise its answer after execution feedback.
-# The harness executes the source only after the coder has finished. Specify
-# every required calculation, candidate check, scoring operation, and fallback
-# as code the coder must write, never as work it must perform before answering.
-# Do not ask for measured scores or verified numerical results. Do not include
-# test suites, toy-example sanity checks, finite-difference gradient tests,
-# benchmark scripts, interactive debugging, or follow-up experiments. Resolve
-# the mathematics in the plan and give concrete defaults that need no preliminary
-# experiments. All search loops and result-dependent adaptation must be fully
-# specified operations inside the generated program.
 LOCAL_STRATEGY_PROMPT = '''## Strategy-stage output
 
 {previous_strategies}You are the domain expert, research lead, and algorithm designer.
@@ -161,3 +141,16 @@ steps, resolve conflicting dimensions or settings, and check that every
 nontrivial operation has an implementation rule. Check that the real plan is
 enclosed exactly once and that the last non-whitespace characters of your
 response are exactly </strategy>.'''
+
+
+PREVIOUS_STRATEGIES = (
+    "The following strategies were already proposed for this same "
+    "task and parent context:\n\n"
+    "{plans}\n\n"
+    "Propose a materially different approach. Do not merely "
+    "rename variables, reorder steps, or make superficial "
+    "parameter changes. Treat these plans as unverified proposals, "
+    "not established facts. Explain the substantive difference "
+    "in your final plan, and make that plan independently usable "
+    "without referring back to earlier strategies.\n\n"
+)

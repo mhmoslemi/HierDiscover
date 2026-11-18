@@ -1,4 +1,7 @@
-SYSTEM_PROMPT = '''You are an expert in computational biology and single-cell RNA-seq analysis.
+"""Task instructions for single-cell RNA-seq denoising."""
+
+
+TASK_PROMPT = '''You are an expert in computational biology and single-cell RNA-seq analysis.
 Your task is to develop a denoising algorithm for scRNA-seq count data. You are experienced in
 compuational biology libraries and tools and are familiar with problems in denoising in the single-cell field.
 
@@ -23,11 +26,11 @@ You need to implement a novel denoising algorithm that outperforms the current s
 Your output is evaluated using these exact functions:
 
 ```python
-<<<EVALUATE_MSE_FUNC>>>
+{evaluate_mse}
 ```
 
 ```python
-<<<EVALUATE_POISSON_FUNC>>>
+{evaluate_poisson}
 ```
 
 ## Scoring
@@ -66,4 +69,30 @@ def magic_denoise(X, **kwargs):
 - Square root transform is variance-stabilizing for Poisson distributions
 - Poisson loss is highly affected by low non-zero values - push values < 1 toward zero
 - The original MAGIC with reversed normalization achieves best results
-'''
+
+
+Evaluation resources: you can use up to {eval_cpus} CPUs.
+{code_section}
+Write your improved `magic_denoise` function.'''
+
+
+PARENT_SCORE = "\nCurrent metrics (lower is better): MSE: {score:.6f}"
+
+
+IMPROVE_PROGRAM = """
+Here is the current implementation:
+```python
+{clean_code}
+```
+
+You are iteratively improving the denoising algorithm.{value_ctx}
+
+Reason about how you could improve this approach.
+"""
+
+
+WRITE_PROGRAM = """
+{value_ctx}
+
+Write code to implement a denoising algorithm.
+"""

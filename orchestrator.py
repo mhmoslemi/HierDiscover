@@ -39,6 +39,7 @@ from models.coder_profiles import (
     _coder_vllm_persistent_workers, _model_basename as _model_basename,
     _uses_sequence_level_policy_ratio,
 )
+from prompts.coder_base import FALLBACK_STRATEGY as _STRATEGY_FALLBACK
 from runtime.configuration import (
     _build_arg_parser as _build_arg_parser, _isolated_evaluation_cpu_ids,
     _is_spo_rs_mode,
@@ -67,10 +68,6 @@ from training.trainers import (
 )
 
 
-_STRATEGY_FALLBACK = (
-    "No usable strategy was returned. Derive the implementation directly "
-    "from the task specification and current parent construction."
-)
 _STRATEGY_BLOCK_RE = re.compile(
     # Do not let an earlier malformed opening tag consume the model's actual
     # final block. With ``<strategy>...<strategy>final</strategy>``, matching

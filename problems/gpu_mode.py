@@ -33,16 +33,10 @@ import sys
 import threading
 import time
 from typing import Any, Dict, List, Optional
-from problems.base import (Problem, ParentContext, RewardResult, SeedState,
-                           render_state_context)
-
-from examples.gpu_mode.prompt import (
-    TRIMUL_PROMPT,
-    MLA_DECODE_PROMPT,
-    MLA_DECODE_PROMPT_END,
-    MLA_DECODE_INITIAL_STATE,
-    MLA_DECODE_INITIAL_VALUE,
-)
+from examples.gpu_mode.seeds import MLA_DECODE_INITIAL_STATE, MLA_DECODE_INITIAL_VALUE
+from problems.base import Problem, ParentContext, RewardResult, SeedState
+from prompts.task import gpu_common, mla_decode_nvidia, trimul
+from prompts.utils import render_state_context
 
 # Runtime scaling relative to H100, from memory bandwidth, because trimul and
 # mla_decode are both bandwidth-bound. ESTIMATES: they set the reward scale, not
@@ -79,32 +73,6 @@ _DEFAULTS = {
         "task_yaml": "examples/gpu_mode/lib/mla-decode/task.yml",
     },
 }
-
-_ARCH_NOTES = {
-    "l40s": """Target hardware: NVIDIA L40S (Ada Lovelace, sm_89, 48 GB GDDR6, no NVLink).
-Ada is not Hopper. The following do NOT exist on this device and will fail to
-compile or silently fall back:
-- TMA / `tl.make_tensor_descriptor` and descriptor-based async copies
-- warpgroup MMA (`wgmma`), and anything assuming a 128-thread warpgroup
-- thread-block clusters and distributed shared memory
-- the 228 KB shared-memory-per-SM budget; Ada gives you 100 KB per SM
-What Ada does have and is worth using: 142 SMs' worth of 4th-gen tensor cores
-(bf16 and fp8), `cp.async` style pipelining, and a large 96 MB L2. Memory
-bandwidth is 864 GB/s, roughly a quarter of an H100's, so this part is far more
-bandwidth-bound than the same kernel on Hopper: favour fewer passes over the
-data, fusion, and reuse through L2 over strategies that assume you can stream.""",
-    "a100": """Target hardware: NVIDIA A100 (Ampere, sm_80). No TMA, no wgmma, no
-thread-block clusters. 164 KB shared memory per SM, 1.5-2.0 TB/s HBM.""",
-    "h100": """Target hardware: NVIDIA H100 (Hopper, sm_90). TMA, wgmma, and
-thread-block clusters are available. 228 KB shared memory per SM, ~3.3 TB/s HBM.""",
-    "h200": """Target hardware: NVIDIA H200 (Hopper, sm_90). As H100 but with 141 GB
-HBM3e at ~4.8 TB/s.""",
-}
-
-
-def arch_notes(gpu_type: str) -> str:
-    return _ARCH_NOTES.get((gpu_type or "").strip().lower(), "")
-
 
 def _clip(s: str, n: int) -> str:
     s = s or ""
@@ -546,38 +514,33 @@ class GpuMode(Problem):
 
     # ------------------------------------------------------------------
     def build_prompt(self, parent: ParentContext) -> List[dict]:
-        state_ctx = render_state_context(self.metric_name, self.target, parent,
-                                         maximize=self.maximize)
+        state_ctx = render_state_context(
+            self.metric_name, self.target, parent, maximize=self.maximize,
+        )
         if parent.observation and parent.observation.strip():
             stdout = parent.observation.strip()
             if len(stdout) > 500:
-                stdout = "\n\n\t\t ...(TRUNCATED)...\n" + stdout[-500:]
-            state_ctx = (state_ctx.rstrip()
-                         + f"\n\n--- Previous Program Output ---\n{stdout}\n"
-                           "--- End Output ---")
+                stdout = gpu_common.TRUNCATED_OUTPUT.format(stdout=stdout[-500:])
+            state_ctx = state_ctx.rstrip() + gpu_common.PREVIOUS_OUTPUT.format(stdout=stdout)
 
-        notes = arch_notes(self.gpu_type)
+        notes = gpu_common.ARCH_NOTES.get((self.gpu_type or "").strip().lower(), "")
         arch_section = f"\n{notes}\n" if notes else ""
 
         if self.problem_type == "trimul":
-            user = f"""{TRIMUL_PROMPT}
-{arch_section}
-{state_ctx}
-Rules:
-- The tensors arguments passed in will be already on your cuda device.
-- Define all of your code in one final ```python ``` block.
-- We will test the correctness of your kernel on multiple input shapes, make sure to support different potential test cases.
-- You are allowed to use mixed precision computations, but make sure your final output is in float32.
-- You must use triton {self.triton_version} and these kernels will be run on an {self.gpu_type}.
-- You do not have to implement everything in triton, you may choose to have some of the operations done in pytorch. However, you must implement at least part of the operations in a kernel.
-- Include a short docstring at the top summarizing your algorithm.
-"""
+            user = trimul.TASK_PROMPT.format(
+                description=trimul.DESCRIPTION,
+                arch_section=arch_section,
+                state_ctx=state_ctx,
+                triton_version=self.triton_version,
+                gpu_type=self.gpu_type,
+            )
         else:
-            user = f"""{MLA_DECODE_PROMPT}
-{arch_section}
-{state_ctx}
-{MLA_DECODE_PROMPT_END}
-"""
+            user = mla_decode_nvidia.TASK_PROMPT.format(
+                description=mla_decode_nvidia.DESCRIPTION,
+                arch_section=arch_section,
+                state_ctx=state_ctx,
+                rules=mla_decode_nvidia.RULES,
+            )
         return [{"role": "user", "content": user}]
 
     def preprocess(self, code: str, parent: ParentContext) -> str:

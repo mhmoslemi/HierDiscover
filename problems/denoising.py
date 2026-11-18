@@ -5,7 +5,7 @@ Single-Cell Analysis (scRNA-seq denoising).
   - reward:      1 / mse   (Poisson is a HARD CONSTRAINT: rejected if poisson_norm < 0.97)
   - preprocess injects the bio imports + the exact evaluate_mse / evaluate_poisson /
     run_denoising_eval sources + a wrapper, then the model's magic_denoise.
-  - get_question reproduced verbatim (SYSTEM_PROMPT with placeholders filled).
+  - prompt:    prompts/task/denoising.py with the evaluator source inserted.
 
  !!!!!  REQUIRMENTS ---- (scanpy, anndata, scprep, graphtools, magic-impute, molecular-cross-validation, openproblems, pancreas dataset ---- REQUIRMENTS!!!!!
 
@@ -14,9 +14,8 @@ Single-Cell Analysis (scRNA-seq denoising).
 from __future__ import annotations
 from typing import Any, List
 import numpy as np
-from problems.base import (
-    Problem, ParentContext, RewardResult, SeedState,
-)
+from problems.base import Problem, ParentContext, RewardResult, SeedState
+from prompts.task import denoising
 
 
 BASELINES = {
@@ -59,19 +58,13 @@ class Denoising(Problem):
 
     # ------------------------------------------------------------------
     def build_prompt(self, parent: ParentContext) -> List[dict]:
-        from examples.denoising.prompt import SYSTEM_PROMPT
         from examples.denoising.utils import EVALUATE_MSE_FUNC, EVALUATE_POISSON_FUNC
 
-        prompt = SYSTEM_PROMPT
-        prompt = prompt.replace("<<<EVALUATE_MSE_FUNC>>>", EVALUATE_MSE_FUNC)
-        prompt = prompt.replace("<<<EVALUATE_POISSON_FUNC>>>", EVALUATE_POISSON_FUNC)
-
-        has_code = bool(parent.code and parent.code.strip())
         value_ctx = ""
         if parent.raw_score is not None:
-            value_ctx = f"\nCurrent metrics (lower is better): MSE: {parent.raw_score:.6f}"
+            value_ctx = denoising.PARENT_SCORE.format(score=parent.raw_score)
 
-        if has_code:
+        if parent.code and parent.code.strip():
             clean_code = parent.code.strip()
             if clean_code.startswith("```python"):
                 clean_code = clean_code[len("```python"):].strip()
@@ -79,28 +72,18 @@ class Denoising(Problem):
                 clean_code = clean_code[3:].strip()
             if clean_code.endswith("```"):
                 clean_code = clean_code[:-3].strip()
-            code_section = f"""
-Here is the current implementation:
-```python
-{clean_code}
-```
-
-You are iteratively improving the denoising algorithm.{value_ctx}
-
-Reason about how you could improve this approach.
-"""
+            code_section = denoising.IMPROVE_PROGRAM.format(
+                clean_code=clean_code, value_ctx=value_ctx,
+            )
         else:
-            code_section = f"""
-{value_ctx}
+            code_section = denoising.WRITE_PROGRAM.format(value_ctx=value_ctx)
 
-Write code to implement a denoising algorithm.
-"""
-
-        user = f"""{prompt}
-
-Evaluation resources: you can use up to {self.eval_cpus} CPUs.
-{code_section}
-Write your improved `magic_denoise` function."""
+        user = denoising.TASK_PROMPT.format(
+            evaluate_mse=EVALUATE_MSE_FUNC,
+            evaluate_poisson=EVALUATE_POISSON_FUNC,
+            eval_cpus=self.eval_cpus,
+            code_section=code_section,
+        )
         return [{"role": "user", "content": user}]
 
     # ------------------------------------------------------------------

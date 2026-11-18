@@ -31,7 +31,7 @@ JEV:   reject candidate if  P(same_core_idea | accepted parent) ≥ threshold   
     eq: `chain(parent):  S0 → S1 | S0 → S2 | S0,S1 → S3 | S0,S1,S2
 one generated response per slot; a complete final plan must pass validation
 fallback slot ⇒ coder prompt contains the fixed "No usable strategy…" sentence`,
-    refs: ["orchestrator.py (_record_strategy_response, _extract_final_strategy)", "generation/gen_workers.py (run_sequential_chains)", "problems/base.py (previous-strategy blocks)", "generation/strategy_prompts.py (LOCAL_STRATEGY_PROMPT)"],
+    refs: ["orchestrator.py (_record_strategy_response, _extract_final_strategy)", "generation/gen_workers.py (run_sequential_chains)", "prompts/utils.py (previous-strategy blocks)", "prompts/strategy_base.py (LOCAL_STRATEGY_PROMPT)"],
     files: ["stepNN_groupGG_fold00_strategySS.{txt,prompt.txt,meta.json}"],
   },
   {

@@ -13,24 +13,7 @@ from typing import Any, List, Optional
 
 from evaluation.reward import extract_python_code
 from evaluation.sandbox import run_code
-from generation.strategy_prompts import LOCAL_STRATEGY_PROMPT
-
-
-CODER_EXECUTION_CONTRACT = '''## Coder capabilities
-
-The coder is a one-shot, text-only LLM. It has no CPU, GPU, Python interpreter,
-terminal, tools, or execution environment. It can only use internal
-language-model reasoning and write source code in a single response. It cannot
-run or test the program, execute numerical calculations, inspect results, or
-revise the program after execution feedback.
-
-The harness executes the submitted program only after the coder's response
-is complete. Any hardware or libraries described in this task belong to that
-execution environment, not to the coder. Implement required calculations,
-candidate checks, scoring, and fallback handling as source-code operations for
-the harness to execute. Do not perform these operations while composing the
-response, claim measured results, or include a testing/development checklist.
-The coder's deliverable is the program source, not a computed solution.'''
+from prompts.utils import coder_messages, strategy_messages
 
 
 # ----------------------------------------------------------------------
@@ -91,26 +74,6 @@ def is_code_failure(res) -> bool:
 
 
 # ----------------------------------------------------------------------
-# Prompt helper
-# ----------------------------------------------------------------------
-def render_state_context(metric_name: str, target, parent: ParentContext,
-                         maximize: bool = True) -> str:
-    direction = "higher is better" if maximize else "lower is better"
-    if parent.code and parent.code.strip():
-        shown = parent.raw_score if parent.raw_score is not None else parent.value
-        return (
-            f"Target {metric_name}: {target} ({direction}).\n"
-            f"Your previous program achieved {metric_name} = {shown:.6f}.\n"
-            f"Here is the previous program:\n"
-            f"```python\n{parent.code}\n```\n"
-        )
-    return (
-        f"Target {metric_name}: {target} ({direction}).\n"
-        f"No previous program. Write one from scratch.\n"
-    )
-
-
-# ----------------------------------------------------------------------
 # Problem ABC
 # ----------------------------------------------------------------------
 class Problem(ABC):
@@ -151,67 +114,11 @@ class Problem(ABC):
     def build_strategy_messages(
             self, messages: List[dict],
             previous_strategies: Optional[List[str]] = None) -> List[dict]:
-        staged = [dict(message) for message in messages]
-        previous_strategies = list(previous_strategies or [])
-        history = ""
-        if previous_strategies:
-            rendered = []
-            for index, strategy in enumerate(previous_strategies, start=1):
-                rendered.append(
-                    f"<previous_strategy_{index}>\n{strategy.strip()}\n"
-                    f"</previous_strategy_{index}>")
-            history = (
-                "The following strategies were already proposed for this same "
-                "task and parent context:\n\n"
-                + "\n\n".join(rendered)
-                + "\n\nPropose a materially different approach. Do not merely "
-                  "rename variables, reorder steps, or make superficial "
-                  "parameter changes. Treat these plans as unverified proposals, "
-                  "not established facts. Explain the substantive difference "
-                  "in your final plan, and make that plan independently usable "
-                  "without referring back to earlier strategies.\n\n"
-            )
-        instruction = LOCAL_STRATEGY_PROMPT.replace(
-            "{previous_strategies}", history, 1)
-        if staged and staged[-1].get("role") == "user":
-            staged[-1]["content"] = (
-                str(staged[-1].get("content", "")).rstrip()
-                + "\n\n" + instruction + "\n"
-            )
-        else:
-            staged.append({"role": "user", "content": instruction})
-        return staged
+        return strategy_messages(messages, previous_strategies)
 
     def build_code_messages(self, messages: List[dict],
                             strategy: str) -> List[dict]:
-        staged = [dict(message) for message in messages]
-        instruction = f"""## Strategy from the reasoning-model planning stage
-
-<strategy>
-{strategy.strip()}
-</strategy>
-
-## Code-stage output
-
-Use the task information and strategy above to produce the complete solution.
-Read the strategy critically and extract useful mathematical insights,
-algorithmic ideas, and implementation details. Build on the parts you judge
-helpful. Treat its proposals as suggestions, not requirements: you are free to
-adapt, simplify, combine, replace, or discard any part, including choosing a
-different overall approach. Use your own judgment to produce the best valid
-solution, while following the original task, evaluator, required interface,
-and execution constraints.
-Do not output analysis, reasoning, a strategy, notes, or example
-usage. Return only exactly one fenced Python code block, beginning with
-```python and ending with ```."""
-        if staged and staged[-1].get("role") == "user":
-            staged[-1]["content"] = (
-                str(staged[-1].get("content", "")).rstrip()
-                + "\n\n" + instruction + "\n"
-            )
-        else:
-            staged.append({"role": "user", "content": instruction})
-        return staged
+        return coder_messages(messages, strategy)
 
     @abstractmethod
     def preprocess(self, code: str, parent: ParentContext) -> str:

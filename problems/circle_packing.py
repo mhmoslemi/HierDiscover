@@ -11,9 +11,9 @@ import inspect
 from typing import Any, List
 import numpy as np
 
-from problems.base import (
-    Problem, ParentContext, RewardResult, SeedState, render_state_context,
-)
+from problems.base import Problem, ParentContext, RewardResult, SeedState
+from prompts.task import circle_packing
+from prompts.utils import render_state_context
 
 
 # ----------------------------------------------------------------------
@@ -48,16 +48,6 @@ def validate_packing(centers, radii):
 _VALIDATOR_SRC = inspect.getsource(validate_packing)
 
 
-# ----------------------------------------------------------------------
-# Prompt sections
-# ----------------------------------------------------------------------
-_ANALYSIS = """Reason about how you could further improve this packing. Consider:
-- Are circles placed optimally near boundaries and corners?
-- Could a different arrangement (hexagonal, nested, hybrid) yield better results?
-- Are there gaps that could be filled with repositioned or resized circles?
-- Could optimization parameters or methods be improved?"""
-
-
 class CirclePacking(Problem):
     two_stage_rollouts = True
     name = "circle_packing"
@@ -73,39 +63,15 @@ class CirclePacking(Problem):
 
     # ------------------------------------------------------------------
     def build_prompt(self, parent: ParentContext) -> List[dict]:
-        state_ctx = render_state_context(self.metric_name, self.target, parent,
-                                         maximize=self.maximize)
-        n = self.num_circles
-
-        user = f"""You are an expert mathematician specializing in circle packing problems and computational geometry.
-
-Your task is to pack {n} circles in a unit square [0,1]×[0,1] to maximize the sum of radii.
-
-We will run the below validation function (read-only, do not modify this):
-```python
-{_VALIDATOR_SRC}
-```
-
-{state_ctx}
-{_ANALYSIS}
-
-Rules:
-- You must define the run_packing function: def run_packing() -> tuple[np.ndarray, np.ndarray, float]
-- Returns (centers, radii, sum_radii) where centers has shape ({n}, 2) and radii has shape ({n},).
-- You can use scientific libraries like scipy, numpy, cvxpy, math.
-- You can use up to {self.eval_cpus} CPUs.
-- Centers must lie within [0,1]^2 and radii must be nonnegative.
-- The pair (centers, radii) must satisfy non-overlap and boundary constraints.
-- Make all helper functions top level and have no closures from function nesting. Don't use any lambda functions.
-- No filesystem or network IO.
-- Do not catch exceptions in order to return a degenerate packing. A program that
-  returns all-zero or near-zero radii when something goes wrong scores the same as
-  one that crashes, and it hides the error that would have told you what to fix.
-  Let it fail loudly instead.
-- You need to get really creative and think from first principles.
-
-"""
-
+        state_ctx = render_state_context(
+            self.metric_name, self.target, parent, maximize=self.maximize,
+        )
+        user = circle_packing.TASK_PROMPT.format(
+            n=self.num_circles,
+            validator=_VALIDATOR_SRC,
+            state_ctx=state_ctx,
+            eval_cpus=self.eval_cpus,
+        )
         return [{"role": "user", "content": user}]
 
     # ------------------------------------------------------------------

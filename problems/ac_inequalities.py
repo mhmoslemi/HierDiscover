@@ -16,18 +16,13 @@ from typing import Any, List
 
 import numpy as np
 
-from problems.base import (
-    Problem, ParentContext, RewardResult, SeedState, render_state_context,
-)
-
-from examples.ac_inequalities.prompt import (
-    AC1_EVAL_FUNCTION,
-    AC1_LITERATURE,
-    AC2_LITERATURE,
-    ae_verifier_program,
+from examples.ac_inequalities.seeds import (
     example_ae_program_random_init,
     thetaevolve_initial_program_prev_init,
 )
+from problems.base import Problem, ParentContext, RewardResult, SeedState
+from prompts.task import ac1, ac2, ac_common
+from prompts.utils import append_user_instruction, render_state_context
 
 
 def _ac_bytelevel_decoder_table():
@@ -164,99 +159,12 @@ class ACInequalities(Problem):
             self._eval_src = inspect.getsource(evaluate_sequence_ac2)
 
     # ------------------------------------------------------------------
-    def _state_ctx(self, parent: ParentContext) -> str:
-        ctx = render_state_context(self.metric_name, self.target, parent,
-                                   maximize=self.maximize)
-        if parent.construction is not None and len(parent.construction) > 0:
-            ctx += f"\nLength of the construction: {len(parent.construction)}"
-        return ctx
-
-    @staticmethod
-    def _append_user_instruction(messages: List[dict], instruction: str
-                                 ) -> List[dict]:
-        staged = [dict(message) for message in messages]
-        if staged and staged[-1].get("role") == "user":
-            staged[-1]["content"] = (
-                str(staged[-1].get("content", "")).rstrip()
-                + "\n\n" + instruction.strip() + "\n"
-            )
-        else:
-            staged.append({"role": "user", "content": instruction.strip()})
-        return staged
-
     def build_strategy_messages(
             self, messages: List[dict],
             previous_strategies: List[str] | None = None) -> List[dict]:
-        common = '''
-Autocorrelation-specific scientific and execution requirements:
-- Write the final plan as normal, readable English prose with ordinary spaces
-  and line breaks. Never emit serialized tokenizer surfaces, escaped token
-  streams, tool/backend error messages, execution traces, or mixed-language
-  fragments. Before closing the block, confirm that all six requested sections
-  are present in order and readable independently of the reasoning transcript.
-- If a current construction exists, `height_sequence_1` is already supplied
-  to the executed program as a one-dimensional NumPy array. Never copy,
-  serialize, reconstruct, or hard-code that array. Read it directly as a
-  possible initialization; this does not require retaining its resolution
-  or construction family.
-- The entrypoint must return a non-empty Python `list` of finite real numbers.
-  Keep the returned coefficients explicitly nonnegative and no larger than
-  1000; do not depend on the evaluator's defensive clipping to repair a search
-  candidate. Retain a separately copied, exactly re-evaluated best candidate
-  and a concrete valid fallback throughout the run.
-- The authoritative evaluator uses full *linear* self-convolution, producing
-  2*n-1 coefficients. It is not circular convolution. Derive every surrogate,
-  gradient, or convolution index against that definition. Verify updates to
-  the saved best candidate and the final return with `evaluate_sequence`.
-  Internal search iterates may worsen or use surrogates; do not mistake their
-  surrogate scores for verified improvements.
-- Positive rescaling below the coefficient cap leaves the objective unchanged.
-  Do not claim that changing scale alone is an improvement, and do not let
-  normalization interact with clipping in a way that changes the candidate.
-- Products of the submitted coefficients make the search generally nonconvex.
-  A direct CVXPY call is not a solution unless the stated subproblem satisfies
-  the solver's rules. Explain any relaxation or alternating subproblem, how a
-  candidate is recovered, and how it is checked by the original evaluator.
-- Choose algorithms for the actual problem size and execution resources.
-  Account for arrays, temporary copies, solver workspace, and evaluation cost.
-  Dense operators, finite differences, and LP methods are options when their
-  costs fit; for larger searches, consider structured, sparse, matrix-free,
-  FFT, analytic-gradient, or reduced-subproblem approaches as appropriate.
-  Explain the chosen formulation's scaling, rather than assuming a library
-  call makes a large allocation or solve affordable.
-- Schedule expensive evaluations and solver calls using elapsed time inside
-  the generated program. Surrogates may guide exploration, but leave time for
-  exact validation and returning the saved best valid candidate. Do not impose
-  an arbitrary number of evaluations independent of the actual runtime.
-- Sequence length and construction family are search choices, not fixed by
-  the parent, seed program, or literature example. Derive dimensions from the
-  candidate being evaluated. If changing resolution, explain the construction
-  or resampling rule, normalization, validity checks, and exact comparison.
-  Explain initialization when no parent is available. The coefficient cap of
-  1000 is a value bound, not a limit on the number of coefficients.'''
-        if self.problem_type == "ac1":
-            mathematical = '''
-AC1 mathematical checks for the final plan:
-- For a returned sequence a of length n, the exact lower-is-better objective is
-  2*n*max(convolve(a, a, mode="full"))/sum(a)^2, with sum(a) >= 0.01 after
-  defensive clipping. Include every one of the 2*n-1 convolution positions.
-- Any normalization or LP direction must preserve nonnegativity and must be
-  evaluated with that exact ratio. Do not infer monotonic improvement from a
-  surrogate bound without an exact acceptance comparison.'''
-        else:
-            mathematical = '''
-AC2 mathematical checks for the final plan:
-- Let c=convolve(a,a,mode="full") have m=2*n-1 entries and let
-  y=(0,c_0,...,c_{m-1},0). The evaluator uses uniform spacing
-  dx=1/(m+1), the piecewise-linear integral
-  L2sq=sum_i dx/3*(y_i^2+y_i*y_{i+1}+y_{i+1}^2),
-  L1=sum(abs(c))/(m+1), and Linf=max(abs(c)). The exact higher-is-better
-  objective is L2sq/(L1*Linf).
-- Keep L1 and Linf strictly positive and use the same endpoint convention and
-  spacing in any analytic gradient or surrogate. Verify the saved best and
-  final candidate with the supplied function rather than trusting an internal
-  score.'''
-        staged = self._append_user_instruction(messages, common + mathematical)
+        task = ac1 if self.problem_type == "ac1" else ac2
+        notes = (ac_common.STRATEGY_NOTES + task.STRATEGY_NOTES).strip()
+        staged = append_user_instruction(messages, notes)
         return super().build_strategy_messages(
             staged, previous_strategies=previous_strategies)
 
@@ -289,76 +197,19 @@ AC2 mathematical checks for the final plan:
 
 
     def build_prompt(self, parent: ParentContext) -> List[dict]:
-        state_ctx = self._state_ctx(parent)
-        budget_s = self.budget_s
-
-        if self.problem_type == "ac1":
-            user = f'''Act as an expert software developer and inequality specialist specializing in creating step functions with certain properties.
-
-Your task is to generate the sequence of non-negative heights of a step function, that minimizes the following evaluation function:
-
-{AC1_EVAL_FUNCTION}
-
-{AC1_LITERATURE}
-
-Your task is to write a search function that searches for the best sequence of coefficients. Your function will have {budget_s} seconds to run, and after that it has to have returned the best sequence it found. If after {budget_s} seconds it has not returned anything, it will be terminated with negative infinity points. All numbers in your sequence have to be positive or zero. Larger sequences with {budget_s}s of items often have better attack surface, but too large sequences with 100s of thousands of items may be too slow to search.
-
-You may code up any search method you want, and you are allowed to call the evaluate_sequence() function as many times as you want. You have access to it, you don't need to code up the evaluate_sequence() function.
-
-{state_ctx}
-
-You may want to start your search from one of the constructions we have found so far, which you can access through the 'height_sequence_1' global variable.\x20
-However, you are encouraged to explore solutions that use other starting points to prevent getting stuck in a local minimum.
-
-Reason about how you could further improve this construction.
-Ideally, try to do something different than the above algorithm. Could be using different algorithmic ideas, adjusting your heuristics, adjusting / sweeping your hyperparemeters, etc.\x20
-Unless you make a meaningful improvement, you will not be rewarded.
-
-Rules:
-- You must define the `propose_candidate` function as this is what will be invoked.
-- You can use scientific libraries like scipy, numpy, cvxpy[CBC,CVXOPT,GLOP,GLPK,GUROBI,MOSEK,PDLP,SCIP,XPRESS,ECOS], math.
-- You can use up to {self.eval_cpus} CPUs.
-- Make all helper functions top level and have no closures from function nesting. Don't use any lambda functions.
-- No filesystem or network IO.
-- Do not import evaluate_sequence yourself. Assume it will already be imported and can be directly invoked.
-- **Print statements**: Use `print()` to log progress, intermediate bounds, timing info, etc. Your output will be shown back to you.
-- Include a short docstring at the top summarizing your algorithm.
-
-Make sure to think and return the final program between ```python and ```.'''
-        else:
-            user = f''''Act as an expert software developer and inequality specialist specializing in creating step functions with certain properties.
-
-Your task is to generate the sequence of non-negative heights of a step functions, that maximizes the following evaluation function:
-
-```python
-{ae_verifier_program}
-```
-
-{AC2_LITERATURE}
-Your task is to write a search function, construct_function(), that searches for the best sequence of coefficients. Your function will have {budget_s} seconds to run, and after that it has to have returned the best sequence it found. If after {budget_s} seconds it has not returned anything, it will be terminated with negative infinity points. All numbers in your sequence have to be positive or zero. Larger sequences with {budget_s}s of items often have better attack surface, but too large sequences with 100s of thousands of items may be too slow to search.
-
-You may code up any search method you want, and you are allowed to call the evaluate_sequence() function as many times as you want. You have access to it, you don't need to code up the evaluate_sequence() function.
-
-{state_ctx}
-
-You may want to start your search from one of the constructions we have found so far, which you can access through the 'height_sequence_1' global variable.\x20
-However, you are encouraged to explore solutions that use other starting points to prevent getting stuck in a local minimum.
-
-Reason about how you could further improve this construction.
-Ideally, try to do something different than the above algorithm. Could be using different algorithmic ideas, adjusting your heuristics, adjusting / sweeping your hyperparemeters, etc.\x20
-Unless you make a meaningful improvement, you will not be rewarded, if you are stuck you should think about how to get unstuck.
-
-Rules:
-- You must define the `construct_function` function as this is what will be invoked.
-- You can use scientific libraries like scipy, numpy, cvxpy[CBC,CVXOPT,GLOP,GLPK,GUROBI,MOSEK,PDLP,SCIP,XPRESS,ECOS], math.
-- You can use up to {self.eval_cpus} CPUs.
-- Make all helper functions top level and have no closures from function nesting. Don't use any lambda functions.
-- No filesystem or network IO.
-- Do not import evaluate_sequence yourself. Assume it will already be imported and can be directly invoked. Do not import height_sequence_1 yourself; it will already be available.
-- **Print statements**: Use `print()` to log progress, intermediate bounds, timing info, etc. Your output will be shown back to you.
-- Include a short docstring at the top summarizing your algorithm.
-
-Make sure to think and return the final program between ```python and ```.'''
+        task = ac1 if self.problem_type == "ac1" else ac2
+        state_ctx = render_state_context(
+            self.metric_name, self.target, parent, maximize=self.maximize,
+        )
+        if parent.construction is not None and len(parent.construction) > 0:
+            state_ctx += ac_common.CONSTRUCTION_LENGTH.format(size=len(parent.construction))
+        user = task.TASK_PROMPT.format(
+            evaluator=task.EVALUATOR,
+            literature=task.LITERATURE,
+            budget_s=self.budget_s,
+            eval_cpus=self.eval_cpus,
+            state_ctx=state_ctx,
+        )
         return [{"role": "user", "content": user}]
 
     # ------------------------------------------------------------------
