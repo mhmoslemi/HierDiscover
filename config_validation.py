@@ -1,0 +1,449 @@
+"""Validation for the self-contained problem YAML presets."""
+
+from __future__ import annotations
+
+from collections.abc import Mapping
+from numbers import Real
+from pathlib import Path
+
+
+# These settings are consumed by the shared training, generation, search,
+# runtimes. Every checked-in preset carries them so a
+# selected YAML is self-contained, but that does not make problem-specific
+# fields interchangeable.
+COMMON_REQUIRED_KEYS = frozenset("""
+problem target
+fail_score model_name training_model_name coder_model_name
+coder_training_model_name strategy_model_name backend load_in_4bit
+lora_rank lora_alpha
+lora_dropout target_modules
+training_gpu_id available_gpu_ids reserve_last_gpu_for_evaluation
+evaluation_gpu_id num_gpus gpu_ids sequential_generation
+evaluation_shares_generation
+generation_backend gen_micro_batch vllm_gpu_memory_utilization
+vllm_enforce_eager vllm_enable_prefix_caching vllm_tensor_parallel_size
+vllm_pipeline_parallel_size vllm_quantization
+vllm_max_num_batched_tokens vllm_enable_expert_parallel vllm_sleep_level
+vllm_staged_loading strategy_vllm_sleep_level strategy_vllm_staged_loading
+num_steps groups_per_step group_size strategies_per_parent
+programs_per_strategy pilot_programs_per_strategy
+pilot_xhigh_programs_per_strategy strategy_archive_top_r
+num_seed_states learning_rate adam_beta1 adam_beta2 adam_epsilon weight_decay
+kl_penalty_coef grad_clip
+spo_rs_beta
+train_examples_per_microbatch logprob_chunk
+puct_c max_buffer_size topk_children_per_parent
+temperature top_p top_k thinking strategy_max_new_tokens
+strategy_max_seq_length strategy_temperature strategy_top_p strategy_top_k
+strategy_thinking strategy_reasoning_effort strategy_vllm_quantization
+deterministic seed
+sandbox_timeout_s reward_workers print_responses max_saved_construction
+""".split())
+
+COMMON_OPTIONAL_KEYS = frozenset({
+    "hardware_profile",
+    "coder_reasoning_effort",
+    "coder_thinking_budget",
+    "max_seq_length", "max_new_tokens",  # Otherwise derived from the coder.
+    "advantage_mode", "fast", "isolate_eval",
+    "fused_long_attention",
+    "training_layout",
+    "phase2_allocation_method",
+    "pilot_medium_programs_per_strategy",
+    "phase2_low_programs_per_strategy", "phase2_medium_programs_per_strategy",
+    "phase2_xhigh_programs_per_strategy",
+    "min_p", "strategy_min_p",
+    "strategy_vllm_persistent_workers",
+    "api_strategy", "strategy_backend", "strategy_api_base_url", "strategy_api_key_env",
+    "strategy_api_concurrency", "strategy_api_timeout_s",
+    "strategy_api_max_retries",
+    "strategy_format_max_retries",
+    "strict_strategy_validation",
+    "uct", "parent_selection", "jev_model_path", "jev_candidate_multiplier",
+    "jev_same_core_threshold",
+    "spo_rs_adaptive_beta", "spo_rs_d_half", "spo_rs_rho_min",
+    "spo_rs_rho_max", "spo_rs_win_alpha",
+    "spo_rs_clip_epsilon", "spo_rs_clip_epsilon_low",
+    "spo_rs_clip_epsilon_high", "spo_rs_update_epochs",
+    "sequence_clip_epsilon_low", "sequence_clip_epsilon_high",
+})
+
+# Compatibility filter only: these keys cannot activate any runtime behavior.
+# Archived configs may still contain them; fresh presets no longer do.
+RETIRED_BATCH_GROWTH_KEYS = frozenset({
+    "max_groups_per_step", "max_group_size", "growth_force_step",
+    "growth_valid_yield", "growth_distinct_min", "growth_factor",
+})
+
+CPU_PROBLEMS = frozenset({
+    "circle_packing", "erdos", "erdos-c4", "ac1", "ac2", "denoising",
+})
+
+PROBLEM_REQUIRED_KEYS = {
+    "circle_packing": frozenset({
+        "num_circles", "degenerate_threshold", "eval_cpus",
+    }),
+    "erdos": frozenset({
+        "budget_s", "eval_cpus",
+    }),
+    "erdos-c4": frozenset({
+        "budget_s", "eval_cpus", "max_coeff_count", "benchmark_c4",
+    }),
+    "ac1": frozenset({"problem_type", "budget_s", "eval_cpus"}),
+    "ac2": frozenset({"problem_type", "budget_s", "eval_cpus"}),
+    "denoising": frozenset({"eval_seed", "eval_cpus"}),
+    "gpu_mode": frozenset({
+        "problem_type", "score_scale", "gpu_type", "gpu_lease_timeout_s",
+        "triton_version", "task_yaml", "lib_dir", "kernel_log_chars",
+        "kernel_timeout_s", "seed_from_reference",
+    }),
+}
+
+PROBLEM_OPTIONAL_KEYS = {
+    "circle_packing": frozenset(),
+    "erdos": frozenset({"target_print", "seed_min_points", "seed_max_points"}),
+    "erdos-c4": frozenset(),
+    "ac1": frozenset({"target_print"}),
+    "ac2": frozenset({"target_print"}),
+    "denoising": frozenset(),
+    "gpu_mode": frozenset({
+        "kernel_lib_dir", "kernel_python", "mla_seed_runtime_us",
+    }),
+}
+
+# A present field from this table is invalid outside its owner set, even for a
+# partial external config. This catches exactly the copy/paste failure that put
+# num_circles in every preset.
+EXCLUSIVE_KEY_OWNERS = {
+    "num_circles": frozenset({"circle_packing"}),
+    "degenerate_threshold": frozenset({"circle_packing"}),
+    "eval_seed": frozenset({"denoising"}),
+    "seed_min_points": frozenset({"erdos"}),
+    "seed_max_points": frozenset({"erdos"}),
+    "budget_s": frozenset({"erdos", "erdos-c4", "ac1", "ac2"}),
+    "eval_cpus": CPU_PROBLEMS,
+    "max_coeff_count": frozenset({"erdos-c4"}),
+    "benchmark_c4": frozenset({"erdos-c4"}),
+    "problem_type": frozenset({"ac1", "ac2", "gpu_mode"}),
+    "score_scale": frozenset({"gpu_mode"}),
+    "gpu_type": frozenset({"gpu_mode"}),
+    "gpu_lease_timeout_s": frozenset({"gpu_mode"}),
+    "triton_version": frozenset({"gpu_mode"}),
+    "task_yaml": frozenset({"gpu_mode"}),
+    "lib_dir": frozenset({"gpu_mode"}),
+    "kernel_lib_dir": frozenset({"gpu_mode"}),
+    "kernel_python": frozenset({"gpu_mode"}),
+    "kernel_log_chars": frozenset({"gpu_mode"}),
+    "kernel_timeout_s": frozenset({"gpu_mode"}),
+    "seed_from_reference": frozenset({"gpu_mode"}),
+    "mla_seed_runtime_us": frozenset({"gpu_mode"}),
+}
+
+
+def _label(source) -> str:
+    return str(source) if source is not None else "configuration"
+
+
+def _positive_number(data: Mapping, key: str, source) -> None:
+    value = data.get(key)
+    if isinstance(value, bool) or not isinstance(value, Real) or value <= 0:
+        raise ValueError(f"{_label(source)}: {key} must be a positive number")
+
+
+def _positive_int(data: Mapping, key: str, source) -> None:
+    value = data.get(key)
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ValueError(f"{_label(source)}: {key} must be a positive integer")
+
+
+def validate_problem_config(
+    data: Mapping, *, source: str | Path | None = None,
+    require_complete: bool = True,
+) -> None:
+    """Raise ValueError when a problem configuration violates its contract."""
+    if not isinstance(data, Mapping) or not data:
+        raise ValueError(f"{_label(source)}: config must be a non-empty mapping")
+
+    obsolete = sorted(key for key in data if str(key).startswith(
+        ("rank_", "x_grpo_", "cvar_", "binary_coder_")))
+    if obsolete:
+        raise ValueError(f"{_label(source)}: removed objective options: {obsolete}")
+
+    problem = str(data.get("problem", "")).strip().lower()
+    if problem not in PROBLEM_REQUIRED_KEYS:
+        raise ValueError(
+            f"{_label(source)}: problem must be one of "
+            f"{sorted(PROBLEM_REQUIRED_KEYS)}, got {problem!r}"
+        )
+
+    for key, owners in EXCLUSIVE_KEY_OWNERS.items():
+        if key in data and problem not in owners:
+            raise ValueError(
+                f"{_label(source)}: {key} is not valid for problem={problem}"
+            )
+
+    required = COMMON_REQUIRED_KEYS | PROBLEM_REQUIRED_KEYS[problem]
+    allowed = required | COMMON_OPTIONAL_KEYS | PROBLEM_OPTIONAL_KEYS[problem]
+    if require_complete:
+        missing = required - set(data)
+        if missing:
+            raise ValueError(
+                f"{_label(source)}: missing required keys: {sorted(missing)}"
+            )
+        unknown = set(data) - allowed
+        if unknown:
+            raise ValueError(
+                f"{_label(source)}: unknown or misplaced keys: {sorted(unknown)}"
+            )
+
+    if "hardware_profile" in data:
+        from runtime.hardware_profiles import hardware_profile
+        hardware_profile(data["hardware_profile"])
+    if problem in ("ac1", "ac2") and data.get("problem_type") != problem:
+        raise ValueError(
+            f"{_label(source)}: {problem} requires problem_type={problem}"
+        )
+    if problem == "gpu_mode" and data.get("problem_type") not in {
+        "trimul", "mla_decode_nvidia",
+    }:
+        raise ValueError(
+            f"{_label(source)}: unsupported gpu_mode problem_type "
+            f"{data.get('problem_type')!r}"
+        )
+    if (problem == "gpu_mode"
+            and data.get("problem_type") == "mla_decode_nvidia"
+            and "mla_seed_runtime_us" not in data):
+        raise ValueError(
+            f"{_label(source)}: mla_decode_nvidia requires the explicit "
+            "mla_seed_runtime_us key (use null until measured on gpu_type)"
+        )
+
+    for key in ("num_steps", "groups_per_step", "group_size",
+                "num_seed_states", "seed_min_points", "seed_max_points",
+                "max_new_tokens", "max_seq_length",
+                "train_examples_per_microbatch", "strategies_per_parent",
+                "programs_per_strategy", "strategy_archive_top_r",
+                "spo_rs_update_epochs"):
+        if key in data:
+            _positive_int(data, key, source)
+    if (problem == "erdos"
+            and data.get("seed_min_points", 40) > data.get("seed_max_points", 99)):
+        raise ValueError(
+            f"{_label(source)}: seed_min_points must be <= seed_max_points")
+    for key in ("strategy_max_new_tokens", "strategy_max_seq_length"):
+        if key in data and data[key] != "auto":
+            _positive_int(data, key, source)
+    if "strategy_format_max_retries" in data:
+        retries = data["strategy_format_max_retries"]
+        if isinstance(retries, bool) or not isinstance(retries, int) or retries < 0:
+            raise ValueError(
+                f"{_label(source)}: strategy_format_max_retries must be a "
+                "non-negative integer")
+    if ("strict_strategy_validation" in data
+            and not isinstance(data["strict_strategy_validation"], bool)):
+        raise ValueError(
+            f"{_label(source)}: strict_strategy_validation must be a boolean")
+    if "parent_selection" in data:
+        mode = data["parent_selection"]
+        if not isinstance(mode, str) or mode.lower() not in {"puct", "uct", "llm", "puct-jev"}:
+            raise ValueError(
+                f"{_label(source)}: parent_selection must be 'puct', 'uct', 'llm', or 'puct-jev'")
+    if "jev_model_path" in data and (not isinstance(data["jev_model_path"], str)
+                                    or not data["jev_model_path"].strip()):
+        raise ValueError(f"{_label(source)}: jev_model_path must be a nonempty path")
+    if "jev_candidate_multiplier" in data:
+        _positive_int(data, "jev_candidate_multiplier", source)
+    if "jev_same_core_threshold" in data:
+        threshold = data["jev_same_core_threshold"]
+        if (isinstance(threshold, bool) or not isinstance(threshold, Real)
+                or not 0 <= threshold <= 1):
+            raise ValueError(f"{_label(source)}: jev_same_core_threshold must be a number in [0, 1]")
+    if "pilot_programs_per_strategy" in data:
+        pilot_count = data["pilot_programs_per_strategy"]
+        if (isinstance(pilot_count, bool)
+                or not isinstance(pilot_count, int)
+                or pilot_count == 0 or pilot_count < -1):
+            raise ValueError(
+                f"{_label(source)}: pilot_programs_per_strategy must be -1 "
+                "(disabled) or a positive integer")
+        programs_per_strategy = data.get("programs_per_strategy")
+        if (pilot_count > 0 and isinstance(programs_per_strategy, int)
+                and pilot_count > programs_per_strategy):
+            raise ValueError(
+                f"{_label(source)}: pilot_programs_per_strategy cannot exceed "
+                "programs_per_strategy")
+    pilot_effort_total = 0
+    for key in ("pilot_xhigh_programs_per_strategy",
+                "pilot_medium_programs_per_strategy"):
+        count = data.get(key, 0)
+        if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+            raise ValueError(
+                f"{_label(source)}: {key} must "
+                "be a non-negative integer")
+        pilot_effort_total += count
+    pilot_count = data.get("pilot_programs_per_strategy")
+    if pilot_effort_total > 0 and isinstance(pilot_count, int):
+        if pilot_count < 1:
+            raise ValueError(
+                f"{_label(source)}: positive pilot medium/xhigh counts require "
+                "adaptive pilots to be enabled")
+        if pilot_effort_total > pilot_count:
+            raise ValueError(
+                f"{_label(source)}: pilot medium + xhigh counts cannot exceed "
+                "pilot_programs_per_strategy")
+    phase2_remainders = 0
+    for effort in ("low", "medium", "xhigh"):
+        key = f"phase2_{effort}_programs_per_strategy"
+        count = data.get(key, -1 if effort == "medium" else 0)
+        if isinstance(count, bool) or not isinstance(count, int) or count < -1:
+            raise ValueError(
+                f"{_label(source)}: {key} must be a non-negative integer "
+                "or -1 for the remaining phase-2 allocation")
+        phase2_remainders += count == -1
+    if phase2_remainders > 1:
+        raise ValueError(
+            f"{_label(source)}: only one phase2 effort count may be -1")
+    if "phase2_allocation_method" in data:
+        allocation_method = str(data["phase2_allocation_method"]).strip().lower()
+        if allocation_method not in {"rule_based", "bandit", "hurdle"}:
+            raise ValueError(
+                f"{_label(source)}: phase2_allocation_method must be "
+                "'rule_based', 'bandit', or 'hurdle'")
+    for key in ("top_k", "strategy_top_k"):
+        if key in data:
+            value = data[key]
+            if (isinstance(value, bool) or not isinstance(value, int)
+                    or value != 0):
+                raise ValueError(
+                    f"{_label(source)}: {key} must be 0 because top-k "
+                    "filtering is disabled project-wide")
+    for key in ("min_p", "strategy_min_p"):
+        if key in data:
+            value = data[key]
+            if (isinstance(value, bool) or not isinstance(value, Real)
+                    or not 0.0 <= float(value) <= 1.0):
+                raise ValueError(
+                    f"{_label(source)}: {key} must be in [0, 1]")
+    if ("advantage_mode" in data
+            and data["advantage_mode"] not in {"entropic", "spo-rs", "spo-rs-v2"}):
+        raise ValueError(
+            f"{_label(source)}: advantage_mode must be entropic, spo-rs, or spo-rs-v2")
+    for key in ("sequence_clip_epsilon_low", "sequence_clip_epsilon_high"):
+        if key in data and not 0.0 < float(data[key]) < 1.0:
+            raise ValueError(f"{_label(source)}: {key} must be in (0, 1)")
+    if "eval_cpus" in data:
+        _positive_int(data, "eval_cpus", source)
+    if "coder_thinking_budget" in data:
+        value = data["coder_thinking_budget"]
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise ValueError(f"{_label(source)}: coder_thinking_budget must be an integer >= 0")
+    if "num_circles" in data:
+        _positive_int(data, "num_circles", source)
+    if "max_coeff_count" in data:
+        _positive_int(data, "max_coeff_count", source)
+        if int(data["max_coeff_count"]) < 3:
+            raise ValueError(
+                f"{_label(source)}: max_coeff_count must be at least 3"
+            )
+    for key in ("sandbox_timeout_s", "budget_s", "score_scale",
+                "kernel_timeout_s", "benchmark_c4"):
+        if key in data:
+            _positive_number(data, key, source)
+
+    if "top_p" in data and not 0 < float(data["top_p"]) <= 1:
+        raise ValueError(f"{_label(source)}: top_p must be in (0, 1]")
+    if ("strategy_top_p" in data
+            and not 0 < float(data["strategy_top_p"]) <= 1):
+        raise ValueError(
+            f"{_label(source)}: strategy_top_p must be in (0, 1]")
+    if ("strategy_temperature" in data
+            and float(data["strategy_temperature"]) <= 0):
+        raise ValueError(
+            f"{_label(source)}: strategy_temperature must be positive")
+    if ("strategy_thinking" in data
+            and not isinstance(data["strategy_thinking"], bool)):
+        raise ValueError(
+            f"{_label(source)}: strategy_thinking must be true or false")
+    if ("strategy_reasoning_effort" in data
+            and str(data["strategy_reasoning_effort"]).lower()
+            not in {"auto", "none", "low", "medium", "high", "xhigh", "max"}):
+        raise ValueError(
+            f"{_label(source)}: strategy_reasoning_effort must be auto, none, low, "
+            "medium, high, xhigh, or max")
+    if ("coder_reasoning_effort" in data
+            and str(data["coder_reasoning_effort"]).lower()
+            not in {"low", "medium", "high", "xhigh"}):
+        raise ValueError(
+            f"{_label(source)}: coder_reasoning_effort must be low, medium, "
+            "high, or xhigh")
+    if "api_strategy" in data:
+        if not isinstance(data["api_strategy"], str):
+            raise ValueError(f"{_label(source)}: api_strategy must be a model name or ''")
+        if data["api_strategy"].strip() not in {"", "gpt-6-luna"}:
+            raise ValueError(f"{_label(source)}: api_strategy supports gpt-6-luna or ''")
+    if ("strategy_backend" in data
+            and str(data["strategy_backend"]).lower() not in {"local", "api"}):
+        raise ValueError(
+            f"{_label(source)}: strategy_backend must be local or api")
+    if ("strategy_api_concurrency" in data
+            and int(data["strategy_api_concurrency"]) < 1):
+        raise ValueError(
+            f"{_label(source)}: strategy_api_concurrency must be >= 1")
+    if ("strategy_api_timeout_s" in data
+            and float(data["strategy_api_timeout_s"]) <= 0):
+        raise ValueError(
+            f"{_label(source)}: strategy_api_timeout_s must be positive")
+    if ("strategy_api_max_retries" in data
+            and int(data["strategy_api_max_retries"]) < 0):
+        raise ValueError(
+            f"{_label(source)}: strategy_api_max_retries must be >= 0")
+    for key in ("vllm_sleep_level", "strategy_vllm_sleep_level"):
+        if key in data and int(data[key]) not in (1, 2):
+            raise ValueError(f"{_label(source)}: {key} must be 1 or 2")
+    if "strategy_vllm_persistent_workers" in data:
+        value = data["strategy_vllm_persistent_workers"]
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise ValueError(
+                f"{_label(source)}: strategy_vllm_persistent_workers must "
+                "be a nonnegative integer")
+    for key in ("vllm_staged_loading", "strategy_vllm_staged_loading"):
+        if key in data and not isinstance(data[key], bool):
+            raise ValueError(
+                f"{_label(source)}: {key} must be true or false")
+    for key in ("adam_beta1", "adam_beta2"):
+        if key in data and not 0 <= float(data[key]) < 1:
+            raise ValueError(f"{_label(source)}: {key} must be in [0, 1)")
+    if "adam_epsilon" in data:
+        _positive_number(data, "adam_epsilon", source)
+    if "weight_decay" in data and float(data["weight_decay"]) < 0:
+        raise ValueError(f"{_label(source)}: weight_decay must be >= 0")
+    if "spo_rs_beta" in data:
+        _positive_number(data, "spo_rs_beta", source)
+    if "spo_rs_win_alpha" in data:
+        value = data["spo_rs_win_alpha"]
+        if (isinstance(value, bool) or not isinstance(value, Real)
+                or float(value) < 0.0):
+            raise ValueError(
+                f"{_label(source)}: spo_rs_win_alpha must be a nonnegative number")
+    if ("spo_rs_adaptive_beta" in data
+            and not isinstance(data["spo_rs_adaptive_beta"], bool)):
+        raise ValueError(
+            f"{_label(source)}: spo_rs_adaptive_beta must be true or false")
+    if "uct" in data and not isinstance(data["uct"], bool):
+        raise ValueError(f"{_label(source)}: uct must be true or false")
+    if "reward_workers" in data and int(data["reward_workers"]) < 0:
+        raise ValueError(f"{_label(source)}: reward_workers must be >= 0")
+    if (problem == "gpu_mode" and data.get("problem_type") != "trimul"
+            and data.get("reward_workers") != 1):
+        raise ValueError(
+            f"{_label(source)}: gpu_mode requires reward_workers=1"
+        )
+    if problem in {"erdos", "erdos-c4", "ac1", "ac2"} and all(
+        key in data for key in ("budget_s", "sandbox_timeout_s")
+    ) and float(data["sandbox_timeout_s"]) <= float(data["budget_s"]):
+        raise ValueError(
+            f"{_label(source)}: sandbox_timeout_s must exceed budget_s so "
+            "the candidate can return its best result before the hard timeout"
+        )
+    if problem == "gpu_mode" and not str(data.get("gpu_type", "")).strip():
+        raise ValueError(f"{_label(source)}: gpu_mode requires gpu_type")

@@ -1,0 +1,774 @@
+"use strict";
+/* ---- hub.js: landing page for several problems + lazy, isolated explorers ------------------------------------------ */
+const RUNS = JSON.parse(document.getElementById("hub-data").textContent);
+const $ = (s, r = document) => r.querySelector(s);
+const NS = "http://www.w3.org/2000/svg";
+const COLORS = ["var(--s1)", "var(--s2)", "var(--s3)", "var(--s4)", "var(--s5)", "var(--s7)", "var(--s6)", "var(--s8)"];
+RUNS.forEach((r, i) => { r.color = COLORS[i % COLORS.length]; });
+
+function esc(s) { return String(s == null ? "" : s).replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c])); }
+function h(tag, attrs, ...kids) {
+  const el = document.createElement(tag);
+  for (const [k, v] of Object.entries(attrs || {})) {
+    if (v == null || v === false) continue;
+    if (k === "class") el.className = v;
+    else if (k === "style" && typeof v === "object") { for (const [sk, sv2] of Object.entries(v)) { if (sk.startsWith("--")) el.style.setProperty(sk, sv2); else el.style[sk] = sv2; } }
+    else if (k === "html") el.innerHTML = v;
+    else if (k.startsWith("on") && typeof v === "function") el.addEventListener(k.slice(2), v);
+    else el.setAttribute(k, v === true ? "" : v);
+  }
+  (function add(list) { for (const c of list) { if (c == null || c === false) continue; if (Array.isArray(c)) add(c); else el.append(c.nodeType ? c : document.createTextNode(c)); } })(kids);
+  return el;
+}
+function svg(tag, attrs, ...kids) {
+  const el = document.createElementNS(NS, tag);
+  for (const [k, v] of Object.entries(attrs || {})) if (v != null) el.setAttribute(k, v);
+  for (const c of kids) if (c != null) el.append(c.nodeType ? c : document.createTextNode(c));
+  return el;
+}
+
+/* ---------------------------------------------------------------- results key (same levels as the explorers) */
+const SHOW_LEVELS = [
+  { id: "paper", label: "published works only", tip: "papers and preprints with a public result - no arena leaderboard entries, no claims" },
+  { id: "board", label: "+ Arena leaderboard", tip: "also the replayed Einstein Arena / community-list entries (not papers)" },
+  { id: "claims", label: "+ unreviewed claims", tip: "also unreviewed claims (flagged, never ranked)" },
+];
+const TIER_RANK = { paper: 0, leaderboard: 1, claim: 2 }, LEVEL_RANK = { paper: 0, board: 1, claims: 2 };
+let SHOW = "paper";
+try { const s0 = localStorage.getItem("rx-show"); if (SHOW_LEVELS.some(l => l.id === s0)) SHOW = s0; } catch (e) { /* ignore */ }
+const tierVisible = t => (TIER_RANK[t] != null ? TIER_RANK[t] : 0) <= LEVEL_RANK[SHOW];
+/* reference value + rank of every run among the results visible at the current level */
+function recompute() {
+  RUNS.forEach(r => {
+    const vis = (r.pub_results || []).filter(x => tierVisible(x.tier)), firm = vis.filter(x => x.tier !== "claim");
+    const d = vis.find(x => x.id === r.ref_default) || firm[0] || null;
+    r.reference = d ? { label: d.label, value: d.value, id: d.id } : null;
+    r.rank = r.best != null ? 1 + firm.filter(x => (r.lower_is_better === false ? x.value > r.best : x.value < r.best)).length : null;
+    r.n_ranked = firm.length + 1;
+  });
+}
+recompute();
+
+/* ---------------------------------------------------------------- formatting */
+const fx = (v, d) => (v == null || !isFinite(v) ? "–" : (+v).toFixed(d));
+const int = n => (n == null ? "–" : Math.round(n).toLocaleString("en-US"));
+const sgn = (v, d) => (v >= 0 ? "+" : "−") + Math.abs(v).toFixed(d);
+function dh(sec) {            // day:hour as "3d 14h"
+  if (sec == null) return "–";
+  let d = Math.floor(sec / 86400), hh = Math.round((sec % 86400) / 3600);
+  if (hh === 24) { d += 1; hh = 0; }
+  return d ? `${d}d ${hh}h` : `${hh}h`;
+}
+const nameOf = r => r.short || r.title;
+const better = (r, a, b) => (r.lower_is_better === false ? a > b : a < b);   // is a better than b?
+function status(r) {
+  if (r.steps_total && r.steps_done >= r.steps_total) return { t: "complete", cls: "good", tip: "all configured steps finished" };
+  if (r.stopped) return { t: "stopped", cls: "warn", tip: "the log of this run ends in a stop / traceback - it can be resumed" };
+  return { t: "in progress", cls: "acc", tip: "fewer steps than configured and no stop / traceback in the log - the run was still going when this page was generated" };
+}
+function gapInfo(r) {
+  if (!r.reference || r.best == null) return null;
+  const g = r.best - r.reference.value, pct = g / r.reference.value * 100, ok = better(r, r.best, r.reference.value);
+  return { g, pct, ok, txt: `${sgn(g, r.dec)} (${sgn(pct, Math.abs(pct) < 0.01 ? 4 : 3)} %)` };
+}
+function progress(r) {          // 0 % = the first step's best, 100 % = the published reference
+  if (!r.reference || !r.curve.length) return null;
+  const s0 = r.curve[0][1], ref = r.reference.value;
+  if (s0 === ref) return null;
+  return r.curve.map(([st, v]) => [st, (s0 - v) / (s0 - ref) * 100]);
+}
+function hwLabel(r) {
+  const hw = r.hardware || {};
+  const inf = hw.basis && /^inferred/.test(hw.basis);
+  return h("span", null, hw.label || "not recorded", inf ? h("span", { class: "inf", title: hw.basis }, "model inferred") : null);
+}
+
+/* ---------------------------------------------------------------- tooltip */
+const tip = $("#tip");
+function tipShow(html, ev) {
+  tip.innerHTML = html; tip.classList.add("on");
+  const w = tip.offsetWidth, hh = tip.offsetHeight;
+  let x = ev.clientX + 14, y = ev.clientY + 14;
+  if (x + w > innerWidth - 8) x = ev.clientX - w - 14;
+  if (y + hh > innerHeight - 8) y = ev.clientY - hh - 14;
+  tip.style.left = Math.max(4, x) + "px"; tip.style.top = Math.max(4, y) + "px";
+}
+const tipHide = () => tip.classList.remove("on");
+
+/* ---------------------------------------------------------------- generic line chart (SVG, hover crosshair) */
+function lineChart(o) {
+  const W = o.w, H = o.h, m = Object.assign({ l: 46, r: 10, t: 8, b: 22 }, o.m || {});
+  if (o.xLabel) m.b += 12;
+  const iw = W - m.l - m.r, ih = H - m.t - m.b;
+  const [x0, x1] = o.xDomain, [y0, y1] = o.yDomain;
+  const X = x => m.l + (x1 === x0 ? iw / 2 : (x - x0) / (x1 - x0) * iw), Y = y => m.t + (1 - (y - y0) / (y1 - y0)) * ih;
+  const s = svg("svg", { viewBox: `0 0 ${W} ${H}`, role: "img", "aria-label": o.label || "line chart" });
+  (o.yTicks || []).forEach(t => {
+    s.append(svg("line", { class: "grid-line", x1: m.l, x2: W - m.r, y1: Y(t), y2: Y(t) }));
+    s.append(svg("text", { x: m.l - 6, y: Y(t) + 3.5, "text-anchor": "end" }, o.yFmt ? o.yFmt(t) : t));
+  });
+  s.append(svg("line", { class: "axis-line", x1: m.l, x2: W - m.r, y1: H - m.b, y2: H - m.b }));
+  (o.xTicks || []).forEach(t => s.append(svg("text", { x: X(t), y: H - m.b + 14, "text-anchor": "middle" }, t)));
+  if (o.xLabel) s.append(svg("text", { x: W - m.r, y: H - 2, "text-anchor": "end" }, o.xLabel));
+  (o.hlines || []).forEach(l => {
+    if (l.y < y0 || l.y > y1) return;
+    s.append(svg("line", { class: "ref-line", x1: m.l, x2: W - m.r, y1: Y(l.y), y2: Y(l.y) }));
+    if (l.label) s.append(svg("text", { x: W - m.r - 4, y: Y(l.y) + (l.below ? 13 : -5), "text-anchor": "end" }, l.label));
+  });
+  const ends = [];
+  o.series.forEach(se => {
+    if (!se.pts.length) return;
+    s.append(svg("path", { d: se.pts.map((p, i) => (i ? "L" : "M") + X(p[0]).toFixed(1) + " " + Y(p[1]).toFixed(1)).join(""), fill: "none", stroke: se.color, "stroke-width": 2, "stroke-linejoin": "round", "stroke-linecap": "round" }));
+    const last = se.pts[se.pts.length - 1];
+    s.append(svg("circle", { cx: X(last[0]), cy: Y(last[1]), r: 4.5, fill: se.color, stroke: "var(--surface)", "stroke-width": 2 }));
+    ends.push({ se, x: X(last[0]), y: Y(last[1]), v: last[1] });
+  });
+  if (o.endLabels) {        // direct labels at the line ends, nudged apart
+    ends.sort((a, b) => a.y - b.y);
+    let prev = -1e9;
+    ends.forEach(e => { e.ly = Math.max(e.y, prev + 15); prev = e.ly; });
+    ends.forEach(e => s.append(svg("text", { class: "lbl", x: Math.min(e.x + 9, W - 4), y: e.ly + 4, "text-anchor": "start" }, o.endLabels(e.se, e.v))));
+  }
+  const cross = svg("line", { x1: 0, x2: 0, y1: m.t, y2: H - m.b, stroke: "var(--ink-3)", "stroke-width": 1, visibility: "hidden" });
+  const dots = o.series.map(se => svg("circle", { r: 4, fill: se.color, stroke: "var(--surface)", "stroke-width": 2, visibility: "hidden" }));
+  s.append(cross); dots.forEach(d => s.append(d));
+  const xs = [...new Set(o.series.flatMap(se => se.pts.map(p => p[0])))].sort((a, b) => a - b);
+  const hit = svg("rect", { x: m.l, y: m.t, width: iw, height: ih, fill: "transparent" });
+  hit.addEventListener("mousemove", ev => {
+    const r = s.getBoundingClientRect(), px = (ev.clientX - r.left) / r.width * W;
+    let best = xs[0]; for (const x of xs) if (Math.abs(X(x) - px) < Math.abs(X(best) - px)) best = x;
+    cross.setAttribute("x1", X(best)); cross.setAttribute("x2", X(best)); cross.setAttribute("visibility", "visible");
+    o.series.forEach((se, i) => { const p = se.pts.find(q => q[0] === best); if (p) { dots[i].setAttribute("cx", X(best)); dots[i].setAttribute("cy", Y(p[1])); dots[i].setAttribute("visibility", "visible"); } else dots[i].setAttribute("visibility", "hidden"); });
+    tipShow(o.tip(best), ev);
+  });
+  hit.addEventListener("mouseleave", () => { cross.setAttribute("visibility", "hidden"); dots.forEach(d => d.setAttribute("visibility", "hidden")); tipHide(); });
+  s.append(hit);
+  return s;
+}
+function niceTicks(lo, hi, n) { return Array.from({ length: n }, (_, i) => lo + (hi - lo) * i / (n - 1)); }
+
+/* ---------------------------------------------------------------- landing page */
+function sparkline(r) {
+  const pts = r.curve.map(p => [p[0], p[1]]);
+  if (!pts.length) return h("div", { class: "sub" }, "no finished step yet");
+  const ref = r.reference ? r.reference.value : null;
+  const vals = pts.map(p => p[1]).concat(ref != null ? [ref] : []);
+  let lo = Math.min(...vals), hi = Math.max(...vals); const pad = (hi - lo) * 0.1 || Math.abs(hi) * 1e-4;
+  const labelBelow = ref != null && pts[pts.length - 1][1] > ref;      // the reference label goes on the side the curve is not on - leave room for it
+  lo -= pad * (labelBelow ? 2.6 : 1); hi += pad * (labelBelow ? 1 : 1);
+  const d = hi - lo > 50 ? 0 : Math.min(10, Math.max(2, Math.ceil(-Math.log10(hi - lo)) + 1));
+  const xmax = Math.max(pts[pts.length - 1][0], 1);
+  const wrap = h("div", { class: "hub-spark" });
+  wrap.append(lineChart({
+    w: 420, h: 150, m: { l: 52, r: 12, t: 8, b: 22 }, xDomain: [0, xmax], yDomain: [lo, hi], yTicks: niceTicks(Math.min(...vals), Math.max(...vals), 3), yFmt: v => v.toFixed(d),
+    xTicks: [0, ...(xmax > 3 ? [Math.round(xmax / 2)] : []), xmax].filter((v, i, a) => a.indexOf(v) === i), xLabel: "step",
+    hlines: ref != null ? [{ y: ref, label: "reference " + ref, below: labelBelow }] : [],
+    series: [{ id: r.id, name: nameOf(r), color: r.color, pts }], label: "best so far by step, " + nameOf(r),
+    tip: x => { const p = pts.find(q => q[0] === x); return `<b>step ${x}</b><br>best so far <b>${fx(p[1], r.dec)}</b>` + (ref != null ? `<br><span class="mut">${sgn(p[1] - ref, r.dec)} vs reference</span>` : ""); },
+  }));
+  return wrap;
+}
+
+const EFF_COL = { low: "#d9480f", medium: "#0b7285", high: "#7048e8", xhigh: "#c2255c" };
+const EFF_ORDER = ["low", "medium", "high", "xhigh"];
+function effText(mix) {
+  const n = Object.values(mix || {}).reduce((a, b) => a + b, 0);
+  return n ? Object.keys(mix).sort((a, b) => EFF_ORDER.indexOf(a) - EFF_ORDER.indexOf(b)).map(e => `${e} ${(100 * mix[e] / n).toFixed(mix[e] / n < 0.1 ? 1 : 0)} %`).join(" · ") : "";
+}
+function effChip(model, effort, title) { return h("span", { class: "effort-chip eff-" + effort, title: title || "" }, model, h("small", null, "· " + effort + " effort")); }
+function effortChipOf(r) {
+  const e = r.effort || {}; if (!e.base) return null;
+  const mix = effText(e.mix);
+  return effChip(r.coder, e.base, `The coder (${r.coder}) ran at reasoning effort "${e.base}".` + (mix ? ` Effort of its scored rollouts: ${mix}.` : "") + (Object.keys(e.mix || {}).length > 1 ? " The other efforts are a few pilot programs per strategy." : ""));
+}
+
+function runCard(r) {
+  const st = status(r), gi = gapInfo(r), hw = r.hardware || {};
+  const kv = [
+    ["Progress", `${r.steps_done} of ${r.steps_total || "?"} steps · ${int(r.rollouts)} programs (${fx(r.valid_fraction * 100, 0)} % valid)` +
+      (r.pending ? `<br><span class="sub">step ${r.pending.step}: ${r.pending.rollouts_done ? "all rollouts scored, adapter update pending - its best is included" : int(r.pending.rollouts) + " programs scored so far" + (r.stopped ? " (run stopped here)" : " (running)")}</span>` : "")],
+    ["Models", `${esc(r.coder)} <span class="sub">coder</span> · ${esc(r.strategist)} <span class="sub">strategist</span>`],
+    ["Selection", esc(r.selection || "PUCT")],
+    ["GPUs", null],
+    ["Wall clock", r.elapsed_s != null ? `<b>${dh(r.elapsed_s)}</b>${r.gpu_hours ? ` <span class="sub">≈ ${int(r.gpu_hours)} GPU-hours</span>` : ""}` : "–"],
+  ];
+  const facts = h("div", { class: "facts" });
+  kv.forEach(([k, v]) => { facts.append(h("div", { class: "k" }, k)); const d = h("div", { class: "v" }); if (k === "GPUs") d.append(hwLabel(r)); else d.innerHTML = v; facts.append(d); });
+  return h("div", { class: "card pcard" },
+    h("div", { class: "ptitle" }, h("span", { class: "sw", style: { background: r.color } }), r.title, h("span", { class: "pill " + st.cls, title: st.tip, style: { marginLeft: "auto" } }, st.t)),
+    h("div", { class: "rname" }, r.run_name),
+    h("div", { class: "chiprow" }, effortChipOf(r), r.effort && Object.keys(r.effort.mix || {}).length > 1 ? h("span", { class: "sub" }, effText(r.effort.mix)) : null),
+    h("div", { class: "big" }, h("span", { class: "v" }, fx(r.best, r.dec)), h("span", { class: "u" }, (r.metric || "best") + " · best so far")),
+    h("div", { class: "gaprow" },
+      gi ? [h("span", { class: "pill " + (gi.ok ? "good" : "") }, gi.ok ? "beats the reference" : "above the reference"), h("span", null, `${gi.txt} vs ${r.reference.label}`)] : h("span", { class: "sub" }, "no published reference for this problem"),
+      r.rank ? h("span", { class: "sub", title: "rank among the published results shipped with the explorer, plus this run" }, `· rank ${r.rank} of ${r.n_ranked}`) : null),
+    sparkline(r), facts,
+    h("div", { class: "go" }, h("button", { class: "btn primary", onclick: () => { location.hash = "#" + r.id; } }, "Open explorer →"),
+      h("span", { class: "sub" }, "pipeline · search · strategist · training · constructions · published SOTA")));
+}
+
+function kpiTile(k, v, d) { return h("div", { class: "kpi" }, h("div", { class: "k" }, k), h("div", { class: "v" }, v), h("div", { class: "d" }, d || "")); }
+
+function progressCard() {
+  const rs = RUNS.filter(r => progress(r));
+  if (rs.length < 1) return null;
+  const series = rs.map(r => ({ id: r.id, name: nameOf(r), color: r.color, pts: progress(r) }));
+  const allV = series.flatMap(s => s.pts.map(p => p[1])), xmax = Math.max(...series.flatMap(s => s.pts.map(p => p[0])));
+  const lo = Math.min(0, ...allV), hi = Math.max(110, Math.max(...allV) + 8), stp = hi > 200 ? 50 : 25;
+  const yt = []; for (let t = Math.ceil(lo / stp) * stp; t <= hi; t += stp) yt.push(t);
+  const host = h("div", { class: "hub-chart" });
+  host.append(lineChart({
+    w: 940, h: 300, m: { l: 50, r: 150, t: 10, b: 26 }, xDomain: [0, xmax], yDomain: [lo, hi], yTicks: yt, yFmt: v => v + " %",
+    xTicks: Array.from({ length: Math.min(xmax, 20) + 1 }, (_, i) => Math.round(i * xmax / Math.min(xmax, 20))).filter((v, i, a) => a.indexOf(v) === i), xLabel: "step",
+    hlines: [{ y: 100, label: "100 % = the published reference of each problem", below: true }],
+    series, endLabels: (se, v) => `${se.name}  ${v.toFixed(0)} %`, label: "progress toward the published reference",
+    tip: x => `<b>step ${x}</b>` + series.map(se => { const p = se.pts.find(q => q[0] === x); return p ? `<br><span class="dot" style="background:${se.color}"></span>${esc(se.name)}: <b>${p[1].toFixed(1)} %</b>` : ""; }).join(""),
+  }));
+  const legend = h("div", { class: "legend" }, series.map(se => h("span", { class: "it" }, h("span", { class: "sw", style: { background: se.color } }), se.name + " – " + RUNS.find(r => r.id === se.id).reference.label)));
+  const rows = []; for (let x = 0; x <= xmax; x++) rows.push([x, ...series.map(se => { const p = se.pts.find(q => q[0] === x); return p ? p[1].toFixed(1) + " %" : "–"; })]);
+  const table = h("details", { style: { marginTop: "8px" } }, h("summary", { class: "sub", style: { cursor: "pointer" } }, "show as table"),
+    h("div", { class: "scroll", style: { maxHeight: "240px", marginTop: "6px" } }, h("table", { class: "t" },
+      h("thead", null, h("tr", null, h("th", null, "step"), series.map(se => h("th", { class: "num" }, se.name)))),
+      h("tbody", null, rows.map(r => h("tr", null, r.map((c, i) => h("td", { class: i ? "num" : "" }, c))))))));
+  return h("div", { class: "card", style: { marginTop: "14px" } },
+    h("div", { class: "card-head" }, h("h2", null, "Progress toward each problem's published reference"), h("span", { class: "sub" }, "0 % = the best of the first step · 100 % = the reference value · above 100 % = the run beats it")),
+    host, legend, table);
+}
+
+function compareCard() {
+  const rows = [
+    ["Problem", r => r.title],
+    ["Run", r => h("span", { class: "mono", style: { fontSize: "11.5px", wordBreak: "break-all" } }, r.run_name)],
+    ["Status", r => { const s = status(r); return h("span", { class: "pill " + s.cls, title: s.tip }, s.t); }],
+    ["Steps finished", r => `${r.steps_done} / ${r.steps_total || "?"}`],
+    ["Programs · valid", r => `${int(r.rollouts)} · ${fx(r.valid_fraction * 100, 1)} %`],
+    ["Coder / strategist", r => h("span", null, r.coder, h("span", { class: "sub" }, r.strategist))],
+    ["Coder reasoning effort", r => h("span", null, effortChipOf(r) || "–", r.effort && Object.keys(r.effort.mix || {}).length ? h("span", { class: "sub" }, effText(r.effort.mix)) : null)],
+    ["Selection", r => r.selection || "PUCT"],
+    ["Best so far", r => h("b", null, fx(r.best, r.dec), h("span", { class: "sub" }, r.metric))],
+    ["Reference", r => r.reference ? h("span", null, fx(r.reference.value, r.dec), h("span", { class: "sub" }, r.reference.label)) : "–"],
+    ["Gap to reference", r => { const g = gapInfo(r); return g ? h("span", null, g.txt, h("span", { class: "sub" }, g.ok ? "better than the reference" : "worse than the reference")) : "–"; }],
+    ["Progress to reference", r => { const p = progress(r); return p ? p[p.length - 1][1].toFixed(0) + " %" : "–"; }],
+    ["Rank", r => r.rank ? `${r.rank} of ${r.n_ranked}` : "–"],
+    ["Wall clock", r => dh(r.elapsed_s)],
+    ["GPU-hours", r => r.gpu_hours ? "≈ " + int(r.gpu_hours) : "–"],
+  ];
+  return tableCard("Side by side", "same pipeline, different problems", rows);
+}
+function hardwareCardHub() {
+  const H = r => r.hardware || {};
+  const rows = [
+    ["GPUs", r => hwLabel(r)],
+    ["Card", r => h("span", null, H(r).name || "–", h("span", { class: "sub" }, H(r).family || ""))],
+    ["Memory per GPU", r => H(r).mem_gib ? H(r).mem_gib.toFixed(2) + " GiB" : "–"],
+    ["Compute capability", r => H(r).capability || "not logged"],
+    ["Hardware profile", r => H(r).profile ? H(r).profile : h("span", null, "RTX6000", h("span", { class: "sub" }, "repo default - not set in this run's config"))],
+    ["Coder generation", r => H(r).coder_engines ? `${H(r).coder_engines} vLLM engines, TP ${H(r).coder_tp}` : "vLLM"],
+    ["Strategist generation", r => H(r).strategist_engines ? `${H(r).strategist_engines} vLLM engines, TP ${H(r).strategist_tp}` : "–"],
+    ["Training layout", r => H(r).training_layout || "–"],
+    ["Evaluation", r => H(r).kernel_gpu_id != null ? `kernels timed on GPU ${H(r).kernel_gpu_id} (${H(r).kernel_gpu_type || "GPU"}), one at a time` : (H(r).eval_processes ? `${H(r).eval_processes} CPU sandbox processes on ${H(r).eval_cpus_used || "?"} CPUs` : "–")],
+    ["Host RAM for offload", r => H(r).host_offload_gib ? H(r).host_offload_gib + " GiB" : "–"],
+    ["Basis of the card name", r => h("span", { class: "sub", style: { display: "inline" } }, H(r).basis || "")],
+  ];
+  return tableCard("Hardware used", "GPU specification of every run (read from its config and the vLLM / trainer logs)", rows);
+}
+function tableCard(title, sub, rows) {
+  const head = h("tr", null, h("th", { class: "rowh" }, ""), RUNS.map(r => h("th", null, h("span", { class: "dot", style: { background: r.color } }), nameOf(r))));
+  const body = rows.map(([k, f]) => h("tr", null, h("td", { class: "rowh" }, k), RUNS.map(r => { const v = f(r); const td = h("td", null); if (typeof v === "string") td.innerHTML = esc(v); else td.append(v); return td; })));
+  return h("div", { class: "card", style: { marginTop: "14px" } }, h("div", { class: "card-head" }, h("h2", null, title), h("span", { class: "sub" }, sub)),
+    h("div", { class: "scroll", style: { maxHeight: "none" } }, h("table", { class: "t cmp" }, h("thead", null, head), h("tbody", null, body))));
+}
+
+/* ---------------------------------------------------------------- reasoning effort & speed (separate page) */
+const EFFORT = (() => { const el = document.getElementById("effort-data"); try { return el ? JSON.parse(el.textContent) : null; } catch (e) { return null; } })();
+const PROB_NAME = { ac1: "AC1", erdos: "Erdős C₅", gpu_mode: "GPU kernel (TriMul)" };
+let effProb = null;
+const k1 = v => (v >= 1e6 ? (v / 1e6).toFixed(1) + "M" : v >= 1000 ? (v / 1000).toFixed(v >= 100000 ? 0 : 1) + "k" : String(Math.round(v)));
+const modeName = g => g.model + " · " + g.effort;
+
+/* horizontal bars: rows = [{label, color, segs:[{v, op}], marks:[{v, kind}], end, tip}] */
+function hbars(o) {
+  const W = 940, L = o.left || 230, R = o.right || 130, rowH = 36, top = 24, H = top + o.rows.length * rowH + 6;
+  const X = v => L + Math.min(1, v / o.max) * (W - L - R);
+  const s = svg("svg", { viewBox: `0 0 ${W} ${H}`, role: "img", "aria-label": o.label || "bar chart" });
+  (o.ticks || []).forEach(t => {
+    s.append(svg("line", { class: "grid-line", x1: X(t), x2: X(t), y1: top - 4, y2: H - 4 }));
+    s.append(svg("text", { x: X(t), y: top - 9, "text-anchor": "middle" }, o.tickFmt ? o.tickFmt(t) : t));
+  });
+  o.rows.forEach((r, i) => {
+    const y = top + i * rowH, bh = 20;
+    s.append(svg("rect", { x: 0, y: y + 1, width: 9, height: 18, rx: 2, fill: r.color }));
+    s.append(svg("text", { class: "lbl", x: 16, y: y + 15 }, r.label));
+    let x0 = 0;
+    (r.segs || []).forEach(sg => { const w = Math.max(0, X(x0 + sg.v) - X(x0)); s.append(svg("rect", { x: X(x0), y, width: w, height: bh, fill: sg.color || r.color, opacity: sg.op == null ? 1 : sg.op, rx: 2 })); x0 += sg.v; });
+    (r.marks || []).forEach(m => {
+      if (m.kind === "line") s.append(svg("line", { x1: X(m.v), x2: X(m.v), y1: y - 2, y2: y + bh + 2, stroke: "var(--ink)", "stroke-width": 2 }));
+      else s.append(svg("path", { d: `M${X(m.v)},${y + bh + 2} l-4.5,7 h9 z`, fill: "var(--ink)" }));
+    });
+    s.append(svg("text", { class: "lbl", x: W - R + 8, y: y + 15 }, r.end || ""));
+    const hit = svg("rect", { x: 0, y: y - 4, width: W, height: rowH - 2, fill: "transparent" });
+    hit.addEventListener("mousemove", ev => tipShow(r.tip || "", ev)); hit.addEventListener("mouseleave", tipHide);
+    s.append(hit);
+  });
+  const wrap = h("div", { class: "hub-chart" }); wrap.append(s); return wrap;
+}
+const niceStep = max => { const raw = max / 5, p = Math.pow(10, Math.floor(Math.log10(raw))), f = raw / p; return (f <= 1 ? 1 : f <= 2 ? 2 : f <= 5 ? 5 : 10) * p; };
+const ticksTo = (max, step) => { const t = []; for (let v = 0; v <= max + 1e-9; v += step) t.push(v); return t; };
+
+function effortReading(rows) {
+  const q = e => rows.find(g => g.model === "Qwen3.8-27B" && g.effort === e);
+  const lo = q("low"), me = q("medium"), xh = q("xhigh");
+  if (!lo) return "";
+  const parts = [];
+  if (xh) parts.push(`xhigh writes ${(xh.mean / lo.mean).toFixed(1)}× as many tokens as low (${k1(xh.mean)} vs ${k1(lo.mean)})`);
+  if (me) parts.push(`medium writes ${(me.mean / lo.mean).toFixed(2)}× the tokens of low - on this problem the two efforts are hardly different`);
+  return parts.length ? "Reading: " + parts.join("; ") + ". " : "";
+}
+function renderEffort() {
+  const root = $("#effortPage"); root.innerHTML = "";
+  if (!EFFORT || !EFFORT.groups || !EFFORT.groups.length) { root.append(h("h1", { class: "hub-h1" }, "Reasoning effort & speed"), h("p", { class: "hub-lede" }, "No effort statistics were embedded (effort_runs.txt is empty or the runs are missing).")); return; }
+  const G = EFFORT.groups, SP = EFFORT.speed || {};
+  const probs = ["ac1", "erdos", "gpu_mode"].filter(p => G.some(g => g.problem === p)).concat([...new Set(G.map(g => g.problem))].filter(p => !["ac1", "erdos", "gpu_mode"].includes(p)));
+  if (!effProb || !probs.includes(effProb)) effProb = probs[0];
+  const rows = G.filter(g => g.problem === effProb).sort((a, b) => (a.model < b.model ? -1 : a.model > b.model ? 1 : EFF_ORDER.indexOf(a.effort) - EFF_ORDER.indexOf(b.effort)));
+  const spd = m => (SP[m] ? SP[m].tps_gpu_median : null);
+  const gpuSec = g => (spd(g.model) ? g.mean / spd(g.model) : null);
+
+  root.append(h("h1", { class: "hub-h1" }, "Reasoning effort & generation speed"),
+    h("p", { class: "hub-lede" }, "How much the coder writes at each reasoning effort, and how fast the GPUs turn that into tokens. Everything here is measured on the runs listed at the bottom (", h("code", null, "effort_runs.txt"),
+      "); 'thinking' is an estimate from a sample of saved responses, the token counts and speeds are logged values."));
+
+  /* ---- problem selector + tiles */
+  const sel = h("div", { class: "row-flex", style: { marginBottom: "14px", display: "flex", gap: "8px", alignItems: "center", flexWrap: "wrap" } }, h("span", { class: "sub" }, "problem"),
+    probs.map(p => h("button", { class: "hub-pill" + (p === effProb ? " active" : ""), onclick: () => { effProb = p; renderEffort(); } }, PROB_NAME[p] || p)));
+  root.append(sel);
+  const tiles = h("div", { class: "kpis" });
+  rows.forEach(g => tiles.append(h("div", { class: "kpi" }, h("div", { class: "k" }, effChip(g.model, g.effort)),
+    h("div", { class: "v" }, k1(g.mean), h("span", { style: { fontSize: "13px", color: "var(--ink-3)", fontWeight: 500 } }, " tokens / rollout")),
+    h("div", { class: "d" }, g.think_est != null ? `≈ ${k1(g.think_est)} thinking (${Math.round(100 * g.think_share)} %) · ` : "", `median ${k1(g.median)} · 90 % under ${k1(g.p90)} · longest ${k1(g.max)} · n = ${int(g.n)}`))));
+  root.append(tiles);
+
+  /* ---- tokens per rollout */
+  const max = Math.max(...rows.map(g => g.p90), ...rows.map(g => g.mean)) * 1.08, st = niceStep(max);
+  const mx = Math.ceil(max / st) * st;
+  const bars = hbars({
+    label: "tokens per rollout by reasoning effort", max: mx, ticks: ticksTo(mx, st), tickFmt: k1, right: 210,
+    rows: rows.map(g => ({
+      label: modeName(g), color: EFF_COL[g.effort] || "var(--accent)",
+      segs: g.think_est != null ? [{ v: g.think_est, op: 1 }, { v: g.mean - g.think_est, op: 0.4 }] : [{ v: g.mean, op: 0.75 }],
+      marks: [{ v: g.median, kind: "line" }, { v: g.p90, kind: "tri" }], end: k1(g.mean) + (g.think_est != null ? "  (≈ " + k1(g.think_est) + " thinking)" : ""),
+      tip: `<b>${esc(modeName(g))}</b><br>mean <b>${int(g.mean)}</b> tokens · median ${int(g.median)} · 90 % under ${int(g.p90)} · longest ${int(g.max)}<br>` + (g.think_est != null ? `≈ ${int(g.think_est)} thinking + ${int(g.mean - g.think_est)} answer (estimated from ${Math.round(100 * g.think_share)} % of the characters)<br>` : "") + `<span class="mut">${int(g.n)} scored rollouts · ${g.runs.length} run${g.runs.length > 1 ? "s" : ""}</span>`,
+    })),
+  });
+  root.append(h("div", { class: "card", style: { marginTop: "14px" } },
+    h("div", { class: "card-head" }, h("h2", null, "Tokens a rollout needs - " + (PROB_NAME[effProb] || effProb)), h("span", { class: "sub" }, "bar = mean response (dark = estimated thinking, light = code and answer) · | = median · ▲ = 90th percentile")),
+    bars,
+    h("div", { class: "sub", style: { marginTop: "6px" } }, effortReading(rows) + "The generation limit of the Qwen coder is 262,144 tokens per rollout. The effort setting is a request in the prompt, not a hard budget: the model decides how long to think, which is why the spread inside one mode is wide.")));
+
+  /* ---- speed */
+  const models = Object.keys(SP).sort();
+  if (models.length) {
+    const smax = Math.max(...models.map(m => Math.max(...SP[m].samples.map(x => x.tps_gpu)))) * 1.1, ss = niceStep(smax), sm = Math.ceil(smax / ss) * ss;
+    const colOf = m => (/gpt-oss/i.test(m) ? EFF_COL.high : EFF_COL.low);
+    const sbars = hbars({
+      label: "generation speed per GPU", max: sm, ticks: ticksTo(sm, ss), tickFmt: v => int(v), left: 270, right: 190,
+      rows: models.map(m => ({
+        label: m + (/gpt-oss/i.test(m) ? " · high" : " · low (pure steps)"), color: colOf(m), segs: [{ v: SP[m].tps_gpu_median, op: 0.85 }], dots: SP[m].samples.map(x => x.tps_gpu),
+        end: int(SP[m].tps_gpu_median) + " tokens/s per GPU", tip: `<b>${esc(m)}</b><br>median <b>${int(SP[m].tps_gpu_median)}</b> tokens/s per GPU (range ${int(SP[m].tps_gpu_min)} - ${int(SP[m].tps_gpu_max)})<br><span class="mut">${SP[m].n_timings} pilot phases from ${SP[m].n_runs} run${SP[m].n_runs > 1 ? "s" : ""} · ${esc(SP[m].basis)}</span>`,
+      })),
+    });
+    const q = SP["Qwen3.8-27B"], o = SP["gpt-oss-120b"];
+    const trows = [];
+    models.forEach(m => SP[m].samples.forEach(x => trows.push([m, x.run, x.step, x.rollouts, x.tokens, x.elapsed_s, x.tps_gpu, effText(x.mix)])));
+    root.append(h("div", { class: "card", style: { marginTop: "14px" } },
+      h("div", { class: "card-head" }, h("h2", null, "How fast tokens are generated (2 × B200)"), h("span", { class: "sub" }, "tokens per second per GPU during the pilot phase (median of the measured steps)")),
+      sbars,
+      q && o ? h("p", { class: "sub", style: { margin: "4px 0 8px" } }, h("b", null, "gpt-oss-120b generates ≈ " + (o.tps_gpu_median / q.tps_gpu_median).toFixed(1) + "× more tokens per second per GPU than Qwen3.8-27B"), " on the same GPUs (a mixture-of-experts model with a few billion active parameters against a dense 27B model).") : null,
+      h("details", null, h("summary", { class: "sub", style: { cursor: "pointer" } }, "show the individual measurements"),
+        h("div", { class: "scroll", style: { maxHeight: "260px", marginTop: "6px" } }, h("table", { class: "t" },
+          h("thead", null, h("tr", null, ["model", "run", "step", "rollouts", "tokens", "seconds", "tokens/s/GPU", "effort mix"].map((c, i) => h("th", { class: i > 1 && i < 7 ? "num" : "" }, c)))),
+          h("tbody", null, trows.map(r => h("tr", null, r.map((c, i) => h("td", { class: i > 1 && i < 7 ? "num" : "" }, typeof c === "number" ? int(c) : c)))))))),
+      h("div", { class: "sub", style: { marginTop: "8px" } }, "Measured from the log's pilot-phase progress bar: the tokens of all pilot rollouts of a step divided by the time the bar took. The pilot phase generates everything at once and the evaluation of finished programs does not hold it back, so this is the effective speed of the generation GPUs - including the ramp-up and the tail where only the longest sequences are still running. Only runs on the B200 setup are used so both models share the hardware.")));
+
+    /* ---- derived cost */
+    const dr = rows.filter(g => gpuSec(g) != null);
+    if (dr.length) {
+      const dm = Math.max(...dr.map(gpuSec)) * 1.1, ds = niceStep(dm), dmx = Math.ceil(dm / ds) * ds;
+      root.append(h("div", { class: "card", style: { marginTop: "14px" } },
+        h("div", { class: "card-head" }, h("h2", null, "What one rollout costs in generation time - " + (PROB_NAME[effProb] || effProb)), h("span", { class: "sub" }, "GPU-seconds per rollout = mean tokens ÷ measured speed of that model")),
+        hbars({ label: "GPU-seconds per rollout", max: dmx, ticks: ticksTo(dmx, ds), tickFmt: v => int(v) + " s", rows: dr.map(g => ({ label: modeName(g), color: EFF_COL[g.effort] || "var(--accent)", segs: [{ v: gpuSec(g), op: 0.85 }], end: gpuSec(g).toFixed(gpuSec(g) < 10 ? 1 : 0) + " GPU-s",
+          tip: `<b>${esc(modeName(g))}</b><br>${int(g.mean)} tokens ÷ ${int(spd(g.model))} tokens/s per GPU = <b>${gpuSec(g).toFixed(1)}</b> GPU-seconds` })) }),
+        h("div", { class: "sub", style: { marginTop: "6px" } }, "Derived, not measured per effort: all efforts of a batch run together, so the logs only give the speed of the model as a whole. It assumes a token costs the same at every effort; very long (xhigh) contexts decode somewhat slower, so the xhigh bar is a lower bound.")));
+    }
+  }
+
+}
+
+/* ---------------------------------------------------------------- what's next: scout with Qwen xhigh, refine with gpt-oss high */
+const NX_LOGO = { qwen: { d: "M19.713 2.825h-5.907c0-.251-.066-.503-.196-.728L12.819.728A1.46 1.46 0 0 0 11.559 0h-1.58c-.52 0-1 .275-1.26.728l-2.42 4.19a1.45 1.45 0 0 0 0 1.453l.791 1.37c.26.448.74.727 1.26.727h11.36c.52 0 1-.275 1.26-.728l.79-1.37a1.45 1.45 0 0 0 0-1.451l-.79-1.37a1.46 1.46 0 0 0-1.26-.728zM.195 9.905l2.951 5.115a1.46 1.46 0 0 0-.531.531l-.791 1.37a1.45 1.45 0 0 0 0 1.452l.79 1.37c.26.448.74.727 1.26.727h4.84c.52 0 1-.275 1.26-.728l.79-1.37a1.45 1.45 0 0 0 0-1.451L5.086 7.083a1.46 1.46 0 0 0-1.26-.728h-1.58c-.52 0-1 .276-1.26.728l-.79 1.37a1.45 1.45 0 0 0 0 1.452m15.888 13.367 2.951-5.115c.217.125.469.196.728.196h1.582c.52 0 1-.275 1.26-.728l.79-1.37a1.45 1.45 0 0 0 0-1.451l-2.42-4.191a1.46 1.46 0 0 0-1.259-.728h-1.582c-.52 0-1 .276-1.259.728l-5.678 9.838a1.45 1.45 0 0 0 0 1.452l.79 1.37c.26.448.74.727 1.26.727h1.582c.52 0 1-.275 1.26-.728z", fill: "#082dff" }, oss: { d: "M9.205 8.658v-2.26c0-.19.072-.333.238-.428l4.543-2.616c.619-.357 1.356-.523 2.117-.523 2.854 0 4.662 2.212 4.662 4.566 0 .167 0 .357-.024.547l-4.71-2.759a.797.797 0 00-.856 0l-5.97 3.473zm10.609 8.8V12.06c0-.333-.143-.57-.429-.737l-5.97-3.473 1.95-1.118a.433.433 0 01.476 0l4.543 2.617c1.309.76 2.189 2.378 2.189 3.948 0 1.808-1.07 3.473-2.76 4.163zM7.802 12.703l-1.95-1.142c-.167-.095-.239-.238-.239-.428V5.899c0-2.545 1.95-4.472 4.591-4.472 1 0 1.927.333 2.712.928L8.23 5.067c-.285.166-.428.404-.428.737v6.898zM12 15.128l-2.795-1.57v-3.33L12 8.658l2.795 1.57v3.33L12 15.128zm1.796 7.23c-1 0-1.927-.332-2.712-.927l4.686-2.712c.285-.166.428-.404.428-.737v-6.898l1.974 1.142c.167.095.238.238.238.428v5.233c0 2.545-1.974 4.472-4.614 4.472zm-5.637-5.303l-4.544-2.617c-1.308-.761-2.188-2.378-2.188-3.948A4.482 4.482 0 014.21 6.327v5.423c0 .333.143.571.428.738l5.947 3.449-1.95 1.118a.432.432 0 01-.476 0zm-.262 3.9c-2.688 0-4.662-2.021-4.662-4.519 0-.19.024-.38.047-.57l4.686 2.71c.286.167.571.167.856 0l5.97-3.448v2.26c0 .19-.07.333-.237.428l-4.543 2.616c-.619.357-1.356.523-2.117.523zm5.899 2.83a5.947 5.947 0 005.827-4.756C22.287 18.339 24 15.84 24 13.296c0-1.665-.713-3.282-1.998-4.448.119-.5.19-.999.19-1.498 0-3.401-2.759-5.947-5.946-5.947-.642 0-1.26.095-1.88.31A5.962 5.962 0 0010.205 0a5.947 5.947 0 00-5.827 4.757C1.713 5.447 0 7.945 0 10.49c0 1.666.713 3.283 1.998 4.448-.119.5-.19 1-.19 1.499 0 3.401 2.759 5.946 5.946 5.946.642 0 1.26-.095 1.88-.309a5.96 5.96 0 004.162 1.713z", fill: "var(--ink)" } };
+let NXV = "A", NXFOCUS = null;
+const NX = { P: 8, S: 4, a: 1, b: 10, gpus: 2, eval: 29.5, cur: 384 };
+function nextDiagram(v) {
+  const A = v === "A";          // A = with the separate strategist (the first design), B = Qwen xhigh plans and codes itself
+  const W = A ? 1440 : 1500, H = A ? 728 : 624, s = svg("svg", { viewBox: `0 0 ${W} ${H}`, role: "img", "aria-label": "two-model round pipeline", style: "width:100%;max-width:1560px;display:block" });
+  const defs = svg("defs", null);
+  defs.append(svg("marker", { id: "nxa", viewBox: "0 0 10 10", refX: 9, refY: 5, markerWidth: 11, markerHeight: 11, markerUnits: "userSpaceOnUse", orient: "auto-start-reverse" }, svg("path", { d: "M0,0L10,5L0,10z", fill: "var(--ink-2)" })));
+  s.append(defs);
+  const g = svg("g", { transform: "translate(0,56)" }); s.append(g);
+  const col = { search: "var(--s4)", strat: "var(--s2)", scout: EFF_COL.xhigh, refine: EFF_COL.high, cpu: "var(--s3)" };
+  const logo = (x, y, z, kind) => {
+    if (kind === "glide") {        // Fastino (GLiDE-9B): black rounded square with a white sparkle
+      g.append(svg("rect", { x, y, width: z, height: z, rx: z * 0.22, fill: "#0b0b0b", stroke: "rgba(255,255,255,.35)", "stroke-width": 1 }));
+      g.append(svg("path", { d: "M12,3.2L13.5,10.5L20.8,12L13.5,13.5L12,20.8L10.5,13.5L3.2,12L10.5,10.5Z", fill: "#fff", transform: `translate(${x},${y}) scale(${z / 24})` }));
+      g.append(svg("path", { d: "M6.2,6.2L9.6,9.6M17.8,6.2L14.4,9.6M6.2,17.8L9.6,14.4M17.8,17.8L14.4,14.4", stroke: "#fff", "stroke-width": 1.4, "stroke-linecap": "round", fill: "none", transform: `translate(${x},${y}) scale(${z / 24})` }));
+      return;
+    }
+    g.append(svg("path", { d: NX_LOGO[kind].d, fill: NX_LOGO[kind].fill, transform: `translate(${x},${y}) scale(${z / 24})` }));
+  };
+  const lora = (x, y) => { g.append(svg("rect", { x: x - 54, y: y - 11, width: 62, height: 22, rx: 11, fill: "var(--s7)", stroke: "var(--surface)", "stroke-width": 2 })); g.append(svg("text", { x: x - 23, y: y + 4.5, "text-anchor": "middle", style: "font-size:12px;font-weight:800;fill:#fff;letter-spacing:.4px" }, "+ LoRA")); };
+  const mctx = document.createElement("canvas").getContext("2d"), FAM = getComputedStyle(document.body).fontFamily;
+  const textW = (t, fs, wt) => { mctx.font = `${wt || 700} ${fs}px ${FAM}`; return mctx.measureText(t).width; };
+  const box = (x, y, w, hh, title, sub, c, mark, click, hint) => {
+    g.append(svg("rect", { x, y, width: w, height: hh, rx: 8, fill: c, "fill-opacity": 0.2, stroke: c, "stroke-width": 2.2 }));
+    const lines = String(sub || "").split("\n").filter(Boolean), Z = 22, GAP = 9, pad = 18;
+    let fs = 15;                                                   // real font metrics: shrink the font (never stretch it) until logo + title fit
+    while (fs > 11 && textW(title, fs) + (mark ? Z + GAP : 0) > w - 2 * pad) fs -= 0.5;
+    const tw = textW(title, fs), grp = tw + (mark ? Z + GAP : 0), x0 = x + (w - grp) / 2;
+    const titleH = 18, gap = lines.length ? 9 : 0, blockH = titleH + gap + lines.length * 17, top = y + (hh - blockH) / 2;
+    const base = top + 14;
+    if (mark) logo(x0, base - 16, Z, mark);
+    g.append(svg("text", { x: x0 + (mark ? Z + GAP : 0), y: base, "text-anchor": "start", style: `font-weight:700;font-size:${fs}px;fill:var(--ink)` }, title));
+    lines.forEach((ln, i) => g.append(svg("text", { x: x + w / 2, y: top + titleH + gap + 13 + i * 17, "text-anchor": "middle", style: "font-size:13px;fill:var(--ink)" }, ln)));
+    if (mark === "oss") lora(x + w - 4, y);
+    if (click) {                                                   // the refiner boxes open the prompt view
+      if (hint !== false) g.append(svg("text", { x: x + w - 12, y: y + hh - 10, "text-anchor": "end", style: "font-size:11.5px;font-weight:600;fill:var(--ink-2)" }, "view prompt ›"));
+      const hit = svg("rect", { x, y, width: w, height: hh, rx: 8, fill: "transparent", class: "nx-hit", style: "cursor:pointer" });
+      hit.addEventListener("click", click); g.append(hit);
+    }
+  };
+  const arrow = (d, c, w) => g.append(svg("path", { d, fill: "none", stroke: c || "var(--ink-2)", "stroke-width": w || 2, "stroke-linecap": "round", "stroke-linejoin": "round", "marker-end": "url(#nxa)" }));
+  const xs = A ? [290, 580, 870, 1160] : [290, 596, 902, 1208], cw = A ? 250 : 270, bw = A ? 1120 : 1188, mid = A ? 850 : 884, cx = i => xs[i] + cw / 2;
+  s.append(svg("text", { x: mid, y: 20, "text-anchor": "middle", style: "font-size:15px;fill:var(--ink)" }, A ? "Each strategy sees ALL earlier strategies of the parent, gets one slow Qwen attempt, and gpt-oss then writes the real batch" : "Qwen xhigh plans and codes by itself - no separate strategist; each plan sees ALL earlier plans of the parent"));
+  box(20, 44, 210, 92, "Parent p", "one of the " + NX.P + " parents", col.search);
+  if (A) {
+    box(20, 210, 210, 80, "JEV gate", "", "var(--s7)", "glide");
+    box(20, 350, 210, 74, "UCT ranking", "", col.search);
+    box(20, 470, 210, 70, "Archive", "", col.search);
+    arrow("M125,468V426"); arrow("M125,348V292"); arrow("M125,208V138");
+  } else {
+    box(20, 170, 210, 80, "JEV gate", "", "var(--s7)", "glide");
+    box(20, 290, 210, 74, "UCT ranking", "", col.search);
+    box(20, 404, 210, 70, "Archive", "", col.search);
+    arrow("M125,402V366"); arrow("M125,288V252"); arrow("M125,168V138");
+  }
+  arrow("M232,90H286");
+  /* every strategy sees ALL earlier ones: rounded brackets above the row (neighbours use the straight arrow) */
+  [[0, 2, 24], [1, 3, 42], [0, 3, 60]].forEach(([i, j, lift]) => {
+    const x0 = cx(i) + (i === 0 && j === 2 ? 36 : 18), x1 = cx(j) - (j === 3 && i === 1 ? 36 : 18), top = 42 - lift, r = 12;
+    arrow(`M${x0},42V${top + r}Q${x0},${top} ${x0 + r},${top}H${x1 - r}Q${x1},${top} ${x1},${top + r}V40`, "var(--s2)", 1.8);
+  });
+  const goPrompt = () => openPromptDrawer();
+  if (A) {
+    for (let i = 0; i < 4; i++) {
+      box(xs[i], 44, cw, 92, "Strategy " + (i + 1), "plan for parent p\nfrozen strategist", col.strat);
+      if (i < 3) arrow(`M${xs[i] + cw + 4},90H${xs[i + 1] - 5}`);
+      arrow(`M${cx(i)},138V164`);
+      box(xs[i], 166, cw, 64, "Round 1: Qwen3.8 xhigh", "", col.scout, "qwen");
+      arrow(`M${cx(i)},232V260`);
+    }
+    box(290, 262, bw, 56, "Evaluate", "", col.cpu);
+    arrow(`M${mid},321V351`);
+    box(290, 354, bw, 72, "Result card per strategy", "Task + strategy + Qwen proposed plan + reward or full error message", col.search);
+    for (let i = 0; i < 4; i++) {
+      arrow(`M${cx(i)},428V454`);
+      box(xs[i], 456, cw, 104, "Round 2: gpt-oss high", "reasons, fixes issues, improves", col.refine, "oss", openPromptDrawer, false);
+      arrow(`M${cx(i)},562V590`);
+    }
+    box(290, 592, bw, 56, "Evaluate", "", col.cpu);
+    arrow("M288,620H147Q125,620 125,598V542");
+  } else {
+    for (let i = 0; i < 4; i++) {
+      box(xs[i], 44, cw, 92, "Strategy " + (i + 1) + " + Qwen3.8 xhigh", "plan, then one program", col.strat, "qwen");
+      if (i < 3) arrow(`M${xs[i] + cw + 4},90H${xs[i + 1] - 5}`);
+      arrow(`M${cx(i)},138V160`);
+    }
+    box(290, 162, bw, 56, "Evaluate", "", col.cpu);
+    arrow(`M${mid},221V251`);
+    box(290, 254, bw, 72, "Result card per strategy", "Task + strategy + Qwen proposed plan + reward or full error message", col.search);
+    for (let i = 0; i < 4; i++) {
+      arrow(`M${cx(i)},328V354`);
+      box(xs[i], 356, cw, 104, "Round 2: gpt-oss high", "reasons, fixes issues, improves", col.refine, "oss", goPrompt);
+      arrow(`M${cx(i)},462V488`);
+    }
+    box(290, 490, bw, 56, "Evaluate", "", col.cpu);
+    arrow("M288,518H147Q125,518 125,496V476");
+  }
+  const wrap = h("div", { class: "hub-chart" }); wrap.append(s); return wrap;
+}
+
+/* the input of one gpt-oss refiner call, drawn as a stack of layers with a REAL example (AC1, from effort_stats.next_example) */
+function logoIcon(kind, z) {
+  const sv2 = svg("svg", { viewBox: "0 0 24 24", width: z, height: z, style: "flex:none" });
+  if (kind === "glide") return sv2;
+  sv2.append(svg("path", { d: NX_LOGO[kind].d, fill: NX_LOGO[kind].fill })); return sv2;
+}
+function pvPane(text, o) {
+  o = o || {};
+  const pre = h("div", { class: "pv-pane" + (o.term ? " term" : "") + (o.collapse ? " clip" : "") }); pre.textContent = text;
+  if (!o.collapse) return pre;
+  const lines = text.split("\n").length, btn = h("button", { class: "btn sm pv-more", onclick: () => { const open = pre.classList.toggle("clip") === false; btn.textContent = open ? "show less" : `show all ${lines} lines`; } }, `show all ${lines} lines`);
+  return h("div", null, pre, lines > (o.collapse || 10) ? btn : null);
+}
+function pvLayer(n, color, title, icon, chips, kids, extra) {
+  return h("div", { class: "pv-layer", id: "pv-layer-" + n, style: { "--lc": color } },
+    h("div", { class: "pv-head" }, h("span", { class: "n" }, String(n)), icon || null, h("span", { class: "t" }, title), extra || null, h("span", { class: "grow" }), chips.map(c => h("span", { class: "pv-chip" }, c))), kids);
+}
+
+/* minimal high-level view of the refiner prompt: opens in a drawer on the right (like the program drawer of the explorers) */
+function openPromptDrawer() {
+  const g = t => `<span class="g">${t}</span>`, ph = (t, c) => `<span class="ph" style="color:${c}">&lt;${t}&gt;</span>`;
+  const body = $("#nxBody");
+  body.innerHTML = `<div class="pp">
+    <div class="pp-bar">System Instruction</div>
+    <p>You are an expert at improving programs. You will be given the task, the parent program with what it printed, and ${g("a first attempt for one strategy")} made by a slower, stronger model, with its result.</p>
+    <h4>## Guidelines</h4>
+    <p>You may ${g("refine the attempt")} - fix what went wrong or was left on the table - and you may ${g("propose something new if that is necessary to do better")}.</p>
+    <h4>## Important notes</h4>
+    <ul><li>You must first ${g("think about what the attempt got right and wrong")}, then write the program.</li>
+    <li>Keep the entry-point name, libraries and time budget required by the task.</li></ul>
+    <h4>## Output format</h4>
+    <p>Return ${g("one program")} in a <span class="ph">\`\`\`python</span> block.</p>
+    <div class="pp-bar">Input Prompt</div>
+    <p><b>Task:</b> ${ph("problem, evaluation function, rules", "var(--s1)")}</p>
+    <p><b>Parent program:</b> ${ph("code", "var(--s4)")}<br><b>Parent stdout:</b> ${ph("what the parent printed", "var(--s4)")}</p>
+    <p><b>Plan:</b> ${ph("brief plan of the Qwen xhigh attempt", EFF_COL.xhigh)}<br><b>Code:</b> ${ph("its program", EFF_COL.xhigh)}<br><b>Stdout / error:</b> ${ph("full stdout, or the full error message", EFF_COL.xhigh)}<br><b>Result:</b> ${ph("valid or not, score, reward", EFF_COL.xhigh)}</p>
+  </div>`;
+  const more = h("button", { class: "btn", style: { marginTop: "16px" }, onclick: () => { closePromptDrawer(); NXV = "prompt"; renderNext(); window.scrollTo(0, 0); } }, "see a real example ›");
+  body.append(more);
+  $("#nxDrawer").classList.add("open"); $("#nxDrawer").setAttribute("aria-hidden", "false");
+}
+function closePromptDrawer() { $("#nxDrawer").classList.remove("open"); $("#nxDrawer").setAttribute("aria-hidden", "true"); }
+document.addEventListener("keydown", e => { if (e.key === "Escape") closePromptDrawer(); });
+
+function renderPrompt(root) {
+  const ex = EFFORT && EFFORT.example;
+  if (!ex) { root.append(h("div", { class: "hint" }, "No example attempt could be extracted from the runs (needs a valid xhigh attempt with a parent that printed something).")); return; }
+  const tok = t => "≈ " + k1(t.length / 3.4) + " tokens", lab = t => h("div", { class: "pv-lab" }, t);
+  const instruction = "Above are the task, the parent program with what it printed, and a first attempt for this strategy from a slower, stronger model: its brief plan, its code, what the code printed, and its score.\n\nRead the attempt critically. You may refine it - fix whatever went wrong or was left on the table - and you may propose something new if that is necessary to do better. Think it through, then return one improved program in a ```python block.";
+  const total = ex.task.length + ex.parent_code.length + ex.parent_stdout.length + ex.plan.length + ex.code.length + ex.stdout.length + instruction.length;
+  root.append(h("div", { class: "card", style: { marginTop: "6px" } },
+    h("div", { class: "card-head" }, h("h2", null, "What gpt-oss reads"), h("span", { class: "sub" }, `one refiner call · a real example from ${esc(ex.run)} (AC1) · prompt ≈ ${k1(total / 3.4)} tokens`)),
+    h("div", { class: "pv" },
+      pvLayer(1, "var(--s1)", "Task", null, [tok(ex.task), "AC1 · lower is better"], [pvPane(ex.task, { collapse: 9 })]),
+      h("div", { class: "pv-con" }),
+      pvLayer(2, "var(--s4)", "Parent answer", null, [`upper bound ${ex.parent_score.toFixed(6)}`, tok(ex.parent_code + ex.parent_stdout)],
+        [lab("Parent program"), pvPane(ex.parent_code, { collapse: 9 }), lab("What the parent printed (stdout)"), pvPane(ex.parent_stdout, { term: true, collapse: 8 })]),
+      h("div", { class: "pv-con" }),
+      pvLayer(3, EFF_COL.xhigh, "Qwen3.8 xhigh attempt for this strategy", logoIcon("qwen", 22), [`upper bound ${ex.raw.toFixed(6)}`, `reward ${ex.reward != null ? ex.reward.toFixed(4) : "-"}`, tok(ex.plan + ex.code + ex.stdout)],
+        [lab("Brief plan"), pvPane(ex.plan, { collapse: 9 }), lab("Code"), pvPane(ex.code, { collapse: 9 }), lab("Its stdout (a failed attempt would show the full error message here)"), pvPane(ex.stdout, { term: true, collapse: 8 })]),
+      h("div", { class: "pv-con" }),
+      pvLayer(4, EFF_COL.high, "Instruction", logoIcon("oss", 22), ["gpt-oss-120b · high effort", "reads this, then reasons and writes"],
+        [h("div", { class: "pv-ask" }, instruction)], h("span", { class: "pv-lora" }, "+ LoRA")))),
+    h("div", { class: "sub", style: { marginTop: "10px" } }, "The task, the parent block and the strategy are what the coder already receives. New in round 2: the Qwen attempt with its stdout (or full error message) and the instruction on top. The example is the best valid xhigh attempt of that run whose texts fit on the page; the parent's printed output is the first 2,000 characters the run saved."));
+  if (NXFOCUS) { const el = document.getElementById("pv-layer-" + NXFOCUS); NXFOCUS = null; if (el) setTimeout(() => el.scrollIntoView({ behavior: "smooth", block: "start" }), 50); }
+}
+
+/* measured per-step overheads (seconds) from the logs of our B200 runs: median over every run that has the event */
+function ovm(key) {
+  const O = (EFFORT && EFFORT.overheads) || {}, v = Object.values(O).map(o => o[key]).filter(Boolean);
+  if (!v.length) return null;
+  const n = v.reduce((a, x) => a + x.n, 0);
+  return { s: v.reduce((a, x) => a + x.median * x.n, 0) / n, n, runs: v.length };
+}
+function nextCalc(v, G, SP) {
+  const q = G.find(g => g.model === "Qwen3.8-27B" && g.effort === "xhigh" && g.problem === "ac1") || G.find(g => g.model === "Qwen3.8-27B" && g.effort === "xhigh");
+  const o = G.find(g => g.model === "gpt-oss-120b" && g.problem === "ac1") || G.find(g => g.model === "gpt-oss-120b");
+  const ql = G.find(g => g.model === "Qwen3.8-27B" && g.effort === "low" && g.problem === "ac1") || G.find(g => g.model === "Qwen3.8-27B" && g.effort === "low");
+  if (!q || !o || !ql || !SP["Qwen3.8-27B"] || !SP["gpt-oss-120b"]) return null;
+  const M = k => (ovm(k) ? ovm(k).s : 0);
+  const sq = SP["Qwen3.8-27B"].tps_gpu_median, so = SP["gpt-oss-120b"].tps_gpu_median, n = v.P * v.S;
+  const r1 = n * v.a, r2 = n * v.b;
+  const t1 = r1 * q.mean / sq / v.gpus, t2 = r2 * o.mean / so / v.gpus;
+  const jev = M("jev"), strat = M("strategist_phase"), sSmall = M("sleep_small"), lq = M("load_qwen"), lo = M("load_gpt-oss"), sBig = M("sleep_big"), coder = M("coder_phase");
+  const evalS = v.eval * 60, swQO = sBig + lo, hidden = Math.max(0, evalS - swQO - t2);
+  const C = { jev: "var(--s7)", strat: "var(--s2)", sw: "var(--ink-3)", q: EFF_COL.xhigh, o: EFF_COL.high, ev: "var(--s3)", cur: EFF_COL.low };
+  const seg = (label, val, color, op) => ({ label, v: val, color, op: op == null ? 0.95 : op });
+  const today = [seg("GLiDE gate", jev, C.jev), seg("strategist phase", strat, C.strat), seg("strategist → coder engines", sSmall, C.sw, 0.55), seg("Qwen low: generation + evaluation", coder, C.cur), seg("coder engines → trainer", sBig, C.sw, 0.55)];
+  const mk = withStrat => [seg("GLiDE gate", jev, C.jev)].concat(withStrat ? [seg("strategist phase", strat, C.strat), seg("strategist → Qwen engines", sSmall, C.sw, 0.55)] : [])
+    .concat([seg("Qwen engines up", lq, C.sw, 0.55), seg("round 1 · Qwen xhigh", t1, C.q), seg("Qwen → gpt-oss engines", swQO, C.sw, 0.55), seg("waiting for the last scouts' evaluation", hidden, C.ev, 0.45),
+      seg("round 2 · gpt-oss high", t2, C.o), seg("evaluation of the last programs", evalS, C.ev), seg("gpt-oss engines → trainer", sBig, C.sw, 0.55)]).filter(x => x.v > 0.5);
+  const A = mk(true), B = mk(false), sum = L => L.reduce((a, x) => a + x.v, 0);
+  return { q, o, ql, sq, so, n, r1, r2, t1, t2, today: today.filter(x => x.v > 0.5), A, B, totals: { today: sum(today), A: sum(A), B: sum(B) }, tok1: r1 * q.mean, tok2: r2 * o.mean, evalS,
+    switches: { A: sSmall + lq + swQO + sBig, B: lq + swQO + sBig }, strat, sSmall, jev, lq, lo, sBig, coder, hidden };
+}
+function renderNext() {
+  const root = $("#nextPage"); root.innerHTML = "";
+  const G = (EFFORT && EFFORT.groups) || [], SP = (EFFORT && EFFORT.speed) || {};
+  root.append(h("h1", { class: "hub-h1" }, "What's next: scout with Qwen xhigh, refine with gpt-oss high"),
+    h("p", { class: "hub-lede" }, "Qwen at xhigh effort is strong but slow; gpt-oss-120b at high effort is about 2× faster per token and reasons well. Instead of asking one model for 64 programs per parent, give every strategy ONE slow, careful Qwen attempt, evaluate all of them, and hand each attempt - with its score and errors - to gpt-oss, which reasons about what went wrong and writes the batch of improved programs. Two variants: A keeps the separate strategist, B lets Qwen xhigh plan and code by itself."));
+  root.append(h("div", { class: "nx-tabs" }, [["A", "◧ A · with strategist"], ["B", "◧ B · Qwen plans and codes"], ["prompt", "✎ gpt-oss prompt · detailed example"]].map(([id, lab]) =>
+    h("button", { class: "hub-pill" + (NXV === id ? " active" : ""), onclick: () => { NXV = id; renderNext(); } }, lab))));
+  if (NXV === "prompt") { renderPrompt(root); return; }
+  const V = NXV === "B" ? "B" : "A";
+  root.append(h("div", { class: "card", style: { marginTop: "6px" } }, h("div", { class: "card-head" }, h("h2", null, V === "A" ? "Variant A: strategist, then Qwen xhigh, then gpt-oss" : "Variant B: Qwen xhigh plans and codes, then gpt-oss"),
+    h("span", { class: "sub" }, "click a Round 2 box to see its prompt" + (V === "B" ? " · numbers follow the calculator below" : ""))), nextDiagram(V)));
+
+  if (V !== "B") return;                // the timing blocks belong to variant B only
+  /* calculator */
+  const out = h("div"), inputs = h("div", { class: "row-flex", style: { display: "flex", gap: "14px", flexWrap: "wrap", alignItems: "flex-end", marginBottom: "12px" } });
+  const fields = [["P", "parents per step"], ["S", "strategies per parent"], ["a", "Qwen xhigh programs per strategy"], ["b", "gpt-oss programs per strategy"], ["gpus", "generation GPUs"], ["eval", "evaluation time of one program (min)"]];
+  fields.forEach(([k, lab]) => { const inp = h("input", { type: "number", value: NX[k], min: 0, step: 1, style: { width: "84px" } }); inp.addEventListener("input", () => { const x = parseFloat(inp.value); if (isFinite(x) && x >= 0) { NX[k] = x; draw(); } }); inputs.append(h("label", { class: "ctl", style: { flexDirection: "column", alignItems: "flex-start", gap: "3px" } }, h("span", { class: "sub" }, lab), inp)); });
+  const mm = x => (x / 60 >= 100 ? int(x / 60) : (x / 60).toFixed(1)) + " min";
+  function draw() {
+    out.innerHTML = "";
+    const c = nextCalc(NX, G, SP);
+    if (!c) { out.append(h("div", { class: "hint" }, "Needs the measured speeds, token counts and overheads of both models (effort_runs.txt).")); return; }
+    const rows = [["Qwen low, one stage (measured)", c.today, c.totals.today, EFF_COL.low], ["A: with strategist", c.A, c.totals.A, EFF_COL.xhigh]].concat(V === "B" ? [["B: Qwen plans and codes", c.B, c.totals.B, EFF_COL.xhigh]] : []);
+    const mx = Math.max(...rows.map(r => r[2])) * 1.04, st = niceStep(mx), mxx = Math.ceil(mx / st) * st;
+    out.append(hbars({ label: "wall-clock time of a step before training", max: mxx, ticks: ticksTo(mxx, st), tickFmt: x => Math.round(x / 60) + " min", left: 280, right: 130,
+      rows: rows.map(([lab, L, tot, col]) => ({ label: lab, color: col, segs: L.map(x => ({ v: x.v, color: x.color, op: x.op })), end: mm(tot),
+        tip: `<b>${esc(lab)}</b> - ${mm(tot)}<br>` + L.map(x => `<span class="dot" style="background:${x.color}"></span>${esc(x.label)}: <b>${mm(x.v)}</b>`).join("<br>") })) }));
+    out.append(h("div", { class: "legend", style: { marginTop: "6px" } }, [["var(--s7)", "GLiDE gate"], ["var(--s2)", "strategist"], ["var(--ink-3)", "model changes (sleep / load)"], [EFF_COL.xhigh, "Qwen xhigh generation"], [EFF_COL.high, "gpt-oss generation"], ["var(--s3)", "evaluation wait"], [EFF_COL.low, "Qwen low coder phase"]]
+      .map(([cl, t]) => h("span", { class: "it" }, h("span", { class: "sw", style: { background: cl } }), t))));
+    const L = V === "A" ? c.A : c.B, tot = V === "A" ? c.totals.A : c.totals.B;
+    out.append(h("div", { class: "kpis", style: { marginTop: "10px" } },
+      kpiTile("Step before training", mm(tot), `Qwen low, one stage: ${mm(c.totals.today)}`),
+      kpiTile("Round 1 · Qwen xhigh", mm(c.t1), `${int(c.r1)} programs × ${k1(c.q.mean)} tokens ÷ ${int(c.sq)} tok/s per GPU ÷ ${NX.gpus} GPUs`),
+      kpiTile("Round 2 · gpt-oss high", mm(c.t2), `${int(c.r2)} programs × ${k1(c.o.mean)} tokens ÷ ${int(c.so)} tok/s per GPU ÷ ${NX.gpus} GPUs`),
+      kpiTile("Strategist phase", V === "A" ? mm(c.strat) : "0 min", V === "A" ? `${mm(c.strat)} + ${mm(c.sSmall)} hand-over · incl. loading its engines` : `saved: ${mm(c.strat + c.sSmall)} per step against A`),
+      kpiTile("Model changes", mm(c.switches[V]), V === "A" ? "strategist → Qwen → gpt-oss → trainer" : "Qwen → gpt-oss → trainer (no strategist engines)"),
+      kpiTile("Programs evaluated", int(c.r1 + c.r2), `${int(c.r1)} scouts + ${int(c.r2)} refined`)));
+  }
+  root.append(h("div", { class: "card", style: { marginTop: "14px" } }, h("div", { class: "card-head" }, h("h2", null, "How long would a step take?"), h("span", { class: "sub" }, "generation from measured speeds · model changes and phases from the logs of our B200 runs")), inputs, out,
+    h("div", { class: "sub", style: { marginTop: "8px" } }, "Generation = programs × mean tokens ÷ measured tokens per second per GPU ÷ GPUs (both models saturated; the real round 1 is longer because the last xhigh sequences, up to ≈ 165k tokens, finish alone). Model changes, the GLiDE gate and the strategist phase are the medians measured in the logs (table below). Round 2 of a strategy starts as soon as its scout is scored, so scouting evaluation hides behind the engine change and round 2; only the last programs' evaluation (one program's run time, 29.5 min for AC1) trails the generation. The Qwen low bar is the measured median of the AC1 run, evaluation waits included. Training is not included in any bar.")));
+  draw();
+
+  /* measured overheads */
+  const O = [["GLiDE gate (load GLiDE-9B, compare candidates)", "jev"], ["strategist phase (8 chains × 4 plans, retries, loading its engines)", "strategist_phase"], ["strategist engines: sleep / hand-over", "sleep_small"], ["Qwen3.8-27B engines: load", "load_qwen"],
+    ["gpt-oss-120b engines: load (one engine at a time)", "load_gpt-oss"], ["coder engines: sleep / hand-over to the trainer", "sleep_big"], ["Qwen low coder phase (generation + evaluation)", "coder_phase"]];
+  root.append(h("div", { class: "card", style: { marginTop: "14px" } }, h("div", { class: "card-head" }, h("h2", null, "Time overhead and model changes - measured"), h("span", { class: "sub" }, "per step, median of the logged events")),
+    h("div", { class: "scroll", style: { maxHeight: "none" } }, h("table", { class: "t" }, h("thead", null, h("tr", null, ["what", "median", "events"].map((c, i) => h("th", { class: i ? "num" : "" }, c)))),
+      h("tbody", null, O.map(([lab, k]) => { const x = ovm(k); return h("tr", null, h("td", null, lab), h("td", { class: "num" }, x ? (x.s >= 120 ? (x.s / 60).toFixed(1) + " min" : Math.round(x.s) + " s") : "–"), h("td", { class: "num" }, x ? x.n + " · " + x.runs + " run" + (x.runs > 1 ? "s" : "") : "not logged")); })))),
+    h("div", { class: "sub", style: { marginTop: "8px" } }, "Read from the timestamps of temirnal.log of the 2 × B200 runs (AC1 with Qwen, kernel task with gpt-oss). The Qwen load time varies a lot (3-15 min) when the engines had to be reloaded after a RAM-pressure release.")));
+}
+
+function renderLanding() {
+  const root = $("#landing"); root.innerHTML = "";
+  const totalS = RUNS.reduce((a, r) => a + (r.elapsed_s || 0), 0), gh = RUNS.reduce((a, r) => a + (r.gpu_hours || 0), 0), prog = RUNS.reduce((a, r) => a + r.rollouts, 0);
+  root.append(h("h1", { class: "hub-h1" }, "All problems"),
+    h("p", { class: "hub-lede" }, `${RUNS.length} problem${RUNS.length > 1 ? "s" : ""}, one pipeline (coder + strategist, PUCT selection, SPO² training). Each card is a full interactive explorer of one run - open it for the pipeline, search tree, strategist plans, training curves, every construction and the published SOTA. For both problems below a smaller number is better.`),
+    h("div", { class: "kpis" },
+      kpiTile("Problems", String(RUNS.length), RUNS.map(nameOf).join(" · ")),
+      kpiTile("Programs generated", int(prog), "across all runs"),
+      kpiTile("Wall clock", dh(totalS), "all runs together"),
+      kpiTile("GPU-hours", "≈ " + int(gh), RUNS.map(r => (r.hardware || {}).label).filter(Boolean).join("  |  "))),
+    h("div", { class: "grid g2" }, RUNS.map(runCard)));
+  const pc = progressCard(); if (pc) root.append(pc);
+  root.append(compareCard(), hardwareCardHub(),
+    h("div", { class: "hub-foot" }, "Generated ", RUNS[0].generated_at, " by ", h("code", null, "make_explorer.sh --unified"), ". Add a problem by building its run into the same page: ", h("code", null, "./make_explorer.sh --unified RUN_A RUN_B RUN_C"), " (see README). Everything here is embedded - the file works offline."));
+}
+
+/* ---------------------------------------------------------------- explorers (one isolated iframe per run, inflated on demand) */
+const frames = {};      // id -> { promise, iframe, url }
+function b64bytes(b64) { const bin = atob(b64); const a = new Uint8Array(bin.length); for (let i = 0; i < bin.length; i++) a[i] = bin.charCodeAt(i); return a; }
+async function inflateHtml(id) {
+  const el = document.getElementById("html-" + id);
+  const bytes = b64bytes(el.textContent.trim());
+  const ds = new Blob([bytes]).stream().pipeThrough(new DecompressionStream("gzip"));
+  return await new Response(ds).text();
+}
+function loadRun(r) {
+  if (frames[r.id]) return frames[r.id].promise;
+  const rec = frames[r.id] = {};
+  rec.promise = (async () => {
+    const txt = await inflateHtml(r.id);
+    rec.url = URL.createObjectURL(new Blob([txt], { type: "text/html" }));
+    const f = h("iframe", { title: r.title + " - " + r.run_name, src: rec.url, "data-run": r.id });
+    rec.iframe = f;
+    await new Promise(res => { f.addEventListener("load", res, { once: true }); $("#frames").append(f); });
+    return rec;
+  })();
+  return rec.promise;
+}
+async function openRun(r) {
+  $("#hubMain").hidden = true; $("#frames").hidden = false; $("#btnNewTab").hidden = false;
+  document.querySelectorAll("#frames iframe").forEach(f => f.classList.remove("on"));
+  document.title = nameOf(r) + " - Run Explorer";
+  $("#hubSub").textContent = r.run_name + "  ·  " + ((r.hardware || {}).label || "");
+  const first = !frames[r.id];
+  let spin = null;
+  if (first) { spin = h("div", { class: "loading" }, h("div", { class: "spinner" }), h("div", null, "Inflating " + r.run_name + " …")); $("#frames").append(spin); }
+  try {
+    const rec = await loadRun(r);
+    if (currentView() === r.id) rec.iframe.classList.add("on");
+  } catch (e) {
+    console.error(e);
+    $("#frames").append(h("div", { class: "warnbox", style: { margin: "30px" } }, "Could not load this explorer: " + (e && e.message || e) + ". Open the standalone file for this run instead."));
+  } finally { if (spin) spin.remove(); }
+}
+function openOverview(page) {
+  $("#hubMain").hidden = false; $("#frames").hidden = true; $("#btnNewTab").hidden = true;
+  const eff = page === "effort", nxt = page === "next";
+  $("#landing").hidden = eff || nxt; $("#effortPage").hidden = !eff; $("#nextPage").hidden = !nxt;
+  if (eff) renderEffort();
+  if (nxt) renderNext();
+  const label = eff ? "reasoning effort & speed" : nxt ? "what's next" : "all problems";
+  document.title = "Run Explorer - " + label; $("#hubSub").textContent = label;
+}
+const currentView = () => { const v = (location.hash || "#overview").slice(1); return v === "effort" || v === "next" || RUNS.some(r => r.id === v) ? v : "overview"; };
+function buildNav() {
+  const nav = $("#hubNav"); nav.innerHTML = "";
+  nav.append(h("button", { class: "hub-pill", "data-view": "overview", onclick: () => { location.hash = "#overview"; } }, "◧ All problems"));
+  if (EFFORT && EFFORT.groups && EFFORT.groups.length) nav.append(h("button", { class: "hub-pill", "data-view": "effort", title: "tokens per rollout and generation speed at each reasoning effort", onclick: () => { location.hash = "#effort"; } }, "⚡ Effort & speed"));
+  RUNS.forEach(r => nav.append(h("button", { class: "hub-pill", "data-view": r.id, title: r.title + " - " + r.run_name, onclick: () => { location.hash = "#" + r.id; } },
+    h("span", { class: "sw", style: { background: r.color } }), nameOf(r), h("small", null, r.best != null ? fx(r.best, r.dec) : ""))));
+  if (EFFORT && EFFORT.groups && EFFORT.groups.length) nav.append(h("button", { class: "hub-pill", "data-view": "next", title: "proposal: Qwen xhigh scouts, gpt-oss high refines", onclick: () => { location.hash = "#next"; } }, "→ What's next"));
+}
+function route() {
+  const v = currentView();
+  document.querySelectorAll(".hub-pill").forEach(p => p.classList.toggle("active", p.dataset.view === v));
+  if (v === "overview" || v === "effort" || v === "next") openOverview(v); else openRun(RUNS.find(r => r.id === v));
+  window.scrollTo(0, 0);
+}
+
+/* ---------------------------------------------------------------- theme (shared with every explorer) */
+const curTheme = () => document.documentElement.getAttribute("data-theme") || (matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light");
+let explicitTheme = null;
+try { explicitTheme = localStorage.getItem("rx-theme"); if (explicitTheme) document.documentElement.setAttribute("data-theme", explicitTheme); } catch (e) { /* ignore */ }
+function pushShow(level, except) { Object.values(frames).forEach(f => { try { if (f.iframe && f.iframe.contentWindow !== except) f.iframe.contentWindow.postMessage({ rxShow: level }, "*"); } catch (e) { /* ignore */ } }); }
+function setShowLevel(level, except) {
+  if (!SHOW_LEVELS.some(l => l.id === level) || level === SHOW) return;
+  SHOW = level; try { localStorage.setItem("rx-show", level); } catch (e) { /* ignore */ }
+  $("#gShow").value = level; recompute(); renderLanding(); buildNav(); pushShow(level, except);
+  document.querySelectorAll(".hub-pill").forEach(p => p.classList.toggle("active", p.dataset.view === currentView()));
+}
+{ const g = $("#gShow"); SHOW_LEVELS.forEach(l => g.append(h("option", { value: l.id, title: l.tip }, l.label))); g.value = SHOW; g.addEventListener("change", () => setShowLevel(g.value)); }
+function pushTheme(t) { Object.values(frames).forEach(f => { try { if (f.iframe) f.iframe.contentWindow.postMessage({ rxTheme: t }, "*"); } catch (e) { /* ignore */ } }); }
+$("#btnTheme").addEventListener("click", () => {
+  const nxt = curTheme() === "dark" ? "light" : "dark";
+  explicitTheme = nxt; document.documentElement.setAttribute("data-theme", nxt);
+  try { localStorage.setItem("rx-theme", nxt); } catch (e) { /* ignore */ }
+  pushTheme(nxt);
+});
+window.addEventListener("message", e => {
+  const d = e.data || {};
+  if (d.rxThemeSet) {                                  // the explorer's own toggle was used: follow it
+    explicitTheme = d.rxThemeSet; document.documentElement.setAttribute("data-theme", d.rxThemeSet);
+    try { localStorage.setItem("rx-theme", d.rxThemeSet); } catch (err) { /* ignore */ }
+    Object.values(frames).forEach(f => { try { if (f.iframe && f.iframe.contentWindow !== e.source) f.iframe.contentWindow.postMessage({ rxTheme: d.rxThemeSet }, "*"); } catch (err) { /* ignore */ } });
+  } else if (d.rxShowSet) {                             // the explorer's own "Results" key was used: follow it everywhere
+    setShowLevel(d.rxShowSet, e.source);
+  } else if (d.rxReady) {
+    if (explicitTheme && d.theme !== explicitTheme) { try { e.source.postMessage({ rxTheme: explicitTheme }, "*"); } catch (err) { /* ignore */ } }
+    if (d.show !== SHOW) { try { e.source.postMessage({ rxShow: SHOW }, "*"); } catch (err) { /* ignore */ } }
+  }
+});
+$("#btnNewTab").addEventListener("click", async () => {
+  const r = RUNS.find(x => x.id === currentView()); if (!r) return;
+  const rec = await loadRun(r); window.open(rec.url, "_blank");
+});
+
+buildNav();
+renderLanding();
+window.addEventListener("hashchange", route);
+route();
