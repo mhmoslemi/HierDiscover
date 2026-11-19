@@ -12,6 +12,10 @@ import time
 from xml.etree import ElementTree
 
 
+# The idle B200s report 5 MiB through nvidia-smi even with no GPU processes.
+_IDLE_VRAM_MIB = 5
+
+
 class GPUNotIdle(RuntimeError):
     """Benchmark admission failed before timing any program."""
 
@@ -33,14 +37,14 @@ def _gpu_busy_reason(gpu_id: int) -> str:
     except (OSError, subprocess.SubprocessError, ElementTree.ParseError, ValueError, IndexError) as exc:
         raise GPUNotIdle(f"Could not verify physical GPU {gpu_id} before benchmarking: {exc}") from exc
 
-    if not (gpu_util or memory_util or pids or used_mib):
+    if not (gpu_util or memory_util or pids or used_mib > _IDLE_VRAM_MIB):
         return ""
     return (f"GPU utilization {gpu_util}%, memory activity {memory_util}%, "
             f"used VRAM {used_mib} MiB, GPU PIDs {pids}")
 
 
 def wait_for_idle_gpu(gpu_id: int, *, on_busy=None) -> None:
-    """Admit a benchmark only when the GPU reports zero used VRAM and no processes."""
+    """Require zero activity, no GPU processes, and only baseline VRAM usage."""
     deadline = time.monotonic() + 30.0
     reason = _gpu_busy_reason(gpu_id)
     if reason:

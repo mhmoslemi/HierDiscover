@@ -556,8 +556,7 @@ class GpuMode(Problem):
             for gpu_id in self.kernel_gpu_ids:
                 with gpu_lease(gpu_id, self.gpu_lease_timeout_s, purpose="TriMul idle check"):
                     self._wait_for_benchmark_gpu(gpu_id)
-            print(f"[gpu-eval] physical GPUs {self.kernel_gpu_ids}: "
-                  "0 MiB used, 0% activity, no GPU processes", flush=True)
+            print(f"[gpu-eval] idle check passed on physical GPUs {self.kernel_gpu_ids}", flush=True)
 
     def _wait_for_benchmark_gpu(self, gpu_id):
         if self._gpu_idle_error is not None:

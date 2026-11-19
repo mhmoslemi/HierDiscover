@@ -4594,7 +4594,7 @@ def main():
             gen_pool.shutdown()
         if parallel_trainer is not None:
             print("[shutdown] stopping process-distributed trainer ...")
-            parallel_trainer.shutdown(for_restart=(restart_for_exact_recovery or evaluation_handoff is not None))
+            parallel_trainer.shutdown(for_restart=restart_for_exact_recovery)
 
     if evaluation_handoff is not None:
         from runtime.run_supervisor import request_evaluation

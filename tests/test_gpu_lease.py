@@ -8,14 +8,15 @@ from runtime.gpu_lease import GPUNotIdle, _gpu_busy_reason
 
 @pytest.mark.parametrize("used,gpu,memory,processes,busy", [
     (0, 0, 0, "", False),
-    (1, 0, 0, "", True),
-    (0, 1, 0, "", True),
-    (0, 0, 1, "", True),
-    (0, 0, 0, "<process_info><pid>123</pid></process_info>", True),
+    (5, 0, 0, "", False),
+    (6, 0, 0, "", True),
+    (5, 1, 0, "", True),
+    (5, 0, 1, "", True),
+    (5, 0, 0, "<process_info><pid>123</pid></process_info>", True),
     (6623, 0, 0, "<process_info><pid>2601241</pid></process_info>", True),
     (0, 0, 0, "Unidentified processes found", None),
 ])
-def test_trimul_requires_an_empty_gpu(used, gpu, memory, processes, busy):
+def test_trimul_allows_only_the_idle_gpu_baseline(used, gpu, memory, processes, busy):
     output = f"""
     <nvidia_smi_log><gpu>
       <utilization><gpu_util>{gpu} %</gpu_util><memory_util>{memory} %</memory_util></utilization>
