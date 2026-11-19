@@ -53,6 +53,7 @@ Protocol (per step):
 
 import asyncio
 import importlib.metadata
+import inspect
 import os
 import signal
 import subprocess
@@ -98,6 +99,8 @@ VLLM_TOKEN_SCORING_MIN_BATCHED_TOKENS = 512
 VLLM_TOKEN_SCORING_MAX_RETRIES = 5
 VLLM_OPTIONAL_TOKEN_SCORING_MAX_RETRIES = 3
 VLLM_STARTUP_FREE_MARGIN_GIB = 1.0
+VLLM_ENGINE_SHUTDOWN_TIMEOUT_S = 30.0
+VLLM_WRAPPER_SHUTDOWN_TIMEOUT_S = VLLM_ENGINE_SHUTDOWN_TIMEOUT_S + 10.0
 
 # tqdm ships with transformers/huggingface_hub, so it's almost always present.
 # Fall back to a coarse print bar if it isn't, so nothing depends on it.
@@ -1086,6 +1089,39 @@ async def _serve_generation_requests(task_queue, generate, *, done_marker="__str
         await asyncio.gather(*pending, return_exceptions=True)
 
 
+async def _finish_vllm_loop():
+    loop = asyncio.get_running_loop()
+    current = asyncio.current_task()
+    pending = [task for task in asyncio.all_tasks(loop) if task is not current]
+    for task in pending:
+        task.cancel()
+    await asyncio.gather(*pending, return_exceptions=True)
+    await loop.shutdown_asyncgens()
+    await loop.shutdown_default_executor()
+
+
+def _shutdown_vllm_engine(engine, loop):
+    shutdown = getattr(engine, "shutdown", None)
+    if not callable(shutdown):
+        core = getattr(getattr(engine, "llm_engine", None), "engine_core", None)
+        shutdown = getattr(core, "shutdown", None)
+    try:
+        if callable(shutdown):
+            try:
+                inspect.signature(shutdown).bind(timeout=VLLM_ENGINE_SHUTDOWN_TIMEOUT_S)
+            except (TypeError, ValueError):
+                shutdown()
+            else:
+                shutdown(timeout=VLLM_ENGINE_SHUTDOWN_TIMEOUT_S)
+    finally:
+        if loop is not None:
+            try:
+                loop.run_until_complete(_finish_vllm_loop())
+            finally:
+                loop.close()
+                asyncio.set_event_loop(None)
+
+
 def _vllm_worker_loop(rank, gpu_id, model_name, max_seq_length, load_in_4bit,
                       task_queue, result_queue, ready_queue, seed=None,
                       lora_rank=32, gpu_memory_utilization=0.9,
@@ -1719,17 +1755,11 @@ def _vllm_worker_loop(rank, gpu_id, model_name, max_seq_length, load_in_4bit,
                           f"{os.path.abspath(os.fspath(vllm_log_path))}")
             result_queue.put((rank, None, {"error": detail}))
 
-    if async_engine:
-        try:
-            llm.shutdown()
-            _run_async(asyncio.sleep(0))
-        except Exception:
-            print(f"[vllm worker {rank}] asynchronous shutdown warning:\n"
-                  f"{traceback.format_exc()}", file=sys.stderr, flush=True)
-        finally:
-            if async_loop is not None:
-                async_loop.close()
-                asyncio.set_event_loop(None)
+    try:
+        _shutdown_vllm_engine(llm, async_loop)
+    except Exception:
+        print(f"[vllm worker {rank}] shutdown warning:\n"
+              f"{traceback.format_exc()}", file=sys.stderr, flush=True)
     print(f"[vllm worker {rank}] shutting down", flush=True)
 
 
@@ -2264,14 +2294,18 @@ class GenerationPool:
                     task_queue.put(None)
                 except Exception:
                     pass
+        # Every wrapper received its stop message, so they can clean up in parallel.
+        deadline = time.monotonic() + VLLM_WRAPPER_SHUTDOWN_TIMEOUT_S
         for rank in worker_ids:
             process = self.procs[rank]
             task_queue = self.task_queues[rank]
-            if process is not None:
-                process.join(timeout=10)
-                if self.backend == "vllm" and process.pid is not None:
-                    # Let the wrapper reap its engines before terminating the
-                    # wrapper itself; CUDA teardown can outlast a short join.
+            if process is not None and process.pid is not None:
+                timeout = max(0.0, deadline - time.monotonic()) if self.backend == "vllm" else 10.0
+                process.join(timeout=timeout)
+                if self.backend == "vllm":
+                    if process.is_alive():
+                        print(f"[pool] vLLM worker {rank} did not finish graceful shutdown; "
+                              "reaping its process group", flush=True)
                     _stop_vllm_processes(descendants.get(rank, ()))
                     # The wrapper may already be gone while a vLLM EngineCore
                     # grandchild remains alive. Always reap its private group.
@@ -2299,6 +2333,8 @@ class GenerationPool:
             self._async_worker_ids.discard(rank)
             if task_queue is not None:
                 try:
+                    if process is not None and process.exitcode != 0:
+                        task_queue.cancel_join_thread()
                     task_queue.close()
                     task_queue.join_thread()
                 except (AttributeError, OSError, ValueError):
@@ -3040,6 +3076,13 @@ class GenerationPool:
 
     def shutdown(self):
         self._stop_workers(range(self.num_workers))
+        for name in ("result_queue", "_ready_queue", "control_queue"):
+            worker_queue = getattr(self, name)
+            if worker_queue is not None:
+                worker_queue.close()
+                worker_queue.join_thread()
+                setattr(self, name, None)
+        self._worker_options.pop("control_queue", None)
 
 
 class HybridHFGenerationPool:
