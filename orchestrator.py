@@ -19,6 +19,7 @@ import shutil
 import threading
 import time
 from contextlib import nullcontext
+from runtime import trimul_evaluation
 from runtime.host_memory import HostMemoryUnavailable, HostMemoryTimeout
 from pathlib import Path
 from types import SimpleNamespace
@@ -1013,8 +1014,7 @@ def _prepare_recoverable_response_tokens(model, tokenizer, artifacts):
 
 def _finalize_pending_spo_rs_artifacts(
         tokenizer, sampler, step_idx, cfg, exp_dir, problem, gen_pool,
-        spo_rs_tracker, sampling_adapter_path, artifacts, *,
-        prepare_gpu_evaluation=None, parallel_trainer=None):
+        spo_rs_tracker, sampling_adapter_path, artifacts):
     """Evaluate and score a generated interrupted step, then seal its metadata.
 
     No policy sampling occurs here. Exact generated token IDs come from the
@@ -1032,6 +1032,8 @@ def _finalize_pending_spo_rs_artifacts(
     from problems.base import ParentContext, RewardResult
     from search.sampler import State
 
+    if getattr(problem, "problem_type", "") == "trimul":
+        raise RuntimeError("TriMul recovery must use isolated evaluation")
     if cfg.generation_backend != "vllm":
         raise RuntimeError('generated-step SPO-RS recovery requires exact vLLM rollout artifacts')
     if gen_pool is None:
@@ -1133,12 +1135,9 @@ def _finalize_pending_spo_rs_artifacts(
                 isolated_slots.put(cpu_id)
 
     evaluation_pool = ThreadPoolExecutor(max_workers=workers)
-    defer_gpu_evaluation = bool(
-        getattr(cfg, "evaluation_shares_generation", False)
-        and getattr(problem, "problem_type", "") == "trimul")
-    evaluation_futures = ({} if defer_gpu_evaluation else {
+    evaluation_futures = {
         evaluation_pool.submit(evaluate, item): index
-        for index, item in enumerate(artifacts)})
+        for index, item in enumerate(artifacts)}
     results = [None] * len(artifacts)
     live_best_state = sampler.best_raw_state(maximize=bool(problem.maximize))
     live_best_raw = (
@@ -1204,19 +1203,6 @@ def _finalize_pending_spo_rs_artifacts(
                 required_context_ids=range(int(cfg.groups_per_step))))
         if missing_scores or not math.isfinite(divergence):
             raise RuntimeError('generated-step recovery did not obtain every exact consecutive-policy score')
-
-        if defer_gpu_evaluation:
-            # Both benchmark GPUs must be idle, including teacher-forced scoring.
-            gen_pool.release()
-            if prepare_gpu_evaluation is None:
-                raise RuntimeError("TriMul recovery requires the trainer GPU handoff")
-            prepare_gpu_evaluation()
-            parked_pids = (parallel_trainer.parked_cuda_pids() if parallel_trainer is not None
-                           else (os.getpid(),))
-            problem.begin_evaluation_batch(parked_trainer_pids=parked_pids)
-            evaluation_futures = {
-                evaluation_pool.submit(evaluate, item): index
-                for index, item in enumerate(artifacts)}
 
         eval_bar = make_progress_bar(len(evaluation_futures), desc="recovering evaluations")
         try:
@@ -1892,18 +1878,13 @@ def _open_reward_pool(cfg, problem, rollout_count, step_idx, gen_pool,
 
 
 def _prepare_gpu_evaluation(backend, optimizer, cfg, problem, step_idx, count,
-                            *, trainer_parked=False, parallel_trainer=None):
+                            *, trainer_parked=False):
     import gc
     import torch
 
-    is_trimul = getattr(problem, "problem_type", "") == "trimul"
-    parked_pids = (os.getpid(),)
-    if is_trimul and parallel_trainer is not None:
-        parked_pids = parallel_trainer.parked_cuda_pids()
-        trainer_parked = True
+    if getattr(problem, "problem_type", "") == "trimul":
+        raise RuntimeError("TriMul requires the trainer process to exit before evaluation")
     if trainer_parked:
-        if is_trimul:
-            problem.begin_evaluation_batch(parked_trainer_pids=parked_pids)
         return False
     print(f"[step {step_idx}] releasing trainer memory before {count} benchmark(s); "
           "one benchmark at a time per evaluation GPU")
@@ -1924,8 +1905,6 @@ def _prepare_gpu_evaluation(backend, optimizer, cfg, problem, step_idx, count,
             "shared-GPU evaluation requires the trainer to offload before "
             "candidate benchmark evaluation, but this model/runtime "
             "cannot move the training state to CPU") from exc
-    if is_trimul:
-        problem.begin_evaluation_batch(parked_trainer_pids=parked_pids)
     return True
 
 
@@ -2001,10 +1980,14 @@ def _run_frozen_search_pass(backend, model, tokenizer, sampler, optimizer,
         return restored
 
     frozen_dir = Path(exp_dir) / "frozen_solver"
+    is_trimul = getattr(problem, "problem_type", "") == "trimul"
+    isolated_batch = trimul_evaluation.completed_batch(frozen_dir, step_idx) if is_trimul else None
     parents = sampler.sample_states(int(cfg.groups_per_step), selection_step=step_idx,
                                     selection_root=frozen_dir)
     if step_idx == 0:
         _rebind_interrupted_step_zero_selection(sampler, frozen_dir, parents)
+    if isolated_batch is not None:
+        trimul_evaluation.check_parents(frozen_dir, step_idx, parents)
     count = int(cfg.frozen_programs_per_parent)
     sampler_type = ("UCTSampler" if sampler.use_uct else type(sampler).__name__)
     save_parent_selections(
@@ -2073,7 +2056,7 @@ def _run_frozen_search_pass(backend, model, tokenizer, sampler, optimizer,
                 writes.append(writer.submit(
                     save_rollout_artifacts, frozen_dir, step_idx, group, index, text,
                     prompt_text=prompts[group], response_token_ids=ids, pending_meta=meta))
-                future = (None if gpu_shared else
+                future = (None if gpu_shared or is_trimul else
                           submit_reward(text, parent_ctxs[group], final, issue))
                 rows_by_group[group].append((text, final, meta, future))
         if any(len(rows) != count for rows in rows_by_group):
@@ -2082,7 +2065,17 @@ def _run_frozen_search_pass(backend, model, tokenizer, sampler, optimizer,
     try:
         with ThreadPoolExecutor(max_workers=1, thread_name_prefix="frozen-rollout-save") as writer, reward_pool:
             frozen_seed_step = step_idx + 2_000_000
-            if pool is not None:
+            if isolated_batch is not None:
+                for row in isolated_batch["candidates"]:
+                    group = row["group"]
+                    path, text, prompt = trimul_evaluation.read_rollout(frozen_dir, step_idx, row)
+                    if prompt != prompts[group]:
+                        raise RuntimeError(f"Saved frozen-solver prompt differs from {path}")
+                    meta = json.loads(path.with_suffix(".meta.json").read_text(encoding="utf-8"))
+                    rows_by_group[group].append((text, row["final_answer"], meta, None))
+                if any(len(rows) != count for rows in rows_by_group):
+                    raise RuntimeError("saved TriMul batch has an unexpected frozen solver rollout count")
+            elif pool is not None:
                 try:
                     collect(pool.iter_group_jobs(
                         prompts_by_group=prompts, group_size=count,
@@ -2102,14 +2095,23 @@ def _run_frozen_search_pass(backend, model, tokenizer, sampler, optimizer,
                     collect(generate_prompt_jobs(
                         model, tokenizer, prompts, [count] * len(parents), frozen_cfg, **options))
 
-            if gpu_shared and rollout_count:
+            if is_trimul and isolated_batch is None:
+                for write in writes:
+                    write.result()
+                trimul_evaluation.request_batch(
+                    frozen_dir, step_idx, problem, cfg.sandbox_timeout_s,
+                    [{"group": group, "rollout": meta["rollout"], "final_answer": final,
+                      "format_issue": meta["output_format_issue"]}
+                     for group, rows in enumerate(rows_by_group)
+                     for _text, final, meta, _future in rows],
+                    previous_best_raw=float(before.raw_score) if before is not None else None)
+            if gpu_shared and rollout_count and isolated_batch is None:
                 # vLLM already parked the trainer and released generation GPUs.
                 # Keep it parked for the second parent pick and coder pool.
                 offloaded = _prepare_gpu_evaluation(
                     backend, optimizer, cfg, problem, step_idx, rollout_count,
                     trainer_parked=(cfg.generation_backend == "vllm"
-                                    and getattr(pool, "sequential", False)),
-                    parallel_trainer=parallel_trainer)
+                                    and getattr(pool, "sequential", False)))
                 for group, rows in enumerate(rows_by_group):
                     rows_by_group[group] = [
                         (text, final, meta,
@@ -2120,8 +2122,12 @@ def _run_frozen_search_pass(backend, model, tokenizer, sampler, optimizer,
             print(f"[step {step_idx}] waiting for frozen solver evaluations before coder selection", flush=True)
             for group, rows in enumerate(rows_by_group):
                 parent = parents[group]
-                for text, _final, meta, future in rows:
-                    result = future.result()
+                for text, final, meta, future in rows:
+                    if isolated_batch is not None:
+                        path = trimul_evaluation.rollout_path(frozen_dir, step_idx, meta)
+                        result = trimul_evaluation.load_result(path, text, final)
+                    else:
+                        result = future.result()
                     child = State.make(
                         timestep=step_idx, value=float(result.reward),
                         code=result.code or "", raw_score=result.raw_score,
@@ -2174,13 +2180,14 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                strategy_pool=None, strategy_tokenizer=None,
                parallel_trainer=None,
                spo_rs_tracker=None, sampling_adapter_path=None,
-               evaluation_complete=None):
+               evaluation_complete=None, pending_artifacts=None):
     import os
     import torch
-    from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+    from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 
     from search.sampler import State
-    from experiment_io import (save_best_state_snapshot, save_parent_selections,
+    from experiment_io import (load_rollout_logprobs, load_rollout_token_ids,
+                               save_best_state_snapshot, save_parent_selections,
                                save_rollout, save_rollout_artifacts, save_rollout_logprobs)
     from problems.base import is_code_failure
     from generation.gen_workers import make_progress_bar, native_final_answer_scope
@@ -2217,9 +2224,13 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
         frozen_pass = _run_frozen_search_pass(
             backend, model, strategy_tokenizer or tokenizer, sampler, optimizer,
             step_idx, cfg, exp_dir, problem, gen_pool, strategy_pool, parallel_trainer)
+    is_trimul = getattr(problem, "problem_type", "") == "trimul"
+    isolated_batch = trimul_evaluation.completed_batch(exp_dir, step_idx) if is_trimul else None
     parents = sampler.sample_states(int(cfg.groups_per_step), selection_step=step_idx)
     if step_idx == 0 and frozen_pass is None:
         _rebind_interrupted_step_zero_selection(sampler, exp_dir, parents)
+    if isolated_batch is not None or pending_artifacts is not None:
+        trimul_evaluation.check_parents(exp_dir, step_idx, parents)
     print(f"\n[step {step_idx}] parents picked: {len(parents)}")
     for i, info in enumerate(sampler.last_picks_info):
         tag = "seed" if info["is_seed"] else "expanded"
@@ -2393,19 +2404,23 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
     deferred_rollouts = []
     vllm_logprob_records = []
     queued_by_parent = {g: 0 for g in range(len(parents))}
-    defer_gpu_evaluation = bool(getattr(cfg, "evaluation_shares_generation", False))
+    defer_gpu_evaluation = is_trimul or bool(getattr(cfg, "evaluation_shares_generation", False))
 
-    def _submit_rollout(record):
+    def _submit_rollout(record, result=None):
         g = int(record["group_id"])
         group_responses[g].append(record)
-        fut = submit_reward(
-            record["text"], parent_ctxs[record["parent_group"]], record["_final_answer_text"],
-            record["output_format_issue"])
+        if result is None:
+            fut = submit_reward(
+                record["text"], parent_ctxs[record["parent_group"]], record["_final_answer_text"],
+                record["output_format_issue"])
+        else:
+            fut = Future()
+            fut.set_result(result)
         reward_futures[g].append(fut)
         record["_reward_future"] = fut
         fut.add_done_callback(
             lambda completed, rollout=record:
-            _record_evaluation_completion(completed, rollout))
+            _record_evaluation_completion(completed, rollout if result is None else None))
         return fut
 
     def _queue_rollout(job_idx, text, token_ids, behavior_logprobs=None):
@@ -2454,22 +2469,22 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
             "model_name": cfg.coder_model_name,
         }
         record["_pending_meta"] = pending_meta
-        save_future = rollout_io_pool.submit(
-            save_rollout_artifacts,
-            exp_dir, step_idx, group_id, rollout_index, text,
-            prompt_text=job["prompt_text"],
-            response_token_ids=token_ids,
-            behavior_logprobs=behavior_logprobs,
-            pending_meta=pending_meta,
-        )
-        record["_artifact_save_future"] = save_future
-        rollout_io_futures.append(save_future)
+        if isolated_batch is None:
+            rollout_io_futures.append(rollout_io_pool.submit(
+                save_rollout_artifacts,
+                exp_dir, step_idx, group_id, rollout_index, text,
+                prompt_text=job["prompt_text"],
+                response_token_ids=token_ids,
+                behavior_logprobs=behavior_logprobs,
+                pending_meta=pending_meta,
+            ))
         if (training_enabled and cfg.generation_backend == "vllm" and token_ids):
             vllm_logprob_records.append(record)
         if defer_gpu_evaluation:
             deferred_rollouts.append(record)
         else:
             _submit_rollout(record)
+        return record
 
     # ----- ROLLOUTS (streamed) + dispatch rewards as each rollout lands -----
     rollout_t0 = time.time()
@@ -2477,7 +2492,32 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
     coder_phase_complete = False
     try:
         try:
-            if gen_pool is not None:
+            if isolated_batch is not None or pending_artifacts is not None:
+                saved_rows = (isolated_batch["candidates"] if isolated_batch is not None
+                              else [item["meta"] for item in pending_artifacts])
+                for row in saved_rows:
+                    group = int(row["group"])
+                    path, text, prompt = trimul_evaluation.read_rollout(exp_dir, step_idx, row)
+                    index = queued_by_parent[group]
+                    if int(row["rollout"]) != index:
+                        raise RuntimeError(f"Unexpected saved TriMul rollout order: {path}")
+                    if index == 0:
+                        prompt_jobs[group]["prompt_text"] = prompt
+                    elif prompt != prompt_jobs[group]["prompt_text"]:
+                        raise RuntimeError(f"Inconsistent saved TriMul prompt: {path}")
+                    behavior_path = path.with_suffix(".behavior_logprobs.zlib")
+                    record = _queue_rollout(
+                        group, text, load_rollout_token_ids(path.with_suffix(".tokens.zlib")),
+                        load_rollout_logprobs(behavior_path) if behavior_path.is_file() else None)
+                    if isolated_batch is not None:
+                        if (record["_final_answer_text"] != row["final_answer"]
+                                or record["output_format_issue"] != row["format_issue"]):
+                            raise RuntimeError(f"Restored TriMul answer scope differs from {path}")
+                        if row["has_reference_logprobs"]:
+                            record["reference_logprobs"] = load_rollout_logprobs(
+                                path.with_suffix(".reference_logprobs.zlib"))
+                print(f"[step {step_idx}] restored {len(saved_rows)} saved TriMul rollouts", flush=True)
+            elif gen_pool is not None:
                 generation_options = {
                     "prompts_by_group": [job["prompt_text"] for job in prompt_jobs],
                     "group_size": cfg.group_size,
@@ -2529,12 +2569,18 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
             if incomplete:
                 raise RuntimeError(
                     f"expected {int(cfg.group_size)} planned rollouts per parent; got {incomplete}")
-            print(f"[step {step_idx}] coder generation complete: {total_rollouts} rollouts", flush=True)
+            if isolated_batch is None and pending_artifacts is None:
+                print(f"[step {step_idx}] coder generation complete: {total_rollouts} rollouts", flush=True)
 
             # CPU reward processes were submitted as each rollout arrived and
             # continue running here. Keep vLLM awake and use that same interval
             # to score fixed base/reference token logprobs without the adapter.
-            if cfg.generation_backend == "vllm" and vllm_logprob_records:
+            if isolated_batch is not None:
+                scoring = isolated_batch["scoring"]
+                spo_rs_divergence = scoring["divergence"]
+                spo_rs_context_divergences = {int(key): value for key, value in scoring["context_divergences"].items()}
+                spo_rs_missing_policy_scores = scoring["missing_policy_scores"]
+            elif cfg.generation_backend == "vllm" and vllm_logprob_records:
                 scoring_started = time.time()
                 eval_done_before = sum(future.done() for futures in reward_futures.values() for future in futures)
                 prompt_token_ids = {}
@@ -2670,12 +2716,38 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                 else:
                     gen_pool.release()
 
-        if deferred_rollouts:
+        if is_trimul and isolated_batch is None:
+            for write in rollout_io_futures:
+                write.result()
+            candidates = []
+            for record in deferred_rollouts:
+                reference = record["reference_logprobs"]
+                row = {
+                    "group": record["group_id"], "rollout": record["rollout_index"],
+                    "final_answer": record["_final_answer_text"],
+                    "format_issue": record["output_format_issue"],
+                    "has_reference_logprobs": reference is not None,
+                }
+                if reference is not None:
+                    path = trimul_evaluation.rollout_path(exp_dir, step_idx, row)
+                    save_rollout_logprobs(path.with_suffix(".reference_logprobs.zlib"), reference)
+                candidates.append(row)
+            trimul_evaluation.request_batch(
+                exp_dir, step_idx, problem, cfg.sandbox_timeout_s, candidates,
+                divergence=spo_rs_divergence, context_divergences=spo_rs_context_divergences,
+                missing_policy_scores=spo_rs_missing_policy_scores, previous_best_raw=live_best_raw,
+                rollout_seconds=time.time() - rollout_t0)
+
+        if isolated_batch is not None:
+            for row, record in zip(isolated_batch["candidates"], deferred_rollouts):
+                path = trimul_evaluation.rollout_path(exp_dir, step_idx, row)
+                _submit_rollout(record, trimul_evaluation.load_result(
+                    path, record["text"], record["_final_answer_text"]))
+        elif deferred_rollouts:
             evaluation_trainer_offloaded = _prepare_gpu_evaluation(
                 backend, optimizer, cfg, problem, step_idx, len(deferred_rollouts),
                 trainer_parked=(not training_enabled and cfg.generation_backend == "vllm"
-                                and getattr(gen_pool, "sequential", False)),
-                parallel_trainer=parallel_trainer)
+                                and getattr(gen_pool, "sequential", False)))
             for record in deferred_rollouts:
                 _submit_rollout(record)
 
@@ -3196,6 +3268,8 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
 
 
     rollout_time = time.time() - rollout_t0
+    if isolated_batch is not None:
+        rollout_time += isolated_batch["scoring"]["rollout_seconds"] + isolated_batch["evaluation_seconds"]
     training_label = (str(len(all_examples)) if training_enabled else "disabled")
     rollout_phase_label = (
         "rollout+eval+overlapped-backward wall time"
@@ -3416,6 +3490,14 @@ def main():
     startup_log = StartupLog()
     with startup_log.capture():
         cfg, merged = load_config()
+        from runtime.gpu_runtime import GPU_PROBLEM_NAMES
+        is_trimul = (str(cfg.problem).lower() in GPU_PROBLEM_NAMES
+                     and str(getattr(cfg, "problem_type", "trimul")).lower() == "trimul")
+        if is_trimul and not os.environ.get("TTT_SUPERVISOR_EVAL_FILE"):
+            script = Path(__file__).resolve()
+            supervisor = script.parent / "runtime" / "run_supervisor.py"
+            os.execv(sys.executable, [sys.executable, str(supervisor), "--",
+                                      sys.executable, str(script), *sys.argv[1:]])
         # This must precede every import path that can initialize CUDA. Worker
         # and evaluation children set their own physical groups before import.
         _pin_training_process(cfg.training_gpu_ids)
@@ -3459,6 +3541,15 @@ def main():
     print = startup_log.print
     terminal_log_path = str(Path(exp_dir).resolve() / "temirnal.log")
     terminal_log.bind(terminal_log_path)
+    if is_trimul and resume_dir and restart_step < cfg.num_steps:
+        from runtime.run_supervisor import request_evaluation
+        try:
+            if cfg.frozen_solver:
+                trimul_evaluation.completed_batch(Path(exp_dir) / "frozen_solver", restart_step)
+            trimul_evaluation.completed_batch(exp_dir, restart_step)
+        except trimul_evaluation.EvaluationHandoff as handoff:
+            request_evaluation(handoff.path)
+            return
     if cfg.generation_backend == "vllm":
         from runtime.host_memory import validate_memory_handoff_runtime
         runtime = validate_memory_handoff_runtime(__file__)
@@ -3679,6 +3770,8 @@ def main():
     interrupted_spo_rs_artifacts = None
     start_step = 0
     current_policy_adapter_path = None
+    recover_spo_rs = (_is_spo_rs_mode(configured_advantage_mode)
+                      and not (is_trimul and cfg.no_train))
     if resume_dir:
         resume_payload = _load_training_checkpoint(exp_dir, mmap=True)
         if resume_payload is not None:
@@ -3689,7 +3782,7 @@ def main():
             print(f"[resume] training checkpoint found; next step is {start_step}")
             if resume_payload["version"] == 1:
                 print('[resume] legacy batch-growth state ignored; using fixed configured batch sizes')
-            if _is_spo_rs_mode(configured_advantage_mode):
+            if recover_spo_rs:
                 interrupted_spo_rs_artifacts = (_recoverable_spo_rs_artifacts(exp_dir, start_step, cfg))
                 if interrupted_spo_rs_artifacts is not None:
                     token_recovery = (
@@ -3708,7 +3801,7 @@ def main():
                         flush=True,
                     )
         else:
-            if _is_spo_rs_mode(configured_advantage_mode):
+            if recover_spo_rs:
                 interrupted_spo_rs_artifacts = (_recoverable_spo_rs_artifacts(exp_dir, 0, cfg))
             initial_adapter = Path(exp_dir) / "adapter_initial"
             recreated_initial_adapter = False
@@ -3869,6 +3962,13 @@ def main():
                   f"v={initialization['value_after']:.9f}, "
                   f"N_eff={initialization['effective_count_after']:.2f}; "
                   "step 0 policy update enabled", flush=True)
+
+    if is_trimul and resume_payload is None:
+        if current_policy_adapter_path is None:
+            current_policy_adapter_path = Path(_save_adapter(
+                model, exp_dir, start_step, directory_name="adapter_initial"))
+        _save_training_checkpoint(exp_dir, start_step, current_policy_adapter_path,
+                                  sampler, optimizer, spo_rs_tracker)
 
     del resume_payload
     from runtime.host_memory import reclaim_unused_host_memory
@@ -4277,6 +4377,7 @@ def main():
     if cumulative_training_seconds:
         print(f'[resume] prior cumulative training time: {cumulative_training_seconds:.1f}s')
     restart_for_exact_recovery = False
+    evaluation_handoff = None
     active_step = None
     try:
         if start_step >= cfg.num_steps:
@@ -4288,12 +4389,12 @@ def main():
                 f"[step {step}] batch: G={cfg.groups_per_step} K={cfg.group_size} "
                 f"({cfg.groups_per_step * cfg.group_size} coder rollouts)", flush=True)
 
-            if (resume_dir and step == start_step
-                    and _is_spo_rs_mode(configured_advantage_mode)):
+            if resume_dir and step == start_step and recover_spo_rs:
                 pending_spo_rs_artifacts = None
                 if interrupted_spo_rs_artifacts is None:
                     interrupted_spo_rs_artifacts = (_recoverable_spo_rs_artifacts(exp_dir, step, step_cfg))
-                if interrupted_spo_rs_artifacts is None:
+                if (interrupted_spo_rs_artifacts is None
+                        and not (is_trimul and trimul_evaluation.batch_path(exp_dir, step).is_file())):
                     pending_spo_rs_artifacts = (_recoverable_pending_spo_rs_artifacts(exp_dir, step, step_cfg))
             else:
                 interrupted_spo_rs_artifacts = None
@@ -4309,7 +4410,8 @@ def main():
                                    prepare_jev_trainer)
 
             frozen_pass = None
-            if cfg.frozen_solver and (interrupted_spo_rs_artifacts or pending_spo_rs_artifacts):
+            if cfg.frozen_solver and (interrupted_spo_rs_artifacts
+                                      or (pending_spo_rs_artifacts and not is_trimul)):
                 frozen_pass = _restore_frozen_archive(sampler, exp_dir, step)
                 if frozen_pass is None:
                     raise RuntimeError("coder rollout recovery requires the saved post-frozen archive")
@@ -4320,7 +4422,7 @@ def main():
                     spo_rs_tracker, current_policy_adapter_path,
                     interrupted_spo_rs_artifacts,
                     evaluation_complete=step_plotter.submit, frozen_pass=frozen_pass)
-            elif pending_spo_rs_artifacts is not None:
+            elif pending_spo_rs_artifacts is not None and not is_trimul:
                 print(
                     f"[resume] found {len(pending_spo_rs_artifacts)} exact "
                     f"saved trajectories for interrupted SPO-RS step {step}; "
@@ -4332,12 +4434,7 @@ def main():
                         tokenizer, sampler, step, step_cfg, exp_dir, problem,
                         gen_pool, spo_rs_tracker,
                         current_policy_adapter_path,
-                        pending_spo_rs_artifacts,
-                        parallel_trainer=parallel_trainer,
-                        prepare_gpu_evaluation=(
-                            _offload_trainer_for_generation
-                            if getattr(problem, "problem_type", "") == "trimul"
-                            else None)))
+                        pending_spo_rs_artifacts))
                 stats = _resume_spo_rs_step_from_artifacts(
                     model, tokenizer, sampler, step,
                     step_cfg, exp_dir, problem, parallel_trainer,
@@ -4355,7 +4452,8 @@ def main():
                     sampling_adapter_path=(
                         current_policy_adapter_path
                         if _is_spo_rs_mode(configured_advantage_mode) else None),
-                    evaluation_complete=step_plotter.submit)
+                    evaluation_complete=step_plotter.submit,
+                    pending_artifacts=pending_spo_rs_artifacts)
 
             stats = stats or {}
             step_training_seconds = float(stats.get("training_seconds", 0.0) or 0.0)
@@ -4393,6 +4491,13 @@ def main():
                 **(stats or {}),
             }
             save_step_summary(exp_dir, step, step_summary)
+            if is_trimul:
+                batch_path = trimul_evaluation.batch_path(exp_dir, step)
+                batch_path.unlink(missing_ok=True)
+                for sidecar in batch_path.parent.glob("*.reference_logprobs.zlib"):
+                    sidecar.unlink(missing_ok=True)
+                if cfg.frozen_solver:
+                    trimul_evaluation.batch_path(Path(exp_dir) / "frozen_solver", step).unlink(missing_ok=True)
             if cfg.frozen_solver:
                 _frozen_archive_path(exp_dir, step).unlink(missing_ok=True)
             append_step_result(exp_dir, step, step_summary)
@@ -4448,6 +4553,9 @@ def main():
                     flush=True,
                 )
                 delattr(cfg, "_exact_replica_recovery_step")
+    except trimul_evaluation.EvaluationHandoff as handoff:
+        evaluation_handoff = handoff.path
+        print(f"[step {active_step}] saved TriMul candidates; shutting down all model processes", flush=True)
     except ExactLongContextTrainingOOM as error:
         if active_step is None or not _is_spo_rs_mode(configured_advantage_mode):
             raise
@@ -4486,8 +4594,12 @@ def main():
             gen_pool.shutdown()
         if parallel_trainer is not None:
             print("[shutdown] stopping process-distributed trainer ...")
-            parallel_trainer.shutdown(for_restart=restart_for_exact_recovery)
+            parallel_trainer.shutdown(for_restart=(restart_for_exact_recovery or evaluation_handoff is not None))
 
+    if evaluation_handoff is not None:
+        from runtime.run_supervisor import request_evaluation
+        request_evaluation(evaluation_handoff)
+        return
     if restart_for_exact_recovery:
         _restart_for_exact_resume(exp_dir)
 

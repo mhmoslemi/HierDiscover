@@ -16,7 +16,7 @@ class GPUNotIdle(RuntimeError):
     """Benchmark admission failed before timing any program."""
 
 
-def _gpu_busy_reason(gpu_id: int, parked_trainer_pids) -> str:
+def _gpu_busy_reason(gpu_id: int) -> str:
     try:
         output = subprocess.run(
             ["nvidia-smi", "-q", "-x", "-i", str(gpu_id)],
@@ -29,38 +29,27 @@ def _gpu_busy_reason(gpu_id: int, parked_trainer_pids) -> str:
         processes = gpu.find("processes")
         if processes is None or (processes.text or "").strip():
             raise ValueError("process list is unavailable")
-        by_pid = {int(process.findtext("pid", "")): process
-                  for process in processes.findall("process_info")}
-        parked_mib = sum(
-            int(by_pid[pid].findtext("used_memory", "").split()[0])
-            for pid in by_pid.keys() & parked_trainer_pids
-        )
+        pids = sorted({int(process.findtext("pid", "")) for process in processes})
     except (OSError, subprocess.SubprocessError, ElementTree.ParseError, ValueError, IndexError) as exc:
         raise GPUNotIdle(f"Could not verify physical GPU {gpu_id} before benchmarking: {exc}") from exc
 
-    foreign_pids = sorted(by_pid.keys() - parked_trainer_pids)
-    # Parked CUDA/NCCL contexts retain VRAM even when the GPU is idle.
-    unattributed_mib = max(0, used_mib - parked_mib)
-    if not (gpu_util or memory_util or foreign_pids or unattributed_mib > 512):
+    if not (gpu_util or memory_util or pids or used_mib):
         return ""
     return (f"GPU utilization {gpu_util}%, memory activity {memory_util}%, "
-            f"VRAM {used_mib} MiB ({parked_mib} MiB parked trainer, "
-            f"{unattributed_mib} MiB outside the parked trainer), "
-            f"GPU PIDs {sorted(by_pid)}, non-trainer PIDs {foreign_pids}")
+            f"used VRAM {used_mib} MiB, GPU PIDs {pids}")
 
 
-def wait_for_idle_gpu(gpu_id: int, parked_trainer_pids=(), *, on_busy=None) -> None:
-    """Admit a benchmark only when the leased physical GPU has quiesced."""
-    parked_trainer_pids = frozenset(parked_trainer_pids)
+def wait_for_idle_gpu(gpu_id: int, *, on_busy=None) -> None:
+    """Admit a benchmark only when the GPU reports zero used VRAM and no processes."""
     deadline = time.monotonic() + 30.0
-    reason = _gpu_busy_reason(gpu_id, parked_trainer_pids)
+    reason = _gpu_busy_reason(gpu_id)
     if reason:
         print(f"[gpu-eval] waiting for physical GPU {gpu_id}: {reason}", flush=True)
         if on_busy is not None:
             on_busy()
     while reason and time.monotonic() < deadline:
         time.sleep(0.5)
-        reason = _gpu_busy_reason(gpu_id, parked_trainer_pids)
+        reason = _gpu_busy_reason(gpu_id)
     if reason:
         raise GPUNotIdle(f"Physical GPU {gpu_id} stayed busy before benchmarking: {reason}")
 

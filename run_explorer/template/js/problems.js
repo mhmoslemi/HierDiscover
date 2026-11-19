@@ -148,7 +148,25 @@ function setupProblem() {
   // facts about the run
   const roots = (TREE.roots || []).map(i => TREE.nodes[i][1]).filter(x => x > 0);
   PROB.rawForReward = reward => (CFG.score_scale || PROB.rewardScale || 1) / reward;
-  if (Array.isArray(CFG.erdos_reward_anchors)) {
+  if (Array.isArray(CFG.trimul_reward_points)) {
+    const [seed, middle, goal] = CFG.trimul_reward_points;
+    PROB.seedRewardFixed = seed[1];
+    PROB.rawForReward = reward => {
+      const [[slow, slowReward], [fast, fastReward]] =
+        reward <= middle[1] ? [seed, middle] : [middle, goal];
+      const fraction = (1 / reward - 1 / fastReward) / (1 / slowReward - 1 / fastReward);
+      const raw = fast + fraction * (slow - fast);
+      return reward > 0 && Number.isFinite(raw) && raw >= 0 ? raw : null;
+    };
+    const points = CFG.trimul_reward_points.map(([raw, reward]) => `${raw} µs → ${reward}`).join(", ");
+    PROB.rewardShort = "TriMul reward curve";
+    PROB.rewardText = `${points}. Failed programs get reward 0.`;
+    PROB.evalEq = PROB.evalEq.split("\n")[0] + `\n${points}\n1 / reward is linear in runtime within each segment.`;
+    PROB.evalBody = `<p>The evaluator checks each kernel and measures its ${PROB.metric}. ${PROB.rewardText}</p>`;
+    PROB.evalRefs = ["problems/gpu_mode.py (GpuMode._runtime_reward)", "problems/base.py (TRIMUL_REWARD_POINTS)"];
+    const parents = CFG.seed_from_reference ? "reference kernels" : "empty archive roots";
+    PROB.seedText = `${parents} with a synthetic ${seed[0]} µs SPO-RS anchor`;
+  } else if (Array.isArray(CFG.erdos_reward_anchors)) {
     const [seed, goal] = CFG.erdos_reward_anchors;
     PROB.seedRewardFixed = 2;
     PROB.rawForReward = reward => {

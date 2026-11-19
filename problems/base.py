@@ -17,8 +17,10 @@ from evaluation.sandbox import run_code
 
 ERDOS_REWARD_ANCHORS = {
     "ac1": (2.0, 1.5026),
-    "trimul": (7000.0, 550.0),  # microseconds
 }
+
+# (runtime in microseconds, reward), from slowest to fastest.
+TRIMUL_REWARD_POINTS = ((6500.0, 2.0), (2800.0, 2.4), (550.0, 5.0))
 
 
 def erdos_scaled_reward(raw_score: float, seed_score: float, goal_score: float) -> float:

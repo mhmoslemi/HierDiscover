@@ -1,7 +1,7 @@
 """
 Kernel Engineering (GPU Mode: trimul / mla_decode_nvidia).
 
-  - problem_type "trimul": reward calibrated to the Erdős seed and goal
+  - problem_type "trimul": reward calibrated at three benchmark runtimes
   - problem_type "mla_decode_nvidia": reward = score_scale / runtime_us
 
 Needs:
@@ -35,7 +35,7 @@ import time
 from typing import Any, Dict, List, Optional
 from examples.gpu_mode.seeds import MLA_DECODE_INITIAL_STATE, MLA_DECODE_INITIAL_VALUE
 from problems.base import (
-    ERDOS_REWARD_ANCHORS, ParentContext, Problem, RewardResult, SeedState, erdos_scaled_reward,
+    TRIMUL_REWARD_POINTS, ParentContext, Problem, RewardResult, SeedState, erdos_scaled_reward,
 )
 from prompts.task import mla_decode_nvidia, trimul
 from prompts.utils import render_state_context
@@ -246,7 +246,7 @@ def _terminate_eval_process_tree(proc, grace_seconds: float = 3.0) -> None:
 def _watch_eval_owner(owner_pid: int) -> None:
     while os.getppid() == owner_pid:
         time.sleep(1)
-    # The trainer vanished without cleanup; no benchmark may outlive it.
+    # The batch coordinator vanished without cleanup.
     os.killpg(os.getpid(), signal.SIGKILL)
 
 
@@ -479,8 +479,11 @@ class GpuMode(Problem):
         if self.problem_type not in _DEFAULTS:
             raise ValueError(f"problem_type must be one of {list(_DEFAULTS)}, "
                              f"got {self.problem_type}")
-        self._reward_anchors = (cfg.get("erdos_reward_anchors", ERDOS_REWARD_ANCHORS["trimul"])
-                                if self.problem_type == "trimul" else None)
+        self._reward_points = self._legacy_reward_anchors = None
+        if self.problem_type == "trimul":
+            self._legacy_reward_anchors = cfg.get("erdos_reward_anchors")
+            default_points = None if "erdos_reward_anchors" in cfg else TRIMUL_REWARD_POINTS
+            self._reward_points = cfg.get("trimul_reward_points", default_points)
         d = _DEFAULTS[self.problem_type]
         self.gpu_type = str(cfg.get("gpu_type", d["gpu_type"]))
         self.triton_version = str(cfg.get("triton_version", "3.3.1"))
@@ -498,7 +501,8 @@ class GpuMode(Problem):
                                    cfg.get("lib_dir", "examples/gpu_mode/lib")))
         if self.target is None:
             self.target = float(d["target"]) * f
-        if (self._reward_anchors is None and abs(f - 1.0) > 1e-9
+        if (self._reward_points is None and self._legacy_reward_anchors is None
+                and abs(f - 1.0) > 1e-9
                 and ("target" not in cfg or "score_scale" not in cfg)):
             print(f"[gpu_mode] {self.gpu_type}: scaled H100 defaults by {f:.2f}x "
                   f"-> target={self.target:.0f}us, score_scale={self.score_scale:.0f} "
@@ -536,15 +540,13 @@ class GpuMode(Problem):
             self._kernel_gpu_slots.put(gpu_id)
         self.gpu_lease_timeout_s = float(cfg.get("gpu_lease_timeout_s", 0.0))
         self._verified_kernel_environments = {}
-        self._parked_trainer_pids = ()
         self._gpu_idle_error = None
         # entrypoint is implicit (custom_kernel inside submission.py)
         self.entrypoint = "custom_kernel"
 
-    def begin_evaluation_batch(self, *, parked_trainer_pids=()):
+    def begin_evaluation_batch(self):
         """Check all TriMul devices after generation and training handoff."""
         self._verified_kernel_environments.clear()
-        self._parked_trainer_pids = tuple(parked_trainer_pids)
         self._gpu_idle_error = None
         if self.problem_type == "trimul":
             removed = _reap_orphaned_kernel_evaluators(self.kernel_gpu_ids)
@@ -552,16 +554,16 @@ class GpuMode(Problem):
                 print(f"[gpu-eval] removed {removed} orphaned evaluator tree(s)",
                       flush=True)
             for gpu_id in self.kernel_gpu_ids:
-                with gpu_lease(gpu_id, self.gpu_lease_timeout_s, purpose="TriMul preflight"):
+                with gpu_lease(gpu_id, self.gpu_lease_timeout_s, purpose="TriMul idle check"):
                     self._wait_for_benchmark_gpu(gpu_id)
-            print(f"[gpu-eval] TriMul idle check passed on physical GPUs {self.kernel_gpu_ids}",
-                  flush=True)
+            print(f"[gpu-eval] physical GPUs {self.kernel_gpu_ids}: "
+                  "0 MiB used, 0% activity, no GPU processes", flush=True)
 
     def _wait_for_benchmark_gpu(self, gpu_id):
         if self._gpu_idle_error is not None:
             raise GPUNotIdle(self._gpu_idle_error)
         try:
-            wait_for_idle_gpu(gpu_id, self._parked_trainer_pids,
+            wait_for_idle_gpu(gpu_id,
                               on_busy=lambda: _reap_orphaned_kernel_evaluators((gpu_id,)))
         except GPUNotIdle as exc:
             # queued candidates should not each repeat the wait on a blocked batch
@@ -628,8 +630,14 @@ class GpuMode(Problem):
                             construction=[], failure_kind=failure_kind)
 
     def _runtime_reward(self, runtime_us: float) -> float:
-        if self._reward_anchors is not None:
-            return erdos_scaled_reward(runtime_us, *self._reward_anchors)
+        if self._reward_points is not None:
+            seed, middle, goal = self._reward_points
+            (slow_us, slow_reward), (fast_us, fast_reward) = (
+                (seed, middle) if runtime_us >= middle[0] else (middle, goal))
+            fraction = (runtime_us - fast_us) / (slow_us - fast_us)
+            return 1.0 / (1.0 / fast_reward + fraction * (1.0 / slow_reward - 1.0 / fast_reward))
+        if self._legacy_reward_anchors is not None:
+            return erdos_scaled_reward(runtime_us, *self._legacy_reward_anchors)
         return self.score_scale / runtime_us
 
     def compute_reward(self, response_text: str, parent: ParentContext,
@@ -790,9 +798,12 @@ class GpuMode(Problem):
                 for _ in range(self.num_seed_states)]
 
     def initial_spo_rs_rewards(self, seeds: List[SeedState]) -> List[float]:
-        if self._reward_anchors is None:
+        if self._reward_points is not None:
+            seed_runtime = self._reward_points[0][0]
+        elif self._legacy_reward_anchors is not None:
+            seed_runtime = self._legacy_reward_anchors[0]
+        else:
             return super().initial_spo_rs_rewards(seeds)
-        seed_runtime = self._reward_anchors[0]
         reward = self._runtime_reward(seed_runtime)
         print(f"[init] TriMul SPO-RS seed anchor: synthetic runtime "
               f"{seed_runtime:g} us, reward={reward:.9f}", flush=True)

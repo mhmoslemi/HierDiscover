@@ -1421,12 +1421,6 @@ class ProcessDistributedTrainer:
     def is_offloaded(self):
         return self._offloaded
 
-    def parked_cuda_pids(self):
-        if not self._workers_idle or len(self._offloaded_ranks) != self._world_size:
-            raise RuntimeError("GPU benchmarking requires every trainer replica to be parked")
-        return (os.getpid(), *(process.pid for process in self._processes.values()
-                               if process.is_alive()))
-
     def estimated_host_offload_bytes(self, *, frozen_to_disk=False):
         """RAM required to move every live trainer replica off its GPU."""
         from runtime.host_memory import (GIB, estimated_module_bytes, estimated_optimizer_bytes)
@@ -2791,15 +2785,9 @@ class ProcessDistributedTrainer:
     def _terminate_workers_for_restart(self):
         """Stop child ranks without entering another distributed collective.
 
-        Exact-overflow recovery is durable before its restart request is
-        raised.  At that point the current process will be replaced with
-        ``exec``, so a graceful NCCL barrier is both unnecessary and unsafe:
-        one child missing the matching barrier would prevent the recovery
-        process from ever starting.  Use one bounded deadline for all ranks,
-        then force-kill any child that ignored SIGTERM.  Deliberately leave
-        rank zero's process group intact; ``exec`` replaces the process and
-        releases that CUDA/NCCL state without another potentially blocking
-        distributed operation.
+        The saved state is already durable. The owner exits or replaces itself
+        to release rank zero's CUDA/NCCL state. Use a bounded deadline for the
+        other ranks so a missing rank cannot hang a shutdown collective.
         """
         import time
 
