@@ -3,7 +3,7 @@
 The main process is distributed rank 0. Persistent spawned workers own the
 remaining GPUs, so transformer forward/checkpoint recomputation on different
 cards does not contend for one Python interpreter. Only LoRA gradients and
-parameters are communicated, each as one flattened NCCL buffer per update.
+parameters are communicated, using bounded FP32 NCCL buffers.
 """
 
 from types import SimpleNamespace
@@ -17,6 +17,7 @@ LONG_ROLLOUT_MEMORY_FRACTION = 0.96
 LONG_ROLLOUT_MEMORY_FRACTIONS = (0.96, 0.98, 0.99)
 MAX_LONG_ROLLOUT_MEMORY_FRACTION = max(LONG_ROLLOUT_MEMORY_FRACTIONS)
 SHARED_PREFIX_WORK_KEY = "__ttt_shared_prefix_examples__"
+_FP32_BUCKET_ELEMENTS = 32 * 1024**2
 
 
 def _shared_prefix_examples(batch):
@@ -187,60 +188,72 @@ def set_long_rollout_memory_ceiling(
         label="long-rollout rescue")
 
 
+def parameter_buckets(parameters):
+    """Keep small adapters in one collective and group large ones by memory."""
+    bucket = []
+    elements = 0
+    for parameter in parameters:
+        count = parameter.numel()
+        if bucket and elements + count > _FP32_BUCKET_ELEMENTS:
+            yield bucket
+            bucket, elements = [], 0
+        bucket.append(parameter)
+        elements += count
+    if bucket:
+        yield bucket
+
+
 def broadcast_trainable_parameters(model, source_rank=0):
-    """Broadcast all LoRA parameters with one contiguous NCCL operation."""
     import torch
     import torch.distributed as dist
 
     parameters = trainable_parameters(model)
     if not parameters:
         raise RuntimeError("fast trainer found no trainable parameters")
-    flat = torch.cat([
-        parameter.detach().reshape(-1).to(dtype=torch.float32)
-        for parameter in parameters
-    ])
-    dist.broadcast(flat, src=int(source_rank))
-    if dist.get_rank() != int(source_rank):
-        offset = 0
-        with torch.no_grad():
-            for parameter in parameters:
-                count = parameter.numel()
-                parameter.copy_(
-                    flat[offset:offset + count].view_as(parameter).to(
-                        dtype=parameter.dtype))
-                offset += count
-    del flat
+    is_source = dist.get_rank() == int(source_rank)
+    with torch.no_grad():
+        for bucket in parameter_buckets(parameters):
+            sizes = [parameter.numel() for parameter in bucket]
+            flat = torch.empty(sum(sizes), device=bucket[0].device, dtype=torch.float32)
+            parts = flat.split(sizes)
+            if is_source:
+                for parameter, part in zip(bucket, parts):
+                    part.view_as(parameter).copy_(parameter)
+            dist.broadcast(flat, src=int(source_rank))
+            if not is_source:
+                for parameter, part in zip(bucket, parts):
+                    parameter.copy_(part.view_as(parameter))
+            del part, parts, flat
 
 
 def reduce_trainable_gradients(model, destination_rank=0, *, group=None):
-    """Sum LoRA gradients into the destination with one collective."""
+    """Sum LoRA gradients in FP32 before copying back to parameter dtype."""
     import torch
     import torch.distributed as dist
 
     parameters = trainable_parameters(model)
     if not parameters:
         raise RuntimeError("fast trainer found no trainable parameters")
-    flat = torch.cat([
-        ((parameter.grad.detach() if parameter.grad is not None
-          else torch.zeros_like(parameter)).reshape(-1).to(
-              dtype=torch.float32))
-        for parameter in parameters
-    ])
-    dist.reduce(flat, dst=int(destination_rank), op=dist.ReduceOp.SUM, group=group)
-    if dist.get_rank() == int(destination_rank):
-        offset = 0
-        with torch.no_grad():
-            for parameter in parameters:
-                count = parameter.numel()
-                reduced = flat[offset:offset + count].view_as(parameter).to(
-                    dtype=parameter.dtype)
+    is_destination = dist.get_rank() == int(destination_rank)
+    with torch.no_grad():
+        for bucket in parameter_buckets(parameters):
+            sizes = [parameter.numel() for parameter in bucket]
+            flat = torch.empty(sum(sizes), device=bucket[0].device, dtype=torch.float32)
+            parts = flat.split(sizes)
+            for parameter, part in zip(bucket, parts):
                 if parameter.grad is None:
-                    parameter.grad = torch.empty_like(parameter)
-                parameter.grad.copy_(reduced)
-                offset += count
-    else:
-        model.zero_grad(set_to_none=True)
-    del flat
+                    part.zero_()
+                else:
+                    part.view_as(parameter).copy_(parameter.grad)
+            dist.reduce(flat, dst=int(destination_rank), op=dist.ReduceOp.SUM, group=group)
+            for parameter, part in zip(bucket, parts):
+                if is_destination:
+                    if parameter.grad is None:
+                        parameter.grad = torch.empty_like(parameter)
+                    parameter.grad.copy_(part.view_as(parameter))
+                else:
+                    parameter.grad = None
+            del part, parts, flat
 
 
 def _padded_token_count(batch):
@@ -1390,6 +1403,8 @@ def _move_optimizer_state(optimizer, device, *, hardware_profile="RTX6000") -> N
 
 def _restore_optimizer_state_to_parameters(optimizer) -> None:
     """Return each optimizer tensor to the device of its sharded parameter."""
+    if getattr(optimizer, "moments_on_host", False):
+        return
     import torch
 
     def move(value, device):

@@ -1223,8 +1223,18 @@ class UnslothBackend(_ModelPlacementBackend):
             print("[precision] verified packed MXFP4 bytes and scales in all "
                   f"{model.config.num_hidden_layers} expert layers", flush=True)
         _validate_gpt_oss_training_attention(model, self.cfg)
-        target_modules = _resolve_lora_target_modules(
-            self.cfg, getattr(model, "config", None))
+        shared_lora = packed_mxfp4 and bool(getattr(self.cfg, "gpt_oss_shared_lora", False))
+        adapter_options = {}
+        if shared_lora:
+            from models.gpt_oss_lora import ATTENTION_AND_HEAD_TARGETS, install_shared_expert_lora
+            target_modules = ATTENTION_AND_HEAD_TARGETS
+            # These expert parameters are attached in their shared layout below.
+            adapter_options["target_parameters"] = []
+            self.cfg.effective_target_modules = (
+                "q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj", "lm_head")
+        else:
+            target_modules = _resolve_lora_target_modules(
+                self.cfg, getattr(model, "config", None))
         print("[backend=unsloth] attaching LoRA ...")
         model = FastLanguageModel.get_peft_model(
             model,
@@ -1235,7 +1245,11 @@ class UnslothBackend(_ModelPlacementBackend):
             bias="none",
             use_gradient_checkpointing="unsloth",
             random_state=self.cfg.seed,
+            **adapter_options,
         )
+        if shared_lora:
+            install_shared_expert_lora(
+                model, _lora_rank(self.cfg), self.cfg.lora_alpha, self.cfg.lora_dropout)
         set_gradient_checkpointing(model, False)
         if str(getattr(self.cfg, "coder_model_profile", "")) == "gpt-oss-120b":
             from models.gpt_oss_training import install_attention_layout_guards
@@ -1275,6 +1289,9 @@ class UnslothBackend(_ModelPlacementBackend):
         self._FastLanguageModel.for_training(self.model)
 
     def disable_adapter(self):
+        if getattr(self.model, "_ttt_gpt_oss_shared_lora", False):
+            from models.gpt_oss_lora import disable_shared_adapter
+            return disable_shared_adapter(self.model)
         return self.model.disable_adapter()
 
 

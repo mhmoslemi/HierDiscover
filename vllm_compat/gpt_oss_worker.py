@@ -19,6 +19,10 @@ class GptOssWorker(Worker):
             max_split_size_mb=max(512, max_split_size_mb))
 
     def load_model(self, *args, **kwargs):
+        lora_config = self.vllm_config.lora_config
+        if lora_config is not None and getattr(lora_config, "enable_moe_shared_loras", False):
+            from vllm_compat.gpt_oss_lora import install_gpt_oss_lora_support
+            install_gpt_oss_lora_support()
         print("[vllm] GPT-OSS bounded Marlin repacking: one expert at a time, "
               "reusing checkpoint storage and allocator scratch "
               "(loading split limit >=512 MiB); "

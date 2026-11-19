@@ -324,8 +324,11 @@ def _save_adapter(model, exp_dir, step_idx, *, directory_name=None):
     out_dir = (str(Path(exp_dir) / str(directory_name))
                if directory_name is not None
                else _adapter_dir(exp_dir, step_idx))
-    # PEFT/Unsloth models support save_pretrained, which writes just the adapter
-    model.save_pretrained(out_dir)
+    if getattr(model, "_ttt_gpt_oss_shared_lora", False):
+        from models.gpt_oss_lora import save_shared_adapter
+        save_shared_adapter(model, out_dir)
+    else:
+        model.save_pretrained(out_dir)
     return out_dir
 
 
@@ -389,6 +392,13 @@ def _live_adapter_snapshots(exp_dir, current_adapter, spo_rs_tracker=None):
 
 def _load_adapter(model, adapter_dir, *, announce=True):
     """Load saved LoRA weights into the already-created trainable adapter."""
+    if getattr(model, "_ttt_gpt_oss_shared_lora", False):
+        from models.gpt_oss_lora import load_shared_adapter
+        load_shared_adapter(model, adapter_dir)
+        if announce:
+            print(f"[resume] loaded shared GPT-OSS LoRA adapter from {adapter_dir}")
+        return
+
     import torch
     from peft import set_peft_model_state_dict
 
@@ -3845,12 +3855,19 @@ def main():
                     "are unavailable."
                 )
 
-    optimizer = torch.optim.AdamW(
+    optimizer_class = torch.optim.AdamW
+    optimizer_options = {}
+    if getattr(model, "_ttt_gpt_oss_shared_lora", False):
+        from training.optimizer import HostMomentAdamW
+        optimizer_class = HostMomentAdamW
+        optimizer_options["hardware_profile"] = cfg.hardware_profile
+    optimizer = optimizer_class(
         [p for p in model.parameters() if p.requires_grad],
         lr=cfg.learning_rate,
         betas=(cfg.adam_beta1, cfg.adam_beta2),
         eps=cfg.adam_epsilon,
         weight_decay=cfg.weight_decay,
+        **optimizer_options,
     )
     if resume_payload is not None:
         optimizer.load_state_dict(resume_payload["optimizer"])
@@ -4042,6 +4059,11 @@ def main():
             vllm_log_path=vllm_log_path,
             hardware_profile=cfg.hardware_profile,
         )
+        if getattr(model, "_ttt_gpt_oss_shared_lora", False):
+            pool_options["vllm_engine_options"] = {
+                "enable_moe_shared_loras": True,
+                "enable_mixed_moe_lora_format": True,
+            }
         if cfg.generation_backend == "vllm":
             from runtime.host_memory import HostMemoryAdmission
             import multiprocessing

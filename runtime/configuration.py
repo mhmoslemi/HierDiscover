@@ -638,6 +638,11 @@ def load_config():
                         local_checkpoint("fastino/GLiDE-9B", merged["hardware_profile"]))
         merged["jev_model_path"] = str(Path(jev_path).expanduser())
     _apply_coder_model_profile(merged, profile_explicit_keys)
+    if merged.get("coder_model_profile") == "gpt-oss-120b":
+        # Saved attention-only runs keep their original parameter/optimizer layout.
+        merged["gpt_oss_shared_lora"] = (
+            bool(saved.get("gpt_oss_shared_lora", False)) if resume_dir is not None
+            else not merged["no_train"])
     if (merged.get("coder_model_profile") == "gpt-oss-120b"
             and str(merged.get("coder_reasoning_effort", "")).lower()
             not in {"low", "medium", "high"}):
