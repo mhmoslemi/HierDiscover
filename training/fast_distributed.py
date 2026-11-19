@@ -138,9 +138,6 @@ def _set_total_memory_ceiling(logical_id, fraction, *, maximum, label):
         raise ValueError(
             f"{label} total memory ceiling must be in (0, {maximum:.2f}]")
     with torch.cuda.device(int(logical_id)):
-        # Release only unused cache before measuring the model's persistent base.
-        # This runs at worker load/update boundaries, never per microbatch.
-        torch.cuda.empty_cache()
         allocated = int(torch.cuda.memory_allocated())
         reserved = int(torch.cuda.memory_reserved())
         free_bytes, total_bytes = torch.cuda.mem_get_info()
@@ -153,6 +150,8 @@ def _set_total_memory_ceiling(logical_id, fraction, *, maximum, label):
                 f"{label} rank {logical_id} already needs "
                 f"{100.0 * occupied:.1f}% GPU memory before a batch, so the "
                 f"{100.0 * fraction:.0f}% total ceiling cannot be honored")
+        if reserved > process_limit:
+            torch.cuda.empty_cache()
         allocator_fraction = min(
             fraction, process_limit / max(1, int(total_bytes)))
         _set_allocator_memory_ceiling(
@@ -172,15 +171,11 @@ def set_total_memory_ceiling(
 
 def set_long_rollout_memory_ceiling(
         logical_id, fraction=LONG_ROLLOUT_MEMORY_FRACTION):
-    """Use reserved card headroom for an otherwise untrainable singleton.
+    """Use additional card memory for exact training.
 
-    This is used after the batch has been reduced to one rollout and before
-    resorting to saved-activation CPU offload. External allocations (including
-    sleeping vLLM processes and NCCL) remain part of the total. Callers first
-    use the 96% ceiling and may explicitly escalate to 98% and then 99% after
-    proven OOMs.  External allocations are measured before every escalation,
-    so even the final stage leaves one percent of the complete card outside
-    the total ceiling rather than granting one process the entire device.
+    Callers start at 96% and can retry singletons at 98% and 99% before
+    resorting to saved-activation CPU offload. External allocations, including
+    sleeping vLLM processes and NCCL, remain part of every ceiling.
     """
     return _set_total_memory_ceiling(
         logical_id, fraction,
@@ -289,8 +284,15 @@ def _move_examples(examples, logical_id):
     return moved
 
 
+def spo_rs_initial_memory_fraction(model, configured_fraction):
+    if getattr(model, "_ttt_gpu_resident_checkpoints", False):
+        return LONG_ROLLOUT_MEMORY_FRACTION
+    return float(configured_fraction)
+
+
 def local_spo_rs_update(backend, model, tokenizer, examples, cfg, logical_id,
                       token_budget, *, memory_fraction=0.80, work_queue=None,
+                      max_examples_per_batch=64,
                       activation_offload_semaphore=None,
                       defer_exact_oom=False):
     """Accumulate one rank's gradients and leave them attached to the model."""
@@ -306,19 +308,24 @@ def local_spo_rs_update(backend, model, tokenizer, examples, cfg, logical_id,
             "fast trainer memory_fraction must be in (0, 0.90]")
 
     backend.set_training_mode()
-    allocator_fraction = set_total_memory_ceiling(
-        logical_id, float(memory_fraction))
-    epsilon, epsilon_low, epsilon_high, kl_coef = (
-        training._clipped_policy_options(cfg))
+    initial_fraction = spo_rs_initial_memory_fraction(model, memory_fraction)
+    headroom_preallocated = initial_fraction > float(memory_fraction)
+    if headroom_preallocated:
+        allocator_fraction = set_long_rollout_memory_ceiling(
+            logical_id, initial_fraction)
+    else:
+        allocator_fraction = set_total_memory_ceiling(
+            logical_id, initial_fraction)
+    hybrid = cfg.advantage_mode == "hybrid"
+    clip_options = None if hybrid else training._clipped_policy_options(cfg)
     parameters = trainable_parameters(model)
     gradient_accumulators = [None for _ in parameters]
     metric_keys = (
         "loss", "policy_loss", "kl_estimate",
         "ratio", "clipped_fraction",
     )
-    totals = {key: 0.0 for key in metric_keys}
-    max_ratio = 0.0
-    max_prefix_ratio = 0.0
+    metric_count = len(metric_keys)
+    step_metrics = None
     quarantined_examples = 0
     deferred_keys = []
     deferred_token_lengths = []
@@ -327,7 +334,7 @@ def local_spo_rs_update(backend, model, tokenizer, examples, cfg, logical_id,
     peak_memory_fraction = 0.0
     budget = max(1, int(token_budget or cfg.max_seq_length))
     emergency_allocator_fraction = None
-    emergency_allocator_stage = 0
+    emergency_allocator_stage = int(headroom_preallocated)
 
     def expand_for_long_rollout():
         nonlocal allocator_fraction, emergency_allocator_fraction
@@ -337,6 +344,7 @@ def local_spo_rs_update(backend, model, tokenizer, examples, cfg, logical_id,
             requested_fraction = LONG_ROLLOUT_MEMORY_FRACTIONS[
                 emergency_allocator_stage]
             emergency_allocator_stage += 1
+            previous_fraction = allocator_fraction
             try:
                 expanded = set_long_rollout_memory_ceiling(
                     logical_id, requested_fraction)
@@ -345,11 +353,10 @@ def local_spo_rs_update(backend, model, tokenizer, examples, cfg, logical_id,
                       f"{100.0 * requested_fraction:.0f}% reserved GPU "
                       f"headroom is unavailable ({error})", flush=True)
                 continue
-            if (emergency_allocator_fraction is not None
-                    and expanded <= emergency_allocator_fraction):
+            allocator_fraction = expanded
+            if expanded <= previous_fraction:
                 continue
             emergency_allocator_fraction = expanded
-            allocator_fraction = max(allocator_fraction, expanded)
             return expanded
         return None
 
@@ -384,10 +391,9 @@ def local_spo_rs_update(backend, model, tokenizer, examples, cfg, logical_id,
             return training._FUSED_LONG_SINGLETON_MIN_TOKENS
         return None
 
-    max_examples_per_batch = 64
+    max_examples_per_batch = max(1, min(64, int(max_examples_per_batch)))
     if work_queue is None:
         pending = sorted(examples, key=example_length)
-        max_examples_per_batch = min(64, max(1, len(examples)))
 
         def take_batch():
             if not pending:
@@ -499,6 +505,12 @@ def local_spo_rs_update(backend, model, tokenizer, examples, cfg, logical_id,
         fused_long_singleton = bool(
             len(cpu_batch) == 1
             and needs_fused_long_singleton(cpu_batch[0]))
+        cpu_batch = [dict(example) for example in cpu_batch]
+        missing_behavior = training._initialize_behavior_logprobs(cpu_batch)
+        if hybrid and missing_behavior:
+            raise ValueError("hybrid training requires the original sampler logprobs")
+        for example in cpu_batch:
+            example.pop("behavior_logprobs", None)
 
         with torch.cuda.device(logical_id):
             base_allocated = int(torch.cuda.memory_allocated())
@@ -516,52 +528,37 @@ def local_spo_rs_update(backend, model, tokenizer, examples, cfg, logical_id,
 
                 with training._policy_dropout_disabled(model):
                     for batch in active_batches:
-                        missing_old = (
-                            training._initialize_behavior_logprobs(batch))
-                        for fallback_batch in (
-                                [example] for example in missing_old):
+                        for example in batch:
+                            if example["old_policy_logprobs"] is not None:
+                                continue
                             old_logprobs = training.compute_batched_token_logprobs(
-                                model, fallback_batch, with_grad=False,
+                                model, [example], with_grad=False,
                                 chunk=cfg.logprob_chunk,
-                                pad_token_id=tokenizer.pad_token_id)
-                            if any(not torch.isfinite(value).all()
-                                   for value in old_logprobs):
+                                pad_token_id=tokenizer.pad_token_id)[0]
+                            if not torch.isfinite(old_logprobs).all():
                                 raise FloatingPointError(
                                     "nonfinite old-policy logprobs")
-                            for example, old_lp in zip(
-                                    fallback_batch, old_logprobs):
-                                example["old_policy_logprobs"] = old_lp.detach()
+                            example["old_policy_logprobs"] = old_logprobs.detach()
 
-
-                        result = training.compute_batched_token_logprobs(
+                        current_logprobs = training.compute_batched_token_logprobs(
                             model, batch, with_grad=True,
                             chunk=cfg.logprob_chunk,
                             pad_token_id=tokenizer.pad_token_id)
-                        current_logprobs = result
 
                         weighted_losses = []
                         for example, current_lp in zip(
                                 batch, current_logprobs):
-                            loss, metrics = training.clipped_policy_loss(
-                                cfg, current_lp,
-                                example["old_policy_logprobs"],
-                                None,
-                                example["advantage"],
-                                clip_epsilon=epsilon,
-                                clip_epsilon_low=epsilon_low,
-                                clip_epsilon_high=epsilon_high,
-                                kl_coef=kl_coef,
+                            loss, metrics = training.historical_policy_loss(
+                                cfg, current_lp, example, clip_options,
                                 return_tensor_metrics=True)
                             weight = float(example["sample_weight"])
-                            if not torch.isfinite(loss).all():
-                                raise FloatingPointError(
-                                    "nonfinite SPO-RS loss")
-                            weighted_losses.append(weight * loss)
+                            loss_weight = 1.0 if hybrid else weight
+                            weighted_losses.append(loss_weight * loss)
                             attempt_values["loss"].append(
-                                weight * loss.detach())
-                            for key in (
-                                    "policy_loss", "kl_estimate",
-                                    "ratio"):
+                                loss_weight * loss.detach())
+                            attempt_values["policy_loss"].append(
+                                loss_weight * metrics["policy_loss"])
+                            for key in ("kl_estimate", "ratio"):
                                 attempt_values[key].append(
                                     weight * metrics[key])
                             attempt_values["clipped_fraction"].append(
@@ -587,13 +584,9 @@ def local_spo_rs_update(backend, model, tokenizer, examples, cfg, logical_id,
                     (torch.stack(attempt_prefix_ratio_values).max()
                      if attempt_prefix_ratio_values else zero),
                 ))
-                packed = torch.stack([
+                return torch.stack([
                     value.to(dtype=torch.float64) for value in reduced
-                ]).detach().cpu().tolist()
-                return (
-                    dict(zip(metric_keys, packed[:len(metric_keys)])),
-                    packed[len(metric_keys)], packed[len(metric_keys) + 1],
-                )
+                ]).detach()
 
             result, effective_batches, unprocessed = (
                 training._run_oom_resilient_backward(
@@ -601,7 +594,8 @@ def local_spo_rs_update(backend, model, tokenizer, examples, cfg, logical_id,
                     device_label=f"cuda:{logical_id}",
                     expand_memory=expand_for_long_rollout,
                     start_checkpointed=fused_long_singleton,
-                    start_with_headroom=fused_long_singleton,
+                    start_with_headroom=(fused_long_singleton and not headroom_preallocated),
+                    headroom_preallocated=headroom_preallocated,
                     # Selectively resumed trajectories already exhausted the
                     # complete GPU-only ladder in an earlier process. Enter
                     # bounded offload immediately for this dispatch only;
@@ -629,6 +623,8 @@ def local_spo_rs_update(backend, model, tokenizer, examples, cfg, logical_id,
 
             if result is not None:
                 with torch.no_grad():
+                    accumulated = []
+                    incoming = []
                     for parameter_index, parameter in enumerate(parameters):
                         gradient = parameter.grad
                         if gradient is None:
@@ -638,12 +634,18 @@ def local_spo_rs_update(backend, model, tokenizer, examples, cfg, logical_id,
                             gradient_accumulators[
                                 parameter_index] = gradient.detach()
                         else:
-                            accumulator.add_(gradient)
+                            accumulated.append(accumulator)
+                            incoming.append(gradient)
                         parameter.grad = None
-                for key in metric_keys:
-                    totals[key] += result[0][key]
-                max_ratio = max(max_ratio, result[1])
-                max_prefix_ratio = max(max_prefix_ratio, result[2])
+                    if incoming:
+                        torch._foreach_add_(accumulated, incoming)
+                    del incoming, accumulated
+                    if step_metrics is None:
+                        step_metrics = result
+                    else:
+                        step_metrics[:metric_count].add_(result[:metric_count])
+                        maxima = step_metrics[metric_count:]
+                        torch.maximum(maxima, result[metric_count:], out=maxima)
 
             model.zero_grad(set_to_none=True)
             if defer_exact_oom:
@@ -673,18 +675,12 @@ def local_spo_rs_update(backend, model, tokenizer, examples, cfg, logical_id,
                 active_bytes = max(1, peak_allocated - base_allocated)
                 target_process_bytes = max(
                     base_allocated + 1,
-                    int(float(memory_fraction) * int(total_bytes))
-                    - external_bytes)
+                    int(allocator_fraction * int(total_bytes)))
                 available_for_batch = max(
                     1, target_process_bytes - base_allocated)
                 desired_budget = int(
                     requested_padded_tokens
                     * available_for_batch / active_bytes * 0.95)
-                if observed_fraction >= float(memory_fraction):
-                    desired_budget = min(
-                        desired_budget,
-                        int(budget * float(memory_fraction)
-                            / max(observed_fraction, 1e-9) * 0.95))
                 lower = max(longest_successful, int(budget * 0.70))
                 upper = max(lower, int(budget * 1.20))
                 desired_budget = min(upper, max(lower, desired_budget))
@@ -698,14 +694,18 @@ def local_spo_rs_update(backend, model, tokenizer, examples, cfg, logical_id,
         for parameter, accumulator in zip(
                 parameters, gradient_accumulators):
             parameter.grad = accumulator
-        torch.cuda.synchronize(logical_id)
+        if step_metrics is None:
+            torch.cuda.synchronize(logical_id)
+            packed = [0.0] * (metric_count + 2)
+        else:
+            packed = step_metrics.cpu().tolist()
     reclaim_unused_host_memory(
         torch, cuda_devices=(logical_id,), force=True)
 
     return {
-        "totals": totals,
-        "max_ratio": max_ratio,
-        "max_prefix_ratio": max_prefix_ratio,
+        "totals": dict(zip(metric_keys, packed[:metric_count])),
+        "max_ratio": packed[metric_count],
+        "max_prefix_ratio": packed[metric_count + 1],
         "quarantined_examples": quarantined_examples,
         "deferred_examples": len(deferred_keys),
         "deferred_keys": deferred_keys,
@@ -1276,6 +1276,7 @@ def worker_main(rank, world_size, cfg_dict, init_method, work_queue,
                     int(rank), command["token_budget"],
                     memory_fraction=command.get("memory_fraction", 0.80),
                     work_queue=work_queue,
+                    max_examples_per_batch=command.get("max_examples_per_batch", 64),
                     activation_offload_semaphore=(
                         activation_offload_semaphore),
                     defer_exact_oom=bool(command.get(

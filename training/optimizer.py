@@ -15,6 +15,8 @@ class HostMomentAdamW(torch.optim.AdamW):
         self._hardware_profile = hardware_profile
 
     def _park_moments(self, parameters, parked):
+        copies = []
+        host_bytes = 0
         for parameter in parameters:
             state = self.state.get(parameter, {})
             for key in self._moment_keys:
@@ -23,16 +25,64 @@ class HostMomentAdamW(torch.optim.AdamW):
                     continue
                 host = parked.get((parameter, key))
                 if host is None:
-                    host = retry_host_allocation(
-                        moment.cpu, hardware_profile=self._hardware_profile,
-                        stage="GPT-OSS Adam moments", required_bytes=moment.numel() * moment.element_size())
-                else:
-                    host.copy_(moment)
-                state[key] = host
+                    host_bytes += moment.numel() * moment.element_size()
+                copies.append((state, key, moment, host))
+
+        def copy_bucket():
+            buffers = [torch.empty_like(moment, device="cpu") if host is None else host
+                       for _, _, moment, host in copies]
+            streams = set()
+            try:
+                for (_, _, moment, _), host in zip(copies, buffers):
+                    if moment.is_cuda:
+                        streams.add(torch.cuda.current_stream(moment.device))
+                    host.copy_(moment, non_blocking=moment.is_cuda)
+            finally:
+                # Publish CPU moments only once the complete bucket is ready.
+                for stream in streams:
+                    stream.synchronize()
+            return buffers
+
+        buffers = (retry_host_allocation(
+            copy_bucket, hardware_profile=self._hardware_profile,
+            stage="GPT-OSS Adam moments", required_bytes=host_bytes)
+            if host_bytes else copy_bucket())
+        for (state, key, _, _), host in zip(copies, buffers):
+            state[key] = host
 
     def load_state_dict(self, state_dict):
-        super().load_state_dict(state_dict)
-        self._park_moments(self.state, {})
+        # AdamW normally casts state to the live parameter's device. Keep the
+        # saved moments on CPU so restarting after eval avoids a CUDA round trip.
+        saved_state = state_dict["state"]
+        state_without_moments = dict(saved_state)
+        moments_by_parameter = {}
+        for saved_group, group in zip(state_dict["param_groups"], self.param_groups, strict=True):
+            for saved_id, parameter in zip(saved_group["params"], group["params"], strict=True):
+                state = saved_state.get(saved_id, {})
+                moments = {key: state[key] for key in self._moment_keys if key in state}
+                if moments:
+                    moments_by_parameter[parameter] = moments
+                    state_without_moments[saved_id] = {
+                        key: value for key, value in state.items() if key not in moments}
+
+        host_bytes = sum(moment.numel() * parameter.element_size()
+                         for parameter, moments in moments_by_parameter.items()
+                         for moment in moments.values())
+
+        def copy_moments():
+            return {
+                parameter: {key: moment.detach().to(device="cpu", dtype=parameter.dtype, copy=True)
+                            for key, moment in moments.items()}
+                for parameter, moments in moments_by_parameter.items()
+            }
+
+        host_moments = (retry_host_allocation(
+            copy_moments, hardware_profile=self._hardware_profile,
+            stage="GPT-OSS Adam checkpoint restore", required_bytes=host_bytes)
+            if moments_by_parameter else {})
+        super().load_state_dict({**state_dict, "state": state_without_moments})
+        for parameter, moments in host_moments.items():
+            self.state[parameter].update(moments)
 
     @torch.no_grad()
     def step(self, closure=None):
@@ -55,7 +105,7 @@ class HostMomentAdamW(torch.optim.AdamW):
                                 host = state.get(key)
                                 if host is not None and host.device != parameter.device:
                                     parked[parameter, key] = host
-                                    state[key] = host.to(parameter.device)
+                                    state[key] = host.to(parameter.device, non_blocking=parameter.is_cuda)
                         self.param_groups = [dict(group, params=bucket)]
                         super().step()
                     finally:

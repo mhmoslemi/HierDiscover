@@ -94,6 +94,7 @@ class ErdosMinOverlap(Problem):
 
     def __init__(self, cfg: dict):
         super().__init__(cfg)
+        self._reward_epsilon = 1e-8 if cfg.get("advantage_mode") == "hybrid" else 0.0
         if self.target is None:
             self.target = 0.3808
         self.budget_s = float(cfg.get("budget_s", 60.0))
@@ -138,7 +139,7 @@ class ErdosMinOverlap(Problem):
         c5_bound = evaluate_erdos_solution(h_values, c5_bound, n_points)
         res.valid = True
         res.raw_score = float(c5_bound)
-        res.reward = float(1.0 / c5_bound)
+        res.reward = float(1.0 / (self._reward_epsilon + c5_bound))
         res.construction = list(np.asarray(h_values).ravel())
         res.msg = f"C5 bound: {c5_bound}"
         return res
@@ -160,7 +161,7 @@ class ErdosMinOverlap(Problem):
             c5_bound = float(np.max(correlation))
             seeds.append(SeedState(
                 code="",
-                value=float(1.0 / c5_bound),
+                value=float(1.0 / (self._reward_epsilon + c5_bound)),
                 raw_score=c5_bound,
                 construction=list(construction),
             ))

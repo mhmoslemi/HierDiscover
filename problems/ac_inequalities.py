@@ -104,6 +104,7 @@ class ACInequalities(Problem):
         self.budget_s = int(cfg.get("budget_s", 1000))
 
         if self.problem_type == "ac1":
+            self._ttt_reward = cfg.get("advantage_mode") == "hybrid"
             self._reward_anchors = cfg.get("erdos_reward_anchors", ERDOS_REWARD_ANCHORS["ac1"])
             self.entrypoint = "propose_candidate"
             self.metric_name = "upper bound"
@@ -142,6 +143,8 @@ class ACInequalities(Problem):
 
     # ------------------------------------------------------------------
     def _ac1_reward(self, raw_score: float) -> float:
+        if self._ttt_reward:
+            return 1.0 / (1e-8 + raw_score)
         if self._reward_anchors is not None:
             return erdos_scaled_reward(raw_score, *self._reward_anchors)
         return 1.0 / raw_score

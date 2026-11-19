@@ -181,7 +181,9 @@ function recipeNode() {
     ["Parent selection", `${c.parent_selection || RUN.sampler} · c=${c.puct_c} · ${c.num_seed_states} seeds${RUN.hasJev ? ` · window ×${c.jev_candidate_multiplier}` : ""}`],
     ["Per step", `${c.groups_per_step} parents × (${c.strategies_per_parent} strategies × ${c.programs_per_strategy}) = ${c.groups_per_step * c.group_size} programs`],
     ["Programs per strategy", c.programs_per_strategy],
-    ["Advantage", `${c.advantage_mode} · β=${c.spo_rs_beta} · clip [${c.spo_rs_clip_epsilon_low}, ${c.spo_rs_clip_epsilon_high}]`],
+    ["Advantage", c.advantage_mode === "hybrid"
+      ? `hybrid · β=${c.spo_rs_beta} · TTT importance sampling`
+      : `${c.advantage_mode} · β=${c.spo_rs_beta} · clip [${c.spo_rs_clip_epsilon_low}, ${c.spo_rs_clip_epsilon_high}]`],
     ["Archive", `top-${c.strategy_archive_top_r}/strategy · top-${c.topk_children_per_parent}/parent · cap ${c.max_buffer_size}`],
     PROB.kernel ? ["Kernel evaluation", `on ${c.gpu_type || "the GPU"} (GPU ${c.kernel_gpu_id != null ? c.kernel_gpu_id : "?"}), killed after ${c.kernel_timeout_s || c.sandbox_timeout_s}s${c.max_new_tokens ? `, up to ${fmt.n(c.max_new_tokens)} tokens` : ""}`]
       : ["Program budget", `${c.budget_s}s search${c.sandbox_timeout_s ? `, sandbox kill at ${c.sandbox_timeout_s}s` : ""}${c.max_new_tokens ? `, up to ${fmt.n(c.max_new_tokens)} tokens` : ""}`],

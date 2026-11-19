@@ -192,6 +192,10 @@ const STAGE_VIZ = {
   },
 
   async adv(box, step) {
+    if (CFG.advantage_mode === "hybrid") {
+      hybridAdvantageChart(box, step);
+      return;
+    }
     const st = ST[step];
     if (!st.spo) { box.append(h("div", { class: "empty" }, "No SPO² update recorded for this step yet.")); return; }
     const rs = RS[step] || [];
@@ -224,15 +228,18 @@ const STAGE_VIZ = {
     const st = ST[step];
     if (!st.policy_updates || !st.policy_updates.length) { box.append(h("div", { class: "empty" }, "Training metrics are not available for this step yet.")); return; }
     const u = st.policy_updates[0];
+    const hybrid = CFG.advantage_mode === "hybrid";
     box.append(h("div", { class: "kv", html:
       `<div class="k">Policy loss</div><div class="v">${fmt.f(u.loss, 5)}</div>` +
       `<div class="k">Mean token ratio π/π_old</div><div class="v">${fmt.f(u.ratio, 6)} (max ${fmt.f(u.ratio_max, 4)})</div>` +
-      `<div class="k">Clipped tokens</div><div class="v">${fmt.pct(u.clipped_fraction, 3)}</div>` +
-      `<div class="k">Gradient norm</div><div class="v">${fmt.sci(u.grad_norm, 2)} (clip at 1.0 never reached)</div>` +
+      (hybrid ? `<div class="k">Batch mean log ratio to reference</div><div class="v">${fmt.f(st.hybrid_reference_kl_mean, 6)}</div>`
+        : `<div class="k">Clipped tokens</div><div class="v">${fmt.pct(u.clipped_fraction, 3)}</div>`) +
+      `<div class="k">Gradient norm</div><div class="v">${fmt.sci(u.grad_norm, 2)}${hybrid ? "" : " (clip at 1.0 never reached)"}</div>` +
       `<div class="k">Training time</div><div class="v">${fmt.dur(st.training_seconds)} on ${st.training_parallel_gpus} GPUs</div>` +
       `<div class="k">Examples / GPU</div><div class="v">${(st.fast_trained_examples_per_gpu || []).join(" + ")}</div>` +
       `<div class="k">Peak GPU memory</div><div class="v">${(st.fast_peak_memory_fraction || []).map(x => fmt.pct(x, 0)).join(" / ")}</div>` +
       `<div class="k">OOM-quarantined</div><div class="v">${st.oom_quarantined_examples || 0}</div>` }));
+    if (hybrid) return;
     box.append(h("h3", { style: { marginTop: "12px" } }, "Clipped objective (shared with the SPO² tab)"));
     box.append(paramSlider("ε_low", 0.05, 0.5, 0.01, x => x.toFixed(2), () => P.clipLo, (v, row) => setParam({ clipLo: v }, row)));
     box.append(paramSlider("ε_high", 0.05, 0.6, 0.01, x => x.toFixed(2), () => P.clipHi, (v, row) => setParam({ clipHi: v }, row)));

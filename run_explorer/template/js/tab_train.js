@@ -23,6 +23,13 @@ registerTab({
   id: "train", label: "SPO² & training", ico: "∇",
   async render(root) {
     const step = S.step, st = ST[step];
+    if (CFG.advantage_mode === "hybrid") {
+      root.append(pageHead("Hybrid advantages and LoRA training",
+        "Historical and sibling credit feed TTT's token-summed importance-sampling loss with batch-centered reference KL."));
+      hybridAdvantageChart(root, step);
+      metricsSection(root, true);
+      return;
+    }
     root.append(pageHead("Learning: SPO² advantages and the LoRA update",
       `<b>SPO²</b> (<code>spo-rs</code> in the code: <i>single-stream policy optimisation with a risk-sensitive exponential reward</i>) turns a program's reward into a training signal with <b>one run-wide baseline</b> <i>v</i> instead of comparing programs inside a group. ` +
       `Only the coder's LoRA adapter is trained - one PPO-clipped AdamW step per training step. ` +
@@ -39,6 +46,21 @@ registerTab({
     metricsSection(root);
   }
 });
+
+function hybridAdvantageChart(root, step) {
+  const rows = (RS[step] || []).filter(r => Number.isFinite(r.adv) && r.planned !== false);
+  if (!rows.length) return;
+  const host = h("div", { class: "chart" });
+  const st = ST[step], baseline = st.spo?.value_before;
+  root.append(card(`Hybrid advantage · step ${step}`,
+    `Logged advantages${baseline == null ? "" : ` · historical baseline ${fmt.f(baseline, 4)}`}`, host));
+  scatterChart(host, {
+    height: 230, xLabel: "reward", yLabel: "hybrid advantage", margin: { l: 56 },
+    points: rows.map(r => ({ x: r.reward, y: r.adv, c: S_COL(r.pg || 0), r: 3.4, a: 0.8, rr: r })),
+    tip: p => `Parent ${p.rr.pg} · reward ${fmt.f(p.x, 4)} · advantage ${fmt.f(p.y, 5)}`,
+    onPoint: p => openRollout(p.rr.id),
+  });
+}
 
 /* ------------------------------------------------------------ advantage playground ------ */
 function playground(root, step) {
@@ -188,20 +210,23 @@ function ppoSection(root, step) {
 }
 
 /* ------------------------------------------------------------ metrics per step ------------------ */
-function metricsSection(root) {
+function metricsSection(root, hybrid = false) {
   const done = STEPS.filter(s => ST[s].policy_updates && ST[s].policy_updates.length);
   if (!done.length) return;
   const U = s => ST[s].policy_updates[0];
   const hosts = range(0, 4).map(() => h("div", { class: "chart" }));
   root.append(h("div", { class: "grid g2", style: { marginTop: "14px" } },
-    card("Policy loss", "−mean_t min(ρA, clip·A), averaged over trajectories", hosts[0]),
-    card("Gradient norm (log10)", "clip threshold is 1.0 - never reached", hosts[1]),
-    card("Clipped-token fraction & max ratio", "almost no token reaches the clip boundary", hosts[2]),
+    card("Policy loss", hybrid ? "Token-summed importance sampling with reference KL" : "−mean_t min(ρA, clip·A), averaged over trajectories", hosts[0]),
+    card("Gradient norm (log10)", hybrid ? "Full batch gradient" : "clip threshold is 1.0 - never reached", hosts[1]),
+    card(hybrid ? "Maximum importance ratio" : "Clipped-token fraction & max ratio", hybrid ? "Largest mean ratio across responses" : "almost no token reaches the clip boundary", hosts[2]),
     card("Training time & examples per GPU", "2 GPUs, adaptive process-per-GPU scheduler", hosts[3])));
   const base = { xLabel: "step", margin: { l: 56 }, xTicks: done, xFmt: v => String(Math.round(v)), height: 220 };
   lineChart(hosts[0], Object.assign({}, base, { yLabel: "loss", yFmt: v => v.toFixed(3), series: [{ name: "loss", color: S_COL(0), pts: done.map(s => [s, U(s).loss]), fmt: v => v.toFixed(5) }], hlines: [{ y: 0, color: cssVar("--ink-3") }], includeH: true }));
-  lineChart(hosts[1], Object.assign({}, base, { yLabel: "log10 ‖g‖", yFmt: v => v.toFixed(1), series: [{ name: "grad norm", color: S_COL(3), pts: done.map(s => [s, Math.log10(U(s).grad_norm)]), fmt: v => fmt.sci(Math.pow(10, v), 2) }], hlines: [{ y: 0, label: "clip = 1.0", color: cssVar("--crit") }], includeH: true }));
-  lineChart(hosts[2], Object.assign({}, base, { yLabel: "clipped %", yFmt: v => v.toFixed(2), series: [{ name: "clipped tokens %", color: S_COL(2), pts: done.map(s => [s, U(s).clipped_fraction * 100]), fmt: v => v.toFixed(3) + "%" }, { name: "(max ρ − 1)·100", color: S_COL(1), pts: done.map(s => [s, (U(s).ratio_max - 1) * 100]), fmt: v => v.toFixed(3) }] }));
+  lineChart(hosts[1], Object.assign({}, base, { yLabel: "log10 ‖g‖", yFmt: v => v.toFixed(1), series: [{ name: "grad norm", color: S_COL(3), pts: done.map(s => [s, Math.log10(U(s).grad_norm)]), fmt: v => fmt.sci(Math.pow(10, v), 2) }], hlines: hybrid ? [] : [{ y: 0, label: "clip = 1.0", color: cssVar("--crit") }], includeH: true }));
+  const ratios = hybrid
+    ? [{ name: "max ratio", color: S_COL(1), pts: done.map(s => [s, U(s).ratio_max]), fmt: v => v.toFixed(5) }]
+    : [{ name: "clipped tokens %", color: S_COL(2), pts: done.map(s => [s, U(s).clipped_fraction * 100]), fmt: v => v.toFixed(3) + "%" }, { name: "(max ρ − 1)·100", color: S_COL(1), pts: done.map(s => [s, (U(s).ratio_max - 1) * 100]), fmt: v => v.toFixed(3) }];
+  lineChart(hosts[2], Object.assign({}, base, { yLabel: hybrid ? "ratio" : "clipped %", yFmt: v => v.toFixed(2), series: ratios }));
   barChart(hosts[3], { height: 220, cats: done.map(String), xLabel: "step", yLabel: "minutes", margin: { l: 52 }, yFmt: v => v.toFixed(0), bands: true, segLabels: (i, si, v) => (v >= 20 ? v.toFixed(0) + "m" : ""), series: [{ name: "training time", color: S_COL(7), vals: done.map(s => (ST[s].training_seconds || 0) / 60) }], tip: (i, si, v) => `<b>step ${done[i]}</b><div>${fmt.dur(v * 60)} · examples/GPU ${(ST[done[i]].fast_trained_examples_per_gpu || []).join(" + ")}</div><div class="mut">peak mem ${(ST[done[i]].fast_peak_memory_fraction || []).map(x => fmt.pct(x, 0)).join(" / ")}</div>` });
-  root.append(h("p", { class: "sub", style: { marginTop: "6px" } }, "Reading these curves: a flat, tiny gradient norm and a vanishing clipped fraction are what a single on-policy step looks like. The learning rate (4e-5 on rank-32 LoRA) and the advantage scale set the actual step size; the run has no KL-to-reference term (coefficient forced to 0 for SPO²)."));
+  if (!hybrid) root.append(h("p", { class: "sub", style: { marginTop: "6px" } }, "Reading these curves: a flat, tiny gradient norm and a vanishing clipped fraction are what a single on-policy step looks like. The learning rate (4e-5 on rank-32 LoRA) and the advantage scale set the actual step size; the run has no KL-to-reference term (coefficient forced to 0 for SPO²)."));
 }

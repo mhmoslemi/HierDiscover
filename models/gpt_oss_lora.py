@@ -59,20 +59,26 @@ class SharedExpertLoRA(nn.Module):
                 self.dropout(inputs), self.down_a.to(inputs.dtype).transpose(-1, -2), offsets)
             return torch.addmm(base, low_rank, self.down_b[0].to(inputs.dtype).T, alpha=self.scale)
 
-        gate = F.linear(self.dropout(inputs), self.gate_a[0].to(inputs.dtype))
-        up = F.linear(self.dropout(inputs), self.up_a[0].to(inputs.dtype))
+        if self.dropout.training and self.dropout.p:
+            gate = F.linear(self.dropout(inputs), self.gate_a[0].to(inputs.dtype))
+            up = F.linear(self.dropout(inputs), self.up_a[0].to(inputs.dtype))
+        else:
+            # One dense projection also avoids two full input gradients
+            # that would otherwise be summed during backward.
+            gate_up_a = torch.cat((self.gate_a[0], self.up_a[0])).to(inputs.dtype)
+            gate, up = F.linear(inputs, gate_up_a).chunk(2, dim=-1)
         gate = grouped_mm(gate, self.gate_b.to(inputs.dtype).transpose(-1, -2), offsets)
         if interleaved:
             gate = _AlignedGroupedMMGradient.apply(gate)
         up = grouped_mm(up, self.up_b.to(inputs.dtype).transpose(-1, -2), offsets)
         if interleaved:
             up = _AlignedGroupedMMGradient.apply(up)
-        gate_base, up_base = (base[..., ::2], base[..., 1::2]) if interleaved else base.chunk(2, dim=-1)
-        gate = torch.add(gate_base, gate, alpha=self.scale)
-        up = torch.add(up_base, up, alpha=self.scale)
-        if interleaved:
-            return torch.stack((gate, up), dim=-1).flatten(-2)
-        return torch.cat((gate, up), dim=-1)
+            delta = torch.stack((gate, up), dim=-1).flatten(-2)
+        else:
+            delta = torch.cat((gate, up), dim=-1)
+        # Adding in the original layout sends the gradient straight to the
+        # base projection instead of scattering two slices back into it.
+        return torch.add(base, delta, alpha=self.scale)
 
     def export_tensors(self):
         return {

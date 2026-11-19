@@ -169,6 +169,7 @@ def dashboard_sections(fields, run_dir, *, resuming=False):
             row("SPO-RS beta", "SPO-RS D_half"),
             row("SPO-RS rho min/max"),
             row("SPO-RS clip eps low/high"),
+            row("Hybrid sibling weight", "Policy loss"),
         ]),
         ("HARDWARE & EVALUATION", 94, [
             row("Hardware profile"),

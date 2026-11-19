@@ -222,8 +222,11 @@ def backward_overflow_example(backend, tokenizer, example, cfg, gpu_ids):
             input_device = next(model.get_input_embeddings().parameters()).device
             for key in ("prompt_ids", "response_ids"):
                 item[key] = item[key].to(input_device)
-            epsilon, low, high, kl = training._clipped_policy_options(cfg)
+            hybrid = cfg.advantage_mode == "hybrid"
+            clip_options = None if hybrid else training._clipped_policy_options(cfg)
             missing_old = training._initialize_behavior_logprobs([item])
+            if hybrid and missing_old:
+                raise ValueError("hybrid overflow requires the original sampler logprobs")
             with training._policy_dropout_disabled(model):
                 if missing_old:
                     item["old_policy_logprobs"] = training.compute_batched_token_logprobs(
@@ -234,18 +237,16 @@ def backward_overflow_example(backend, tokenizer, example, cfg, gpu_ids):
                         model, [item], True, cfg.logprob_chunk,
                         pad_token_id=tokenizer.pad_token_id)
                     current = result[0]
-                    loss, metrics = training.clipped_policy_loss(
-                        cfg, current, item["old_policy_logprobs"],
-                        None, item["advantage"],
-                        clip_epsilon=epsilon, clip_epsilon_low=low,
-                        clip_epsilon_high=high, kl_coef=kl)
+                    loss, metrics = training.historical_policy_loss(cfg, current, item, clip_options)
                     if not torch.isfinite(loss).all():
                         raise FloatingPointError("nonfinite overflow policy loss")
                     weight = float(item["sample_weight"])
-                    (weight * loss).backward()
+                    loss_weight = 1.0 if hybrid else weight
+                    (loss_weight * loss).backward()
                     totals = {name: weight * float(metrics[name]) for name in (
-                        "policy_loss", "kl_estimate", "ratio")}
-                    totals.update(loss=weight * float(loss.detach()),
+                        "kl_estimate", "ratio")}
+                    totals.update(loss=loss_weight * float(loss.detach()),
+                                  policy_loss=loss_weight * metrics["policy_loss"],
                                   clipped_fraction=weight * float(metrics["clipped"]))
                     return dict(totals=totals, max_ratio=float(metrics["ratio"]),
                                 max_prefix_ratio=float(metrics["prefix_ratio_max"]),

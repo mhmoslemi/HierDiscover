@@ -15,7 +15,7 @@ from models.coder_profiles import _uses_sequence_level_policy_ratio
 from runtime.configuration import (
     SEQUENCE_CLIP_EPSILON_DEFAULT, SPO_RS_CLIP_EPSILON_DEFAULT, SPO_RS_CLIP_EPSILON_HIGH_DEFAULT,
     SPO_RS_CLIP_EPSILON_LOW_DEFAULT,
-    _is_spo_rs_mode, _parse_gpu_ids,
+    _is_spo_rs_mode, _parse_gpu_ids, _uses_reward_history,
 )
 from training.exact_overflow import (
     ExactLongContextTrainingOOM, _clip_sharded_grad_norm_,
@@ -512,6 +512,7 @@ def _gradient_checkpointing_work_units(batches):
 def _run_oom_resilient_backward(
         model, batches, attempt, *, device_label, expand_memory=None,
         start_checkpointed=False, start_with_headroom=False,
+        headroom_preallocated=False,
         start_activation_offload=False,
         activation_offload_semaphore=None, defer_exact_oom=False,
         allow_activation_offload=True):
@@ -615,7 +616,9 @@ def _run_oom_resilient_backward(
         return work
 
     active_work = select_checkpointing()
-    configured_headroom_min_work = getattr(model, "_ttt_reserved_headroom_min_work", None)
+    configured_headroom_min_work = (
+        None if headroom_preallocated else
+        getattr(model, "_ttt_reserved_headroom_min_work", None))
     headroom_min_work = profile.get("headroom_min_work", configured_headroom_min_work)
     if ((bool(start_with_headroom) or (headroom_min_work is not None and active_work >= int(headroom_min_work)))
             and expand_memory is not None):
@@ -1019,6 +1022,29 @@ def clipped_policy_loss(cfg, current_logprobs, old_logprobs,
         return_tensor_metrics=return_tensor_metrics)
 
 
+def historical_policy_loss(cfg, current_logprobs, example, clip_options, *,
+                           return_tensor_metrics=False):
+    """Use one objective across the replicas and both overflow paths."""
+    if cfg.advantage_mode == "hybrid":
+        from training.hybrid import importance_sampling_loss
+
+        return importance_sampling_loss(
+            current_logprobs, example, cfg.kl_penalty_coef,
+            return_tensor_metrics=return_tensor_metrics)
+
+    epsilon, low, high, kl = clip_options
+    return clipped_policy_loss(
+        cfg, current_logprobs, example["old_policy_logprobs"], None,
+        example["advantage"], clip_epsilon=epsilon, clip_epsilon_low=low,
+        clip_epsilon_high=high, kl_coef=kl,
+        return_tensor_metrics=return_tensor_metrics)
+
+
+def _historical_grad_clip(cfg):
+    # Keep the nonfinite gradient check when the TTT update clips no gradient.
+    return math.inf if cfg.advantage_mode == "hybrid" else cfg.grad_clip
+
+
 def _a3b_sequence_clipped_standard_loss(cfg, current_logprobs, behavior_logprobs, reference_logprobs, advantage):
     """Apply the A3B sequence surrogate inside entropic training.
 
@@ -1109,7 +1135,8 @@ def _prepare_entropic_overlap_group(
     return prepared
 
 
-def _prepare_spo_rs_overlap_inputs(tokenizer, group_responses, reward_futures, prompt_jobs):
+def _prepare_spo_rs_overlap_inputs(tokenizer, group_responses, reward_futures, prompt_jobs, *,
+                                   reference_logprob_mean=None):
     """Build every reward-independent SPO-RS training input on CPU.
 
     SPO-RS uses rollout-policy logprobs produced by vLLM and a frozen
@@ -1163,6 +1190,10 @@ def _prepare_spo_rs_overlap_inputs(tokenizer, group_responses, reward_futures, p
                 "_overlap_key": (int(group_id), int(rollout_index)),
                 "_overlap_reward_future": reward_future,
             }
+            if reference_logprob_mean is not None:
+                example["reference_logprobs"] = torch.as_tensor(
+                    record["reference_logprobs"], dtype=torch.float32)
+                example["reference_logprob_mean"] = reference_logprob_mean
             record["_spo_rs_overlap_example"] = example
             prepared.append(example)
 
@@ -1173,7 +1204,7 @@ def _prepare_spo_rs_overlap_inputs(tokenizer, group_responses, reward_futures, p
     return prepared
 
 
-def _complete_spo_rs_overlap_examples(examples, spo_rs_tracker=None):
+def _complete_spo_rs_overlap_examples(examples, spo_rs_tracker=None, *, sibling_futures=None):
     """Attach historical SPO advantages as individual CPU rewards finish."""
     if not examples:
         return []
@@ -1182,11 +1213,16 @@ def _complete_spo_rs_overlap_examples(examples, spo_rs_tracker=None):
         raise RuntimeError("SPO-RS overlap received an example before its reward completed")
     if spo_rs_tracker is None:
         raise RuntimeError("SPO-RS overlap requires its historical tracker")
-    results = [future.result() for future in futures]
+    results = [future.result() for future in (futures if sibling_futures is None else sibling_futures)]
     rewards = [float(result.reward) for result in results]
     advantages = spo_rs_tracker.rollout_advantages(rewards)
     if advantages is None:
         raise RuntimeError("SPO-RS overlap lost its frozen pre-step tracker baseline")
+    if sibling_futures is not None:
+        from training.hybrid import hybrid_advantages
+
+        advantages, _ = hybrid_advantages(rewards, advantages)
+        advantages = [advantages[example["rollout_index"]] for example in examples]
     for example, advantage in zip(examples, advantages):
         example["advantage"] = float(advantage)
         # Futures cannot be sent through the process trainer's work queues.
@@ -1222,7 +1258,7 @@ def _finalize_exact_spo_rs_overflow(
     _apply_precomputed_exact_gradients(model, overflow_state, step_idx)
     grad_norm = _clip_sharded_grad_norm_(
         [parameter for parameter in model.parameters() if parameter.requires_grad],
-        cfg.grad_clip, error_if_nonfinite=True)
+        _historical_grad_clip(cfg), error_if_nonfinite=True)
     optimizer.step()
 
     metric_keys = (
@@ -1249,7 +1285,7 @@ def _finalize_exact_spo_rs_overflow(
     print(
         f"[step {step_idx}] {cfg.advantage_mode} epoch 1/1: "
         f"loss={totals['loss']:.6f} "
-        f"reference=off "
+        f"reference={'on' if cfg.advantage_mode == 'hybrid' and cfg.kl_penalty_coef else 'off'} "
         f"ratio={totals['ratio']:.6f} max={max_ratio:.6f} "
         f"clipped={totals['clipped_fraction']:.1%} "
         "OOM-quarantined=0 "
@@ -1649,7 +1685,8 @@ class ProcessDistributedTrainer:
         import torch
         from training.fast_distributed import (broadcast_trainable_parameters,
                                       local_spo_rs_update,
-                                      reduce_trainable_gradients)
+                                      reduce_trainable_gradients,
+                                      spo_rs_initial_memory_fraction)
 
         if self._offloaded:
             print(f'[train-fast] restoring {self._world_size} process trainers for the update', flush=True)
@@ -1658,18 +1695,28 @@ class ProcessDistributedTrainer:
         started = time.time()
         queued_examples = self._queue_examples(examples)
         supplied_old = sum(_valid_example_token_logprobs(example, "behavior_logprobs") for example in queued_examples)
+        reference_label = (
+            f"{sum(_valid_example_token_logprobs(ex, 'reference_logprobs') for ex in queued_examples)}/{len(examples)}"
+            if cfg.advantage_mode == "hybrid" and cfg.kl_penalty_coef else "off")
         print(f"[step {step_idx}] {cfg.advantage_mode} logprobs: "
               "vLLM supplied old="
-              f"{supplied_old}/{len(examples)}, reference="
-              f"off",
+              f"{supplied_old}/{len(examples)}, reference={reference_label}",
               flush=True)
+        update_memory_fraction = spo_rs_initial_memory_fraction(
+            self.model, self._memory_fraction)
+        high_memory_update = update_memory_fraction > self._memory_fraction
+        rescue = "98%->99%" if high_memory_update else "96%->98%->99%"
+        # Leave work in the shared queue for the other rank even on short rollouts.
+        max_examples_per_batch = (
+            math.ceil(len(queued_examples) / self._world_size)
+            if high_memory_update else 64)
         print(f"[train-fast] one process/GPU; memory ceiling="
-              f"{self._memory_percentage:g}%; "
-              "exact singleton rescue=96%->98%->99%; "
+              f"{100.0 * update_memory_fraction:g}%; "
+              f"exact singleton rescue={rescue}; "
               f"initial padded-token budgets/GPU={self._token_budgets}",
               flush=True)
 
-        defer_exact_oom = _is_spo_rs_mode(getattr(cfg, "advantage_mode", ""))
+        defer_exact_oom = _uses_reward_history(getattr(cfg, "advantage_mode", ""))
         self._workers_idle = False
         for rank in range(1, self._world_size):
             self._command_queues[rank].put({
@@ -1677,6 +1724,7 @@ class ProcessDistributedTrainer:
                 "step_cfg": dict(vars(cfg)),
                 "token_budget": self._token_budgets[rank],
                 "memory_fraction": self._memory_fraction,
+                "max_examples_per_batch": max_examples_per_batch,
                 "defer_exact_oom": defer_exact_oom,
             })
 
@@ -1685,6 +1733,7 @@ class ProcessDistributedTrainer:
             self._token_budgets[0],
             memory_fraction=self._memory_fraction,
             work_queue=self._work_queue,
+            max_examples_per_batch=max_examples_per_batch,
             activation_offload_semaphore=(self._activation_offload_semaphore),
             defer_exact_oom=defer_exact_oom)
         child_messages = self._collect_event("computed", range(1, self._world_size))
@@ -1735,7 +1784,7 @@ class ProcessDistributedTrainer:
             else:
                 grad_norm_tensor = torch.nn.utils.clip_grad_norm_(
                     [parameter for parameter in self.model.parameters() if parameter.requires_grad],
-                    max_norm=cfg.grad_clip, error_if_nonfinite=True)
+                    max_norm=_historical_grad_clip(cfg), error_if_nonfinite=True)
                 self.optimizer.step()
                 grad_norm = float(grad_norm_tensor.item())
         except BaseException as error:
@@ -1784,7 +1833,7 @@ class ProcessDistributedTrainer:
             f"{peak_percentages}%; allocator caps/GPU={allocator_percentages}%", flush=True)
         print(f"[step {step_idx}] {cfg.advantage_mode} epoch 1/1: "
               f"loss={totals['loss']:.6f} "
-              f"reference=off "
+              f"reference={reference_label} "
               f"ratio={totals['ratio']:.6f} max={max_ratio:.6f} "
               f"clipped={totals['clipped_fraction']:.1%} "
               f"OOM-quarantined={quarantined_examples}", flush=True)
@@ -1830,8 +1879,8 @@ class ProcessDistributedTrainer:
             reduce_trainable_gradients,
         )
 
-        if not _is_spo_rs_mode(getattr(cfg, "advantage_mode", "")):
-            raise ValueError("exact overflow recovery is SPO-RS-only")
+        if not _uses_reward_history(getattr(cfg, "advantage_mode", "")):
+            raise ValueError("exact overflow recovery requires a historical advantage mode")
         if self._closed or not self._workers_idle:
             raise RuntimeError("process trainer is not idle for exact overflow recovery")
         if self._offloaded:
@@ -1988,7 +2037,7 @@ class ProcessDistributedTrainer:
                     _apply_precomputed_exact_gradients(self.model, overflow_state, step_idx)
                     grad_norm_tensor = torch.nn.utils.clip_grad_norm_(
                         [parameter for parameter in self.model.parameters() if parameter.requires_grad],
-                        max_norm=cfg.grad_clip,
+                        max_norm=_historical_grad_clip(cfg),
                         error_if_nonfinite=True,
                     )
                     self.optimizer.step()
@@ -2045,7 +2094,7 @@ class ProcessDistributedTrainer:
         print(
             f"[step {step_idx}] {cfg.advantage_mode} epoch 1/1: "
             f"loss={totals['loss']:.6f} "
-            f"reference=off "
+            f"reference={'on' if cfg.advantage_mode == 'hybrid' and cfg.kl_penalty_coef else 'off'} "
             f"ratio={totals['ratio']:.6f} max={max_ratio:.6f} "
             f"clipped={totals['clipped_fraction']:.1%} "
             "OOM-quarantined=0 "
@@ -2290,8 +2339,8 @@ class ProcessDistributedTrainer:
         from concurrent.futures import ThreadPoolExecutor
         from training.fast_distributed import local_spo_rs_update
 
-        if not _is_spo_rs_mode(getattr(cfg, "advantage_mode", "")):
-            raise ValueError("streaming clipped overlap is SPO-RS-only")
+        if not _uses_reward_history(getattr(cfg, "advantage_mode", "")):
+            raise ValueError("streaming historical overlap requires a historical advantage mode")
         if self._closed or not self._workers_idle:
             raise RuntimeError("process trainer is not idle for an SPO-RS overlap update")
         if self._spo_rs_overlap is not None:
@@ -2446,7 +2495,7 @@ class ProcessDistributedTrainer:
                     else:
                         grad_norm_tensor = torch.nn.utils.clip_grad_norm_(
                             [parameter for parameter in self.model.parameters() if parameter.requires_grad],
-                            max_norm=cfg.grad_clip,
+                            max_norm=_historical_grad_clip(cfg),
                             error_if_nonfinite=True)
                         self.optimizer.step()
                         grad_norm = float(grad_norm_tensor.item())
@@ -2513,7 +2562,7 @@ class ProcessDistributedTrainer:
             f"{peak_percentages}%; allocator caps/GPU={allocator_percentages}%", flush=True)
         print(f"[step {step_idx}] {cfg.advantage_mode} epoch 1/1: "
               f"loss={totals['loss']:.6f} "
-              f"reference=off "
+              f"reference={'on' if cfg.advantage_mode == 'hybrid' and cfg.kl_penalty_coef else 'off'} "
               f"ratio={totals['ratio']:.6f} max={max_ratio:.6f} "
               f"clipped={totals['clipped_fraction']:.1%} "
               f"OOM-quarantined={quarantined_examples} "

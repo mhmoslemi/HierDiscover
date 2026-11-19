@@ -97,7 +97,11 @@ def evaluate_batch(path):
         raise ValueError("isolated evaluation requires TriMul and at least one evaluation GPU")
     problem.begin_evaluation_batch()
 
-    def evaluate(row, response_path, metadata):
+    def evaluate(row):
+        response_path = rollout_path(root, step, row)
+        metadata = json.loads(response_path.with_suffix(".meta.json").read_text(encoding="utf-8"))
+        if metadata.get("trimul_isolated_evaluation"):
+            return metadata["raw_score"] if metadata["valid"] else None
         response = response_path.read_bytes().decode("utf-8")
         if row["format_issue"] is not None:
             result = RewardResult(reward=problem.fail_score, msg=row["format_issue"], failure_kind="code")
@@ -119,25 +123,13 @@ def evaluate_batch(path):
     best = batch["scoring"].get("previous_best_raw")
     bar = make_progress_bar(len(batch["candidates"]), desc="evaluating TriMul")
     try:
-        pending = []
-        for row in batch["candidates"]:
-            response_path = rollout_path(root, step, row)
-            metadata = json.loads(response_path.with_suffix(".meta.json").read_text(encoding="utf-8"))
-            if metadata.get("trimul_isolated_evaluation"):
-                raw = metadata["raw_score"] if metadata["valid"] else None
-                if raw is not None:
-                    best = raw if best is None else min(best, raw)
-                bar.update(1)
-            else:
-                pending.append((row, response_path, metadata))
         with ThreadPoolExecutor(max_workers=len(problem.kernel_gpu_ids)) as pool:
-            futures = [pool.submit(evaluate, *job) for job in pending]
+            futures = [pool.submit(evaluate, row) for row in batch["candidates"]]
             try:
                 for future in as_completed(futures):
                     raw = future.result()
                     if raw is not None and (best is None or raw < best):
-                        before = "unavailable" if best is None else f"{best:.9f}"
-                        getattr(bar, "write", print)(f"[step {step}] best before: {before} --> best now: {raw:.9f}")
+                        getattr(bar, "write", print)(f"[step {step}] best kernel runtime: {raw:.9f} µs")
                         best = raw
                     bar.update(1)
             except BaseException:

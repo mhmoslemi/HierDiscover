@@ -1193,6 +1193,11 @@ class UnslothBackend(_ModelPlacementBackend):
         packed_mxfp4 = bool(
             str(getattr(self.cfg, "coder_model_profile", ""))
             == "gpt-oss-120b" and not use_4bit)
+        shared_lora = packed_mxfp4 and bool(getattr(self.cfg, "gpt_oss_shared_lora", False))
+        gpu_checkpointing = shared_lora and getattr(
+            self.cfg, "hardware_profile", None) in {"B200", "B200_full_ram"}
+        # Unsloth's smart mode moves checkpoint inputs through host RAM.
+        checkpointing_mode = True if gpu_checkpointing else "unsloth"
 
         device_map = _training_device_map(self.cfg)
         print(f"[backend=unsloth] loading {training_name} across "
@@ -1203,6 +1208,7 @@ class UnslothBackend(_ModelPlacementBackend):
             max_seq_length=self.cfg.max_seq_length,
             load_in_4bit=use_4bit,
             dtype=torch.bfloat16,
+            use_gradient_checkpointing=checkpointing_mode,
             # Resolve the base once for both LoRA training and rollout workers.
             use_exact_model_name=True,
             local_files_only=local_files_only,
@@ -1223,7 +1229,6 @@ class UnslothBackend(_ModelPlacementBackend):
             print("[precision] verified packed MXFP4 bytes and scales in all "
                   f"{model.config.num_hidden_layers} expert layers", flush=True)
         _validate_gpt_oss_training_attention(model, self.cfg)
-        shared_lora = packed_mxfp4 and bool(getattr(self.cfg, "gpt_oss_shared_lora", False))
         adapter_options = {}
         if shared_lora:
             from models.gpt_oss_lora import ATTENTION_AND_HEAD_TARGETS, install_shared_expert_lora
@@ -1243,13 +1248,16 @@ class UnslothBackend(_ModelPlacementBackend):
             lora_dropout=self.cfg.lora_dropout,
             target_modules=target_modules,
             bias="none",
-            use_gradient_checkpointing="unsloth",
+            use_gradient_checkpointing=checkpointing_mode,
             random_state=self.cfg.seed,
             **adapter_options,
         )
         if shared_lora:
             install_shared_expert_lora(
                 model, _lora_rank(self.cfg), self.cfg.lora_alpha, self.cfg.lora_dropout)
+        model._ttt_gpu_resident_checkpoints = gpu_checkpointing
+        if gpu_checkpointing:
+            print("[memory] GPT-OSS GPU-resident gradient checkpoints enabled", flush=True)
         set_gradient_checkpointing(model, False)
         if str(getattr(self.cfg, "coder_model_profile", "")) == "gpt-oss-120b":
             from models.gpt_oss_training import install_attention_layout_guards

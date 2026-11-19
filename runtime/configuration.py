@@ -48,6 +48,10 @@ def _uses_clipped_policy_loss(mode):
     return _is_spo_rs_mode(mode)
 
 
+def _uses_reward_history(mode):
+    return str(mode).lower() in {"spo-rs", "hybrid"}
+
+
 def _normalize_saved_advantage_config(saved):
     """Migrate retained policy controls without reactivating removed objectives."""
     saved = dict(saved)
@@ -55,7 +59,8 @@ def _normalize_saved_advantage_config(saved):
     if mode not in ADVANTAGE_MODES or saved.get("binary_coder_training", False):
         raise ValueError(
             'saved run uses an unsupported training objective. '
-            'Choose a run that used entropic or spo-rs.')
+            f'Choose a run that used one of {ADVANTAGE_MODES}.')
+    saved["advantage_mode"] = mode
     if _is_spo_rs_mode(mode) and (
             saved.get("spo_rs_adaptive_beta")
             or saved.get("spo_rs_reward_shaping") not in (None, "exponential")):
@@ -85,14 +90,17 @@ def _resolve_policy_options(merged):
             raise ValueError(f"{name} must be finite and in (0, 1)")
         merged[name] = value
     sequence_policy = _is_exact_qwen3_30b_a3b(merged["coder_model_name"])
-    if _uses_clipped_policy_loss(merged.get("advantage_mode")) or sequence_policy:
-        if int(merged["group_size"]) < 2:
-            raise ValueError("sequence/clipped policy modes require group_size >= 2")
+    clipped = _uses_clipped_policy_loss(merged.get("advantage_mode")) or sequence_policy
+    if clipped and int(merged["group_size"]) < 2:
+        raise ValueError("sequence/clipped policy modes require group_size >= 2")
+    if clipped or merged.get("advantage_mode") == "hybrid":
         kl_coef = float(merged["kl_penalty_coef"])
         if not math.isfinite(kl_coef) or kl_coef < 0.0:
             raise ValueError("kl_penalty_coef must be finite and nonnegative")
+        if merged.get("advantage_mode") == "hybrid":
+            merged["kl_penalty_coef"] = kl_coef
         if float(merged["temperature"]) != 1.0 or float(merged["top_p"]) != 1.0:
-            print("[config] sequence/clipped policy training sets temperature=1 "
+            print("[config] full-policy training sets temperature=1 "
                   "and top_p=1 to match its policy likelihood")
         merged["temperature"] = 1.0
         merged["top_p"] = 1.0
@@ -101,17 +109,19 @@ def _resolve_policy_options(merged):
 
 
 def _resolve_spo_rs_options(merged):
-    if not _is_spo_rs_mode(merged.get("advantage_mode")):
+    if not _uses_reward_history(merged.get("advantage_mode")):
         return
 
+    clipped = _is_spo_rs_mode(merged.get("advantage_mode"))
     raw_clip_epsilon = merged.get("spo_rs_clip_epsilon")
     defaults = {
         "spo_rs_beta": SPO_RS_BETA_DEFAULT,
         "spo_rs_d_half": SPO_RS_D_HALF_DEFAULT,
         "spo_rs_rho_min": SPO_RS_RHO_MIN_DEFAULT,
         "spo_rs_rho_max": SPO_RS_RHO_MAX_DEFAULT,
-        "spo_rs_clip_epsilon": SPO_RS_CLIP_EPSILON_DEFAULT,
     }
+    if clipped:
+        defaults["spo_rs_clip_epsilon"] = SPO_RS_CLIP_EPSILON_DEFAULT
     for name, default in defaults.items():
         raw = merged.get(name)
         value = default if raw is None else float(raw)
@@ -124,6 +134,8 @@ def _resolve_spo_rs_options(merged):
         raise ValueError("spo_rs_d_half must be positive")
     if not (0.0 < merged["spo_rs_rho_min"] <= merged["spo_rs_rho_max"] < 1.0):
         raise ValueError("SPO-RS rho bounds must satisfy 0 < rho_min <= rho_max < 1")
+    if not clipped:
+        return
     if not 0.0 < merged["spo_rs_clip_epsilon"] < 1.0:
         raise ValueError("spo_rs_clip_epsilon must be in (0, 1)")
     side_defaults = {
@@ -235,8 +247,8 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--kl-penalty-coef", type=float, default=None)
     p.add_argument("--advantage-mode", type=str.lower,
                    choices=list(ADVANTAGE_MODES), default=None,
-                   help="Objective: entropic (adaptive beta within each group, "
-                        "default) or spo-rs (historical entropic value tracking).")
+                   help="Objective: entropic (adaptive beta), spo-rs (historical "
+                        "baseline), or hybrid (historical and sibling credit with the TTT loss).")
     p.add_argument("--sequence-clip-epsilon-low", type=float, default=None,
                    help="Entropic Qwen3-30B-A3B sequence-ratio clipping distance "
                         "below 1 (default 0.2).")
@@ -665,10 +677,20 @@ def load_config():
     if generation_backend not in ("hf", "vllm"):
         raise ValueError("generation_backend must be 'hf' or 'vllm'")
     merged["generation_backend"] = generation_backend
-    advantage_mode = str(merged.get("advantage_mode") or "entropic").lower()
+    advantage_mode = str(merged.get("advantage_mode") or
+                         os.environ.get("TTT_LAUNCH_ADVANTAGE_DEFAULT", "entropic")).lower()
     if advantage_mode not in ADVANTAGE_MODES:
         raise ValueError(f"advantage_mode must be one of {ADVANTAGE_MODES}")
     merged["advantage_mode"] = advantage_mode
+    saved_mode = str(saved.get("advantage_mode") or "entropic").lower()
+    if saved and advantage_mode != saved_mode and "hybrid" in {advantage_mode, saved_mode}:
+        raise ValueError("Resume a hybrid run with its saved advantage mode and reward scale")
+    if advantage_mode == "hybrid":
+        merged["grad_clip"] = 0.0
+        if not saved and args.kl_penalty_coef is None:
+            merged["kl_penalty_coef"] = 0.1
+        if saved and float(merged["kl_penalty_coef"]) != float(saved["kl_penalty_coef"]):
+            raise ValueError("Hybrid resume requires the saved reference KL coefficient")
     merged["uct"] = bool(merged.get("uct", False))
     if merged["frozen_solver"]:
         merged.setdefault("strategy_temperature", 1.0)
@@ -858,7 +880,7 @@ def load_config():
                 "with an HF LoRA or GPT-OSS-120B packed-MXFP4 Unsloth replica on each GPU.")
 
     if (resume_dir is not None and not merged["no_train"]
-            and _is_spo_rs_mode(merged["advantage_mode"])):
+            and _uses_reward_history(merged["advantage_mode"])):
         recovery = _read_exact_sharded_recovery(resume_dir)
         if recovery is not None:
             step = int(recovery["step"])
@@ -1016,7 +1038,16 @@ def load_config():
     # Resumes must keep the reward units stored in the archive and SPO-RS tracker.
     from problems.base import ERDOS_REWARD_ANCHORS, TRIMUL_REWARD_POINTS
     reward_task = str(merged.get("problem_type", merged["problem"])).lower()
-    if reward_task == "trimul":
+    if advantage_mode == "hybrid":
+        merged["fail_score"] = 0.0
+        if reward_task in {"trimul", "mla_decode_nvidia"}:
+            merged["score_scale"] = 1500.0 if reward_task == "trimul" else 5000.0
+        if reward_task == "trimul":
+            merged["trimul_reward_points"] = None
+            merged["erdos_reward_anchors"] = None
+        elif reward_task == "ac1":
+            merged["erdos_reward_anchors"] = None
+    elif reward_task == "trimul":
         merged["trimul_reward_points"] = (saved.get("trimul_reward_points") if saved
                                           else TRIMUL_REWARD_POINTS)
     elif reward_task in ERDOS_REWARD_ANCHORS:

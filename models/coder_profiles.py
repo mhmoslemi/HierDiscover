@@ -192,4 +192,5 @@ def _apply_coder_model_profile(merged, explicit_keys=frozenset()):
 
 def _uses_sequence_level_policy_ratio(cfg):
     """Use the MoE-stable sequence ratio only for plain Qwen3-30B-A3B."""
-    return _is_exact_qwen3_30b_a3b(cfg.coder_model_name)
+    return (getattr(cfg, "advantage_mode", "") != "hybrid"
+            and _is_exact_qwen3_30b_a3b(cfg.coder_model_name))

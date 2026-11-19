@@ -300,7 +300,8 @@ def parse_terminal_log(path, max_lines=4000):
             kind = "coding_start"
         elif "vLLM logprobs" in clean:
             kind = "logprobs"
-        elif "SPO-RS evaluation/training overlap started" in clean:
+        elif ("SPO-RS evaluation/training overlap started" in clean
+              or "hybrid evaluation/training overlap started" in clean):
             kind = "train_start"
         elif "parents picked:" in clean:
             kind = "pick"
@@ -555,7 +556,8 @@ def collect(run_dir, code_per_step=25, all_code=False, think_full=False, progres
                     "spo_rs_divergence", "spo_rs_context_divergences", "training_seconds",
                     "cumulative_training_seconds", "oom_quarantined_examples", "fast_trained_examples_per_gpu",
                     "fast_padded_token_budgets", "fast_peak_memory_fraction", "training_parallel_gpus",
-                    "spo_rs_policy_updated", "spo_rs_sampling_adapter", "result_metric_name", "result_maximize"]
+                    "spo_rs_policy_updated", "spo_rs_sampling_adapter", "result_metric_name", "result_maximize",
+                    "hybrid_reference_kl_mean", "hybrid_sibling_weight"]
             for k in keep:
                 if k in summ:
                     rec[k] = summ[k]

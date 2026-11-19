@@ -41,7 +41,7 @@ registerTab({
       kpi("Programs", fmt.n(rows.length), `${valid.length} valid (${fmt.pct(rows.length ? valid.length / rows.length : NaN)})`),
       kpi("Best " + PROB.metric, valid.length ? fmt.raw(Math.min(...valid.map(r => r.raw))) : "–", valid.length ? `median valid ${fmt.raw(median(valid.map(r => r.raw)))}` : ""),
       kpi("Beat their parent", fmt.n(rows.filter(r => r.improved).length), `${fmt.pct(rows.length ? rows.filter(r => r.improved).length / rows.length : NaN)} of programs`),
-      kpi("Advantage (valid / failed)", `${fmt.f(mean(valid.map(r => advIsWhatIf() ? advWhatIf(r) : r.adv)), 3)} / ${fmt.f(mean(rows.filter(r => !r.valid).map(r => advIsWhatIf() ? advWhatIf(r) : r.adv)), 3)}`, advIsWhatIf() ? "<span class='what-if'>what-if β, v</span> (see SPO² tab)" : "logged SPO² advantages"),
+      kpi("Advantage (valid / failed)", `${fmt.f(mean(valid.map(r => advIsWhatIf() ? advWhatIf(r) : r.adv)), 3)} / ${fmt.f(mean(rows.filter(r => !r.valid).map(r => advIsWhatIf() ? advWhatIf(r) : r.adv)), 3)}`, advIsWhatIf() ? "<span class='what-if'>what-if β, v</span> (see SPO² tab)" : (CFG.advantage_mode === "hybrid" ? "logged hybrid advantages" : "logged SPO² advantages")),
       kpi("Mean response", fmt.tok(Math.round(mean(rows.map(r => r.ntok || 0)))) + " tok", `valid ${fmt.tok(Math.round(mean(valid.map(r => r.ntok || 0))))} · invalid ${fmt.tok(Math.round(mean(rows.filter(r => !r.valid).map(r => r.ntok || 0))))}`)));
 
     // ----- scatter

@@ -107,8 +107,10 @@ def initialize_groups(world_size):
 
 def availability(model, cfg, world_size):
     """Never substitute independent sequence chunks or a slow recurrent kernel."""
+    from runtime.configuration import _uses_reward_history
+
     if (getattr(cfg, "coder_model_profile", "") != "qwen3.8-27b"
-            or getattr(cfg, "advantage_mode", "") != "spo-rs"
+            or not _uses_reward_history(getattr(cfg, "advantage_mode", ""))
             or world_size < 2 or world_size & (world_size - 1)):
         return False, "not a supported hybrid Qwen replicated SPO-RS layout"
     try:
@@ -351,22 +353,23 @@ def compute_context_work(backend, tokenizer, example, cfg, group, ranks, *, vali
         backend._validated_context_groups.add(ranks)
     with hybrid_context(model, group) as context:
         with training._policy_dropout_disabled(model):
+            hybrid = cfg.advantage_mode == "hybrid"
             missing = training._initialize_behavior_logprobs([example])
-            old = example.get("old_policy_logprobs")
             if missing:
-                old = token_logprobs(model, example, tokenizer, cfg, context, with_grad=False)
+                if hybrid:
+                    raise ValueError("hybrid context training requires the original sampler logprobs")
+                example["old_policy_logprobs"] = token_logprobs(
+                    model, example, tokenizer, cfg, context, with_grad=False)
             current = token_logprobs(model, example, tokenizer, cfg, context)
-            epsilon, low, high, kl = training._clipped_policy_options(cfg)
-            loss, metrics = training.clipped_policy_loss(
-                cfg, current, old.to(device), None, example["advantage"],
-                clip_epsilon=epsilon, clip_epsilon_low=low,
-                clip_epsilon_high=high, kl_coef=kl)
+            clip_options = None if hybrid else training._clipped_policy_options(cfg)
+            loss, metrics = training.historical_policy_loss(cfg, current, example, clip_options)
             if not torch.isfinite(loss).all():
                 raise FloatingPointError("nonfinite context-parallel policy loss")
             weight = float(example["sample_weight"])
+            loss_weight = 1.0 if hybrid else weight
             # Every rank sees the gathered loss. Its gather backward sums those
             # copies; divide here, then SUM parameter gradients across the group.
-            (weight * loss / context.size).backward()
+            (loss_weight * loss / context.size).backward()
     from training.fast_distributed import reduce_trainable_gradients
 
     reduce_trainable_gradients(model, destination_rank=ranks[0], group=group)
@@ -374,9 +377,9 @@ def compute_context_work(backend, tokenizer, example, cfg, group, ranks, *, vali
                  for name, parameter in model.named_parameters()
                  if parameter.requires_grad and parameter.grad is not None}
     model.zero_grad(set_to_none=True)
-    totals = {name: weight * float(metrics[name]) for name in
-              ("policy_loss", "kl_estimate", "ratio")}
-    totals.update(loss=weight * float(loss.detach()),
+    totals = {name: weight * float(metrics[name]) for name in ("kl_estimate", "ratio")}
+    totals.update(loss=loss_weight * float(loss.detach()),
+                  policy_loss=loss_weight * metrics["policy_loss"],
                   clipped_fraction=weight * float(metrics["clipped"]))
     result = dict(completed=True, stats=dict(
         totals=totals, max_ratio=float(metrics["ratio"]),
@@ -414,6 +417,10 @@ def _validate_context_group(backend, tokenizer, example, cfg, group, ranks):
                 advantage=1.0, sample_weight=1.0)
     size = mini["response_ids"].shape[1]
     old = torch.empty(size, dtype=torch.float32, device=device)
+    hybrid = cfg.advantage_mode == "hybrid"
+    if hybrid:
+        mini.update(reference_logprobs=old, reference_logprob_mean=0.0)
+    clip_options = None if hybrid else training._clipped_policy_options(cfg)
     reference_gradients = None
     if leader:
         print(f"[train-context] checking forward/gradient equivalence on GPUs {list(ranks)} "
@@ -429,10 +436,8 @@ def _validate_context_group(backend, tokenizer, example, cfg, group, ranks):
                 model, source, None, [(prompt.numel() - 1, total)], [response[0]],
                 with_grad=True, chunk=cfg.logprob_chunk)[0]
             old.copy_(scores.detach())
-            epsilon, low, high, kl = training._clipped_policy_options(cfg)
-            loss, _ = training.clipped_policy_loss(
-                cfg, scores, old, None, 1.0, clip_epsilon=epsilon,
-                clip_epsilon_low=low, clip_epsilon_high=high, kl_coef=kl)
+            mini["old_policy_logprobs"] = old
+            loss, _ = training.historical_policy_loss(cfg, scores, mini, clip_options)
             loss.backward()
         reference_gradients = {name: parameter.grad.detach().cpu().clone()
                                for name, parameter in model.named_parameters()

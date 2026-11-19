@@ -306,10 +306,11 @@ async function openRollout(rid) {
   root.innerHTML = "";
   const st = ST[r.step] || {};
   const spo = st.spo;
+  const hybrid = CFG.advantage_mode === "hybrid";
   const beta = 2.0;
   const G = Math.exp(beta * r.reward);
   const v = spo ? spo.value_before : null;
-  const advCalc = v ? (G / v - 1) / beta : null;
+  const advCalc = v && !hybrid ? (G / v - 1) / beta : null;
   const kv = [
     ["Outcome", r.valid ? `<span class="pill good">valid</span> ${esc(PROB.metric)} <b>${fmt.raw(r.raw)}</b> (reward ${fmt.f(r.reward, 6)})` : `<span class="pill bad">invalid</span> ${esc(r.fail || "failed")} - ${esc(r.msg)}`],
     ["Rollout", `${r.sidx == null ? "Direct rollout" : "Strategy S" + r.sidx}${r.fallback ? ' · <span class="pill warn">strategist fallback</span>' : ""}`],
@@ -317,7 +318,7 @@ async function openRollout(rid) {
     ["Parent score", `raw ${fmt.raw(r.praw)} (reward ${fmt.f(r.pval, 6)}) ${r.valid ? (r.improved ? '<span class="pill good">beats parent</span>' : '<span class="pill">not better than parent</span>') : ""}`],
     ["Response tokens", `${fmt.n(r.ntok)}${r.think_chars != null ? ` · reasoning ${fmt.n(r.think_chars)} chars` : ""}`],
     ["Sequence length n", r.n ? fmt.n(r.n) : "–"],
-    ["SPO² advantage", `logged <b>${fmt.f(r.adv, 5)}</b>` + (advCalc != null ? ` · recomputed (exp(2·r)/v − 1)/2 with v=${fmt.f(v, 4)} → ${fmt.f(advCalc, 5)}` : "") +
+    [hybrid ? "Hybrid advantage" : "SPO² advantage", `logged <b>${fmt.f(r.adv, 5)}</b>` + (advCalc != null ? ` · recomputed (exp(2·r)/v − 1)/2 with v=${fmt.f(v, 4)} → ${fmt.f(advCalc, 5)}` : "") +
       (advIsWhatIf() ? ` · <span class="what-if">what-if</span> β=${P.beta.toFixed(1)}, v=${fmt.f(advParams(r.step).v, 4)} → <b>${fmt.f(advWhatIf(r), 5)}</b>` : "")],
   ];
   root.append(h("div", { class: "kv", html: kv.map(([k, vv]) => `<div class="k">${k}</div><div class="v">${vv}</div>`).join("") }));
@@ -497,8 +498,15 @@ function advParams(step) {
   const v = P.vOver[step] != null ? P.vOver[step] : (t ? t.vb : null);
   return { beta: P.beta, v, simV: t ? t.vb : null };
 }
-function advWhatIf(r) { const a = advParams(r.step); return a.v ? (Math.exp(a.beta * r.reward) / a.v - 1) / a.beta : null; }
-function advIsWhatIf() { return P.beta !== DEFAULT_P.beta || P.dHalf !== DEFAULT_P.dHalf || P.rhoMin !== DEFAULT_P.rhoMin || P.rhoMax !== DEFAULT_P.rhoMax || Object.keys(P.vOver).length > 0; }
+function advWhatIf(r) {
+  if (CFG.advantage_mode === "hybrid") return r.adv;
+  const a = advParams(r.step);
+  return a.v ? (Math.exp(a.beta * r.reward) / a.v - 1) / a.beta : null;
+}
+function advIsWhatIf() {
+  if (CFG.advantage_mode === "hybrid") return false;
+  return P.beta !== DEFAULT_P.beta || P.dHalf !== DEFAULT_P.dHalf || P.rhoMin !== DEFAULT_P.rhoMin || P.rhoMax !== DEFAULT_P.rhoMax || Object.keys(P.vOver).length > 0;
+}
 
 /* ------------------------------------------------------------------ entry animations / playback -- */
 let ANIM = false;

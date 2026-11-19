@@ -7,7 +7,7 @@ from numbers import Real
 from pathlib import Path
 
 
-ADVANTAGE_MODES = ("entropic", "spo-rs")
+ADVANTAGE_MODES = ("entropic", "spo-rs", "hybrid")
 PARENT_SELECTION_MODES = ("puct", "uct", "puct-jev")
 LEGACY_CODER_CAP_KEY = "coder_thinking_budget"
 
@@ -285,7 +285,7 @@ def validate_problem_config(
     if ("advantage_mode" in data
             and data["advantage_mode"] not in ADVANTAGE_MODES):
         raise ValueError(
-            f"{_label(source)}: advantage_mode must be entropic or spo-rs")
+            f"{_label(source)}: advantage_mode must be one of {ADVANTAGE_MODES}")
     for key in ("sequence_clip_epsilon_low", "sequence_clip_epsilon_high"):
         if key in data and not 0.0 < float(data[key]) < 1.0:
             raise ValueError(f"{_label(source)}: {key} must be in (0, 1)")
