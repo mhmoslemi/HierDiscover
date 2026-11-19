@@ -29,19 +29,24 @@ def _gpu_busy_reason(gpu_id: int, parked_trainer_pids) -> str:
         processes = gpu.find("processes")
         if processes is None or (processes.text or "").strip():
             raise ValueError("process list is unavailable")
-        pids = {int(process.findtext("pid", "")) for process in processes.findall("process_info")}
+        by_pid = {int(process.findtext("pid", "")): process
+                  for process in processes.findall("process_info")}
+        parked_mib = sum(
+            int(by_pid[pid].findtext("used_memory", "").split()[0])
+            for pid in by_pid.keys() & parked_trainer_pids
+        )
     except (OSError, subprocess.SubprocessError, ElementTree.ParseError, ValueError, IndexError) as exc:
         raise GPUNotIdle(f"Could not verify physical GPU {gpu_id} before benchmarking: {exc}") from exc
 
-    foreign_pids = sorted(pids - parked_trainer_pids)
-    # Parking releases model/optimizer tensors. Keep a bounded allowance for
-    # CUDA/NCCL contexts from these already parked trainer processes.
-    memory_allowance_mib = 4096 if (pids & parked_trainer_pids) else 512
-    if not (gpu_util or memory_util or foreign_pids or used_mib > memory_allowance_mib):
+    foreign_pids = sorted(by_pid.keys() - parked_trainer_pids)
+    # Parked CUDA/NCCL contexts retain VRAM even when the GPU is idle.
+    unattributed_mib = max(0, used_mib - parked_mib)
+    if not (gpu_util or memory_util or foreign_pids or unattributed_mib > 512):
         return ""
     return (f"GPU utilization {gpu_util}%, memory activity {memory_util}%, "
-            f"VRAM {used_mib} MiB (idle allowance {memory_allowance_mib} MiB), "
-            f"GPU PIDs {sorted(pids)}, non-trainer PIDs {foreign_pids}")
+            f"VRAM {used_mib} MiB ({parked_mib} MiB parked trainer, "
+            f"{unattributed_mib} MiB outside the parked trainer), "
+            f"GPU PIDs {sorted(by_pid)}, non-trainer PIDs {foreign_pids}")
 
 
 def wait_for_idle_gpu(gpu_id: int, parked_trainer_pids=(), *, on_busy=None) -> None:
