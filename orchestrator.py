@@ -64,7 +64,7 @@ from training.trainers import (
     clipped_surrogate_loss as clipped_surrogate_loss,
     compute_group_advantages, compute_token_logprobs as compute_token_logprobs,
 )
-from training.hybrid import SIBLING_WEIGHT, hybrid_advantages, reference_logprob_mean
+from training.hybrid import hybrid_advantages, reference_logprob_mean
 
 
 _ANSI_ORANGE = "\033[38;5;208m"
@@ -1489,7 +1489,8 @@ def _resume_spo_rs_step_from_artifacts(
         for start in range(0, len(rewards), group_size):
             siblings = slice(start, start + group_size)
             recovered_advantages[siblings], _ = hybrid_advantages(
-                rewards[siblings], recovered_advantages[siblings])
+                rewards[siblings], recovered_advantages[siblings],
+                sibling_weight=cfg.hybrid_sibling_weight)
     spo_info = spo_infos[0]
     saved_value_before = spo_info.get("value_before")
     if (saved_value_before is None
@@ -1782,7 +1783,7 @@ def _resume_spo_rs_step_from_artifacts(
         stats.update(frozen_pass["stats"])
     if hybrid_mode:
         stats["hybrid_reference_kl_mean"] = hybrid_reference_mean
-        stats["hybrid_sibling_weight"] = SIBLING_WEIGHT
+        stats["hybrid_sibling_weight"] = cfg.hybrid_sibling_weight
     if overflow_state is not None:
         stats.update(parallel_trainer.recover_spo_rs_overflow(recovery_examples, cfg, step_idx, overflow_state))
     elif all_examples:
@@ -2857,7 +2858,9 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                                 for group_id in ready_groups:
                                     ready_examples = examples_by_group.pop(group_id)
                                     _complete_spo_rs_overlap_examples(
-                                        ready_examples, spo_rs_tracker, sibling_futures=reward_futures[group_id])
+                                        ready_examples, spo_rs_tracker,
+                                        sibling_futures=reward_futures[group_id],
+                                        sibling_weight=cfg.hybrid_sibling_weight)
                                     parallel_trainer.queue_spo_rs_overlap(ready_examples)
                                 if not ready_groups:
                                     wait([f for g in examples_by_group for f in reward_futures[g] if not f.done()],
@@ -3146,7 +3149,8 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
             adv_scale = float(cfg.spo_rs_beta)
             adv_scale_label = "beta"
             if hybrid_mode:
-                advantages, sibling_beta = hybrid_advantages(rewards_np, advantages)
+                advantages, sibling_beta = hybrid_advantages(
+                    rewards_np, advantages, sibling_weight=cfg.hybrid_sibling_weight)
         else:
             advantages, adv_scale = compute_group_advantages(rewards_np)
             adv_scale_label = "beta"
@@ -3521,7 +3525,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
         step_stats["spo_rs_policy_updated"] = False
     if hybrid_mode:
         step_stats["hybrid_reference_kl_mean"] = hybrid_reference_mean
-        step_stats["hybrid_sibling_weight"] = SIBLING_WEIGHT
+        step_stats["hybrid_sibling_weight"] = cfg.hybrid_sibling_weight
 
     if frozen_pass is not None:
         step_stats.update(frozen_pass["stats"])
@@ -3760,7 +3764,7 @@ def main():
         print(f"SPO-RS D_half:      {cfg.spo_rs_d_half}")
         print(f"SPO-RS rho min/max: {cfg.spo_rs_rho_min} / {cfg.spo_rs_rho_max}")
         if hybrid_mode:
-            print(f"Hybrid sibling weight: {SIBLING_WEIGHT:g}")
+            print(f"Hybrid sibling weight: {cfg.hybrid_sibling_weight:g}")
             print("Policy loss:        TTT token-summed importance sampling")
         else:
             print(f"SPO-RS clip eps low/high: "

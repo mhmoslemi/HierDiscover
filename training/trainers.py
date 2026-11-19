@@ -24,6 +24,7 @@ from training.exact_overflow import (
     _write_exact_spo_rs_overflow_state, _validate_precomputed_exact_gradients,
 )
 from training.fast_distributed import _move_optimizer_state, _restore_optimizer_state_to_parameters
+from training.hybrid import DEFAULT_SIBLING_WEIGHT, hybrid_advantages
 
 
 _FUSED_LONG_SINGLETON_MIN_TOKENS = 8192
@@ -1204,8 +1205,9 @@ def _prepare_spo_rs_overlap_inputs(tokenizer, group_responses, reward_futures, p
     return prepared
 
 
-def _complete_spo_rs_overlap_examples(examples, spo_rs_tracker=None, *, sibling_futures=None):
-    """Attach historical SPO advantages as individual CPU rewards finish."""
+def _complete_spo_rs_overlap_examples(examples, spo_rs_tracker=None, *, sibling_futures=None,
+                                      sibling_weight=DEFAULT_SIBLING_WEIGHT):
+    """Attach advantages to reward-complete trajectories."""
     if not examples:
         return []
     futures = [example.get("_overlap_reward_future") for example in examples]
@@ -1219,9 +1221,7 @@ def _complete_spo_rs_overlap_examples(examples, spo_rs_tracker=None, *, sibling_
     if advantages is None:
         raise RuntimeError("SPO-RS overlap lost its frozen pre-step tracker baseline")
     if sibling_futures is not None:
-        from training.hybrid import hybrid_advantages
-
-        advantages, _ = hybrid_advantages(rewards, advantages)
+        advantages, _ = hybrid_advantages(rewards, advantages, sibling_weight=sibling_weight)
         advantages = [advantages[example["rollout_index"]] for example in examples]
     for example, advantage in zip(examples, advantages):
         example["advantage"] = float(advantage)

@@ -12,7 +12,7 @@ import yaml
 from config_validation import (
     ADVANTAGE_MODES, COMMON_OPTIONAL_KEYS, COMMON_REQUIRED_KEYS, LEGACY_CODER_CAP_KEY,
     PARENT_SELECTION_MODES, RETIRED_BATCH_GROWTH_KEYS, RETIRED_TRAINER_KEYS, reject_retired_coder_cap,
-    validate_problem_config,
+    validate_hybrid_sibling_weight, validate_problem_config,
 )
 from runtime.hardware_profiles import generation_cpu_ids, local_checkpoint, restore_hardware_settings
 
@@ -27,6 +27,7 @@ from training.exact_overflow import (
     _clear_exact_sharded_recovery, _infer_exact_sharded_recovery, _read_exact_sharded_recovery,
     _write_exact_sharded_recovery, supports_warm_overflow,
 )
+from training.hybrid import DEFAULT_SIBLING_WEIGHT
 
 
 SEQUENCE_CLIP_EPSILON_DEFAULT = 0.2
@@ -686,6 +687,10 @@ def load_config():
     if saved and advantage_mode != saved_mode and "hybrid" in {advantage_mode, saved_mode}:
         raise ValueError("Resume a hybrid run with its saved advantage mode and reward scale")
     if advantage_mode == "hybrid":
+        # A preexisting hybrid run used 0.10 when its config had no weight.
+        sibling_weight = (saved or merged).get("hybrid_sibling_weight", DEFAULT_SIBLING_WEIGHT)
+        validate_hybrid_sibling_weight(sibling_weight, source=saved_config_path if saved else cfg_path)
+        merged["hybrid_sibling_weight"] = float(sibling_weight)
         merged["grad_clip"] = 0.0
         if not saved and args.kl_penalty_coef is None:
             merged["kl_penalty_coef"] = 0.1

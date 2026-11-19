@@ -5,10 +5,10 @@ import numpy as np
 from training.advantage import entropic_adaptive_advantages
 
 
-SIBLING_WEIGHT = 0.10
+DEFAULT_SIBLING_WEIGHT = 0.10
 
 
-def hybrid_advantages(rewards, historical_advantages):
+def hybrid_advantages(rewards, historical_advantages, *, sibling_weight=DEFAULT_SIBLING_WEIGHT):
     """Add a centered adaptive-softmax adjustment for one complete parent group."""
     rewards = np.asarray(rewards, dtype=np.float64)
     historical_advantages = np.asarray(historical_advantages, dtype=np.float64)
@@ -16,7 +16,7 @@ def hybrid_advantages(rewards, historical_advantages):
         raise ValueError("hybrid rewards and historical advantages must align in one nonempty group")
     _, sibling_beta = entropic_adaptive_advantages(rewards)
     weights = np.exp(sibling_beta * (rewards - rewards.max()))
-    adjustment = SIBLING_WEIGHT * (weights / weights.sum() - 1.0 / rewards.size)
+    adjustment = sibling_weight * (weights / weights.sum() - 1.0 / rewards.size)
     return historical_advantages + adjustment, sibling_beta
 
 
