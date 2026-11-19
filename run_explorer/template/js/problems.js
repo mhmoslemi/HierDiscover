@@ -147,6 +147,24 @@ function setupProblem() {
   PROB.score = vals => PROB.prep ? PROB.prep(vals).mx : NaN;
   // facts about the run
   const roots = (TREE.roots || []).map(i => TREE.nodes[i][1]).filter(x => x > 0);
+  PROB.rawForReward = reward => (CFG.score_scale || PROB.rewardScale || 1) / reward;
+  if (Array.isArray(CFG.erdos_reward_anchors)) {
+    const [seed, goal] = CFG.erdos_reward_anchors;
+    PROB.seedRewardFixed = 2;
+    PROB.rawForReward = reward => {
+      const raw = goal + (1 / reward - 0.38086) * (seed - goal) / (0.5 - 0.38086);
+      return Number.isFinite(raw) && raw >= 0 ? raw : null;
+    };
+    PROB.rewardShort = "Erdős-scaled reward";
+    PROB.rewardText = "Reciprocal of the Erdős-equivalent score. Failures get reward 0.";
+    PROB.evalEq = PROB.evalEq.split("\n")[0] + `\nequivalent = 0.38086 + (0.5 − 0.38086) × (raw − ${goal}) / (${seed} − ${goal})\nreward = 1 / equivalent          (failure ⇒ 0)`;
+    PROB.evalBody = `<p>The evaluator checks each program and computes its ${PROB.metric}. The reward maps a raw score of ${seed} to 2.0 and ${goal} to 2.625637. Failed programs get reward 0.</p>`;
+    PROB.evalRefs = [PROB.file, "problems/base.py (erdos_scaled_reward)"];
+    if (PROB.kernel) {
+      const parents = CFG.seed_from_reference ? "reference kernels" : "empty archive roots";
+      PROB.seedText = `${parents} with a synthetic ${seed} µs SPO-RS anchor`;
+    }
+  }
   PROB.seedRaw = roots.length ? mean(roots) : NaN;
   PROB.seedRewards = PROB.seedRewardFixed != null ? [PROB.seedRewardFixed] : roots.map(x => 1 / x);
   PROB.seedReward = PROB.seedRewardFixed != null ? PROB.seedRewardFixed : (roots.length ? mean(PROB.seedRewards) : 0.5);

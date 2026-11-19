@@ -50,7 +50,7 @@ function playground(root, step) {
     const sample = []; const seen = new Set();
     rs.forEach(r => { const k = Math.round(r.reward * 200) + ":" + Math.round((r.adv || 0) * 500); if (!seen.has(k) && r.adv != null) { seen.add(k); sample.push([r.reward, r.adv]); } });
     lineChart(host, {
-      height: 300, xLabel: "reward r = 1 / " + PROB.metric, yLabel: "advantage A", margin: { l: 56 }, xDomain: [-0.02 * PROB.rewardMax, PROB.rewardMax], xTicks: niceTicks(0, PROB.rewardMax, 7), yFmt: x => x.toFixed(2),
+      height: 300, xLabel: "reward r", yLabel: "advantage A", margin: { l: 56 }, xDomain: [-0.02 * PROB.rewardMax, PROB.rewardMax], xTicks: niceTicks(0, PROB.rewardMax, 7), yFmt: x => x.toFixed(2),
       series: [
         { name: "A(r)", color: S_COL(0), pts: range(0, 73).map(i => { const r = i * PROB.rewardMax / 72; return [r, spoAdv(r, v, beta)]; }), dots: false, width: 2.4 },
         { name: "programs", color: S_COL(1), pts: sample.sort((a, b) => a[0] - b[0]).slice(0, 80), width: 0, dotR: 4 },
@@ -60,12 +60,12 @@ function playground(root, step) {
     const rstar = Math.log(v) / beta, valid = rs.filter(r => r.valid).map(r => r.reward), med = median(valid), best = Math.max(...valid, 0);
     info.innerHTML = "";
     info.append(h("div", { class: "kv", html:
-      `<div class="k">Break-even r*</div><div class="v"><b>${fmt.f(rstar, 4)}</b> = ln(v)/β ⇒ ${PROB.metric} ${fmt.f(1 / rstar, 4)}</div>` +
+      `<div class="k">Break-even r*</div><div class="v"><b>${fmt.f(rstar, 4)}</b> = ln(v)/β ⇒ ${PROB.metric} ${fmt.f(PROB.rawForReward(rstar), PROB.dec)}</div>` +
       `<div class="k">A(failure, r=0)</div><div class="v">${fmt.f(spoAdv(0, v, beta), 4)}</div>` +
       `<div class="k">A(seed level, r=${fmt.f(PROB.seedReward, 2)})</div><div class="v">${fmt.f(spoAdv(PROB.seedReward, v, beta), 4)}</div>` +
       `<div class="k">A(median valid)</div><div class="v">${fmt.f(spoAdv(med, v, beta), 4)} <span class="sub">(r=${fmt.f(med, 4)})</span></div>` +
       `<div class="k">A(best of step)</div><div class="v">${fmt.f(spoAdv(best, v, beta), 4)} <span class="sub">(r=${fmt.f(best, 5)})</span></div>` +
-      `<div class="k">Best − median</div><div class="v"><b>${fmt.f(spoAdv(best, v, beta) - spoAdv(med, v, beta), 5)}</b> <span class="sub">compare with the failure row: the signal is mostly valid-vs-invalid, not good-vs-great</span></div>` +
+      `<div class="k">Best − median</div><div class="v"><b>${fmt.f(spoAdv(best, v, beta) - spoAdv(med, v, beta), 5)}</b></div>` +
       `<div class="k">Baseline used</div><div class="v">v = ${fmt.f(v, 4)} <span class="sub">(${P.vOver[step] != null ? "your override" : "simulated by the tracker"}; logged ${fmt.f(st.spo.value_before, 4)})</span></div>` }));
     const logged = Math.abs(beta - 2) < 1e-9 && Math.abs(v - st.spo.value_before) < 1e-6;
     if (rs.length && logged) {
@@ -147,7 +147,7 @@ function trackerHistory(root) {
   if (!done.length) return;
   const a = h("div", { class: "chart" }), b = h("div", { class: "chart" }), c = h("div", { class: "chart" }), note = h("div", { class: "sub", style: { marginTop: "6px" } });
   root.append(h("div", { class: "grid g3", style: { marginTop: "14px" } },
-    card("Baseline v: logged vs your parameters", `starts at the mean of exp(β·r) over the 8 seed rewards (= ${mean((PROB.seedRewards || [PROB.seedReward]).map(r => Math.exp(2 * r))).toFixed(2)} for β=2)`, h("div", null, a, note)),
+    card("Baseline v: logged vs your parameters", `starts at the mean of exp(β·r) over the initial rewards (= ${mean((PROB.seedRewards || [PROB.seedReward]).map(r => Math.exp(2 * r))).toFixed(2)} for β=2)`, h("div", null, a, note)),
     card("Update rate η and forgetting ρ", "solid = logged · dashed = your parameters", b),
     card("Policy shift D per step", "sequence-level KL to previous adapter, nats (held fixed in the simulation)", c)));
   const draw = () => {

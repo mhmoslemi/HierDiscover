@@ -86,7 +86,7 @@ PROBLEM_REQUIRED_KEYS = {
     "ac2": frozenset({"problem_type", "budget_s", "eval_cpus"}),
     "denoising": frozenset({"eval_seed", "eval_cpus"}),
     "gpu_mode": frozenset({
-        "problem_type", "score_scale", "gpu_type", "gpu_lease_timeout_s",
+        "problem_type", "gpu_type", "gpu_lease_timeout_s",
         "triton_version", "task_yaml", "lib_dir", "kernel_log_chars",
         "kernel_timeout_s", "seed_from_reference",
     }),
@@ -100,7 +100,7 @@ PROBLEM_OPTIONAL_KEYS = {
     "ac2": frozenset({"target_print"}),
     "denoising": frozenset(),
     "gpu_mode": frozenset({
-        "kernel_lib_dir", "kernel_python", "mla_seed_runtime_us",
+        "kernel_lib_dir", "kernel_python", "mla_seed_runtime_us", "score_scale",
     }),
 }
 

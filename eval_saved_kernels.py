@@ -82,6 +82,7 @@ def main(argv=None):
     from problems.gpu_mode import GpuMode, verify_benchmark_environment
 
     cfg = json.loads(saved_config.read_text(encoding="utf-8"))
+    cfg.setdefault("erdos_reward_anchors", None)
     if cfg.get("problem") != "gpu_mode":
         parser.error("This command only evaluates saved gpu_mode rollouts")
     current = yaml.safe_load(config_path.read_text(encoding="utf-8"))

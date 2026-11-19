@@ -3834,22 +3834,19 @@ def main():
                   f"{last_step}")
         else:
             # Step 0 needs a baseline that exists before its responses are
-            # sampled. The verified seed archive is already available history
-            # on exactly the problem reward scale, so use it once rather than
-            # leaking step-0 rewards into their own advantages or suppressing
-            # the first policy update.
+            # sampled. The problem provides initial rewards on its scoring scale.
             seed_rewards = []
-            for seed in seeds:
+            for initial_reward in problem.initial_spo_rs_rewards(seeds):
                 try:
-                    reward = float(seed.value)
+                    reward = float(initial_reward)
                 except (TypeError, ValueError):
                     continue
                 if math.isfinite(reward):
                     seed_rewards.append(reward)
             if not seed_rewards:
                 raise ValueError(
-                    "a fresh SPO-RS run requires at least one finite verified "
-                    "seed reward to initialize its pre-step baseline")
+                    "a fresh SPO-RS run requires at least one finite "
+                    "initial reward to initialize its pre-step baseline")
             initial_adapter = Path(_save_adapter(model, exp_dir, -1, directory_name="adapter_initial"))
             transformed = spo_rs_tracker.transformed_rewards(seed_rewards)
             initialization = spo_rs_tracker.update(
@@ -3857,7 +3854,7 @@ def main():
                 policy_adapter=initial_adapter, step=-1)
             current_policy_adapter_path = initial_adapter
             print("[init] SPO-RS global tracker initialized before step 0 "
-                  f"from {len(seed_rewards)} verified seed rewards: "
+                  f"from {len(seed_rewards)} initial rewards: "
                   f"v={initialization['value_after']:.9f}, "
                   f"N_eff={initialization['effective_count_after']:.2f}; "
                   "step 0 policy update enabled", flush=True)

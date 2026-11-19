@@ -203,7 +203,7 @@ const STAGE_VIZ = {
     const draw = () => {
       const { beta, v, simV } = advParams(step), A = r => (Math.exp(beta * r) / v - 1) / beta;
       lineChart(host, {
-        height: 220, xLabel: "reward r = 1 / " + PROB.metric, yLabel: "advantage A(r)", margin: { l: 56 }, xDomain: [0, PROB.rewardMax], xTicks: niceTicks(0, PROB.rewardMax, 7), yFmt: x => x.toFixed(2),
+        height: 220, xLabel: "reward r", yLabel: "advantage A(r)", margin: { l: 56 }, xDomain: [0, PROB.rewardMax], xTicks: niceTicks(0, PROB.rewardMax, 7), yFmt: x => x.toFixed(2),
         series: [{ name: "A(r)", color: S_COL(0), pts: range(0, 73).map(i => { const r = i * PROB.rewardMax / 72; return [r, A(r)]; }), dots: false, width: 2.2 }],
         hlines: [{ y: 0, label: "A = 0", color: cssVar("--ink-3") }], tipHead: x => `reward ${x.toFixed(2)}`,
       });
@@ -212,11 +212,10 @@ const STAGE_VIZ = {
       info.innerHTML = "";
       info.append(h("div", { class: "kv", style: { marginTop: "8px" }, html:
         `<div class="k">Baseline v</div><div class="v">${fmt.f(v, 4)}${Math.abs(v - st.spo.value_before) > 1e-6 ? ` <span class="sub">(logged ${fmt.f(st.spo.value_before, 4)})</span>` : ""} → after ${fmt.f(trackerSim().byStep[step] ? trackerSim().byStep[step].va : st.spo.value_after, 4)}</div>` +
-        `<div class="k">Break-even reward r*</div><div class="v">ln(v)/β = <b>${fmt.f(rstar, 4)}</b> (${PROB.metric} ${fmt.f(1 / rstar, 4)}) — programs worse than this get A &lt; 0</div>` +
+        `<div class="k">Break-even reward r*</div><div class="v">ln(v)/β = <b>${fmt.f(rstar, 4)}</b> (${PROB.metric} ${fmt.f(PROB.rawForReward(rstar), PROB.dec)}). Lower rewards give A &lt; 0.</div>` +
         mk("Failed programs (r=0)", r => !r.valid) + mk("Valid programs", r => r.valid) + mk("Valid, beat parent", r => r.improved) +
         `<div class="k">Tracker (logged)</div><div class="v">N_eff ${fmt.n(st.spo.effective_count_before)} → ${fmt.n(st.spo.effective_count_after)} · η=${fmt.f(st.spo.eta, 3)} · ρ=${st.spo.rho} · D=${fmt.f(st.spo.divergence, 2)} nats</div>` }));
       if (advIsWhatIf()) info.append(h("div", { class: "what-if", style: { display: "inline-block", marginTop: "6px" } }, "what-if values - the Sankey above, the Rollouts tab and the SPO² tab use the same numbers"));
-      info.append(h("p", { class: "sub", style: { marginTop: "8px" } }, `Because r is ≈0 (fail) or ≈${PROB.validReward.toFixed(2)} (valid), advantages are almost binary. The baseline v of every step is re-simulated from the tracker parameters in the SPO² tab.`));
     };
     draw(); onParam(draw);
   },

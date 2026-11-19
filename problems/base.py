@@ -15,6 +15,19 @@ from evaluation.reward import extract_python_code
 from evaluation.sandbox import run_code
 
 
+ERDOS_REWARD_ANCHORS = {
+    "ac1": (2.0, 1.5026),
+    "trimul": (7000.0, 550.0),  # microseconds
+}
+
+
+def erdos_scaled_reward(raw_score: float, seed_score: float, goal_score: float) -> float:
+    """Map a valid minimization score to the Erdős seed and goal reward scale."""
+    fraction_from_goal = (raw_score - goal_score) / (seed_score - goal_score)
+    erdos_score = 0.38086 + (0.5 - 0.38086) * fraction_from_goal
+    return 1.0 / erdos_score
+
+
 # ----------------------------------------------------------------------
 # Data carried between the engine and the problems
 # ----------------------------------------------------------------------
@@ -126,6 +139,10 @@ class Problem(ABC):
     @abstractmethod
     def seed_states(self) -> List[SeedState]:
         ...
+
+    def initial_spo_rs_rewards(self, seeds: List[SeedState]) -> List[float]:
+        """Rewards available before the first policy rollout."""
+        return [seed.value for seed in seeds]
 
     # ---- default reward path (subprocess sandbox) --------------------
     def compute_reward(self, response_text: str, parent: ParentContext,

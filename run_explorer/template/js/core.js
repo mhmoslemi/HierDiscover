@@ -463,7 +463,7 @@ const _simCache = {};
 function simulateTracker(beta, dHalf, rhoMin, rhoMax) {
   const out = { byStep: {}, order: [] };
   const seeds = PROB.seedRewards && PROB.seedRewards.length ? PROB.seedRewards : [PROB.seedReward];
-  let v = mean(seeds.map(r => Math.exp(beta * r))), N = 8 / (1 - rhoMin);
+  let v = mean(seeds.map(r => Math.exp(beta * r))), N = (CFG.num_seed_states || 8) / (1 - rhoMin);
   STEPS.forEach(s => {
     const sp = ST[s].spo; if (!sp) return;
     const rs = RS[s] || [], M = sp.group_size || rs.length;

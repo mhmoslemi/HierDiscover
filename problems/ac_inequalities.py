@@ -2,7 +2,7 @@
 Autocorrelation Inequalities (AC1 and AC2).
 
   - problem_type "ac1": entrypoint propose_candidate, minimize upper bound,
-                        reward = 1/result
+                        reward calibrated to the Erdős seed and goal
   - problem_type "ac2": entrypoint construct_function, maximize lower bound,
                         reward = result
 
@@ -19,7 +19,9 @@ from examples.ac_inequalities.seeds import (
     example_ae_program_random_init,
     thetaevolve_initial_program_prev_init,
 )
-from problems.base import Problem, ParentContext, RewardResult, SeedState
+from problems.base import (
+    ERDOS_REWARD_ANCHORS, ParentContext, Problem, RewardResult, SeedState, erdos_scaled_reward,
+)
 from prompts.task import ac1, ac2, ac_common
 from prompts.utils import render_state_context
 
@@ -102,6 +104,7 @@ class ACInequalities(Problem):
         self.budget_s = int(cfg.get("budget_s", 1000))
 
         if self.problem_type == "ac1":
+            self._reward_anchors = cfg.get("erdos_reward_anchors", ERDOS_REWARD_ANCHORS["ac1"])
             self.entrypoint = "propose_candidate"
             self.metric_name = "upper bound"
             self.maximize = False
@@ -138,6 +141,11 @@ class ACInequalities(Problem):
         return prelude + "# ---- model code below ----\n" + code
 
     # ------------------------------------------------------------------
+    def _ac1_reward(self, raw_score: float) -> float:
+        if self._reward_anchors is not None:
+            return erdos_scaled_reward(raw_score, *self._reward_anchors)
+        return 1.0 / raw_score
+
     def score(self, output: Any, stdout: str) -> RewardResult:
         res = RewardResult(reward=self.fail_score)
         if not isinstance(output, list) or not output:
@@ -168,7 +176,7 @@ class ACInequalities(Problem):
         res.construction = list(output)
         res.msg = f"Success; raw_score={result}"
         if self.problem_type == "ac1":
-            res.reward = float(1.0 / result)
+            res.reward = self._ac1_reward(result)
         else:
             res.reward = result
         return res
@@ -181,7 +189,7 @@ class ACInequalities(Problem):
             construction = [float(rng.random())] * int(rng.integers(1000, 8000))
             if self.problem_type == "ac1":
                 raw = float(evaluate_sequence_ac1(construction))
-                value = float(1.0 / raw)
+                value = self._ac1_reward(raw)
                 code = example_ae_program_random_init(self.budget_s)
             else:
                 raw = float(evaluate_sequence_ac2(construction))

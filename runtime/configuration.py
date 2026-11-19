@@ -1008,6 +1008,12 @@ def load_config():
 
     # 4) Provide attribute access after the YAML's shared and problem-specific
     # keys have passed their ownership contract.
+    # Resumes must keep the reward units stored in the archive and SPO-RS tracker.
+    from problems.base import ERDOS_REWARD_ANCHORS
+    reward_task = str(merged.get("problem_type", merged["problem"])).lower()
+    if reward_task in ERDOS_REWARD_ANCHORS:
+        merged["erdos_reward_anchors"] = (saved.get("erdos_reward_anchors") if saved
+                                          else ERDOS_REWARD_ANCHORS[reward_task])
     merged["target_modules"] = tuple(merged["target_modules"])
     cfg = SimpleNamespace(**merged)
     if cfg.generation_backend == 'vllm' and int(cfg.num_gpus or 0) < 1:

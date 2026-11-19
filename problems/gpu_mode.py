@@ -1,9 +1,8 @@
 """
 Kernel Engineering (GPU Mode: trimul / mla_decode_nvidia).
 
-  - problem_type "trimul":  score_scale 1500, target ~1000 us
-  - problem_type "mla_decode_nvidia": score_scale 5000, target ~1700 us
-  - reward = score_scale / runtime_us   (minimize runtime, reward higher=better)
+  - problem_type "trimul": reward calibrated to the Erdős seed and goal
+  - problem_type "mla_decode_nvidia": reward = score_scale / runtime_us
 
 Needs:
   * a CUDA GPU + triton (and the packages in requirements/requirements-gpumode.txt)
@@ -35,7 +34,9 @@ import threading
 import time
 from typing import Any, Dict, List, Optional
 from examples.gpu_mode.seeds import MLA_DECODE_INITIAL_STATE, MLA_DECODE_INITIAL_VALUE
-from problems.base import Problem, ParentContext, RewardResult, SeedState
+from problems.base import (
+    ERDOS_REWARD_ANCHORS, ParentContext, Problem, RewardResult, SeedState, erdos_scaled_reward,
+)
 from prompts.task import mla_decode_nvidia, trimul
 from prompts.utils import render_state_context
 
@@ -473,6 +474,8 @@ class GpuMode(Problem):
         if self.problem_type not in _DEFAULTS:
             raise ValueError(f"problem_type must be one of {list(_DEFAULTS)}, "
                              f"got {self.problem_type}")
+        self._reward_anchors = (cfg.get("erdos_reward_anchors", ERDOS_REWARD_ANCHORS["trimul"])
+                                if self.problem_type == "trimul" else None)
         d = _DEFAULTS[self.problem_type]
         self.gpu_type = str(cfg.get("gpu_type", d["gpu_type"]))
         self.triton_version = str(cfg.get("triton_version", "3.3.1"))
@@ -490,7 +493,8 @@ class GpuMode(Problem):
                                    cfg.get("lib_dir", "examples/gpu_mode/lib")))
         if self.target is None:
             self.target = float(d["target"]) * f
-        if abs(f - 1.0) > 1e-9 and ("target" not in cfg or "score_scale" not in cfg):
+        if (self._reward_anchors is None and abs(f - 1.0) > 1e-9
+                and ("target" not in cfg or "score_scale" not in cfg)):
             print(f"[gpu_mode] {self.gpu_type}: scaled H100 defaults by {f:.2f}x "
                   f"-> target={self.target:.0f}us, score_scale={self.score_scale:.0f} "
                   f"(reward {self.score_scale / self.target:.2f} at target). "
@@ -598,6 +602,11 @@ class GpuMode(Problem):
                             parsed=True, ran=False, msg=msg, stdout=logs,
                             construction=[], failure_kind=failure_kind)
 
+    def _runtime_reward(self, runtime_us: float) -> float:
+        if self._reward_anchors is not None:
+            return erdos_scaled_reward(runtime_us, *self._reward_anchors)
+        return self.score_scale / runtime_us
+
     def compute_reward(self, response_text: str, parent: ParentContext,
                        timeout_s: float, *, final_answer_text: str | None = None) -> RewardResult:
         from evaluation.reward import extract_python_code
@@ -703,7 +712,7 @@ class GpuMode(Problem):
         res.code = code
         res.stdout = out.get("logs", "")      # warnings survive on success too
         res.raw_score = score_us
-        res.reward = (float(self.score_scale / score_us) if score_us > 0
+        res.reward = (self._runtime_reward(score_us) if score_us > 0
                       else self.fail_score)
         res.construction = []
         res.msg = out.get("msg", f"runtime_us={score_us}")
@@ -749,3 +758,12 @@ class GpuMode(Problem):
         # up number would seed the tree with a reward nothing can reproduce.
         return [SeedState(code=code, value=0.0, raw_score=None, construction=[])
                 for _ in range(self.num_seed_states)]
+
+    def initial_spo_rs_rewards(self, seeds: List[SeedState]) -> List[float]:
+        if self._reward_anchors is None:
+            return super().initial_spo_rs_rewards(seeds)
+        seed_runtime = self._reward_anchors[0]
+        reward = self._runtime_reward(seed_runtime)
+        print(f"[init] TriMul SPO-RS seed anchor: synthetic runtime "
+              f"{seed_runtime:g} us, reward={reward:.9f}", flush=True)
+        return [reward] * len(seeds)

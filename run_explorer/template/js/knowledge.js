@@ -62,7 +62,7 @@ target 1.5027  ⇔  reward ≈ 0.66547`,
     short: "exp(β·r) vs baseline v",
     body: `
       <p>Instead of GRPO-style group normalisation, SPO-RS keeps <b>one run-wide scalar baseline <code>v</code></b> (a persistent "value" of the exponentiated reward) shared by all 512 rollouts of a step. The reward is first passed through an exponential <b>risk-sensitive transform</b> <code>G = exp(β·r)</code>, which emphasises the upper tail (objective ≈ E[R] + β/2·Var R).</p>
-      <p>Advantages are <b>not centred inside a group</b>. Because almost every program is either a failure (r=0) or a valid program with r≈{{VALIDR}}, the learning signal is essentially <i>valid vs. invalid</i>: failures get a negative advantage, valid programs a positive one, and the difference between a 1.5050 and 1.5048 solution is tiny (≈0.006).</p>
+      <p>Each program's advantage comes from its reward and the same run-wide baseline. Rewards above the break-even point give positive advantages. Rewards below it give negative advantages.</p>
       <p>After the advantages are formed the baseline moves toward the new batch: <code>v ← (ρ·N_eff·v + ΣG)/(ρ·N_eff + M)</code>. The forgetting factor ρ depends on how far the policy moved (divergence D); in this run D≈4–5 nats so ρ sits at its floor 0.875.</p>`,
     eq: `G_i   = exp(β r_i)                       β = spo_rs_beta = 2.0 (fixed)
 A_i   = (G_i / v − 1) / β                v = baseline BEFORE this step (one value for all rollouts)
@@ -70,7 +70,7 @@ break-even reward   r* = ln(v) / β
 D     = mean over contexts of Σ_tokens (logπ_cur − logπ_prev)   (clamped ≥ 0)
 ρ     = clip(2^(−D / d_half), ρ_min, ρ_max) = clip(2^(−D/0.06), 0.875, 0.96)
 N_c   = ρ·N_eff + M                      v' = (ρ·N_eff·v + Σ G_i) / N_c      η = M / N_c      N_eff' = N_c`,
-    refs: ["training/spo_rs.py:57-82 (advantages), :136-196 (tracker update)", "orchestrator.py (train_step, advantage assembly)", "orchestrator.py (main, tracker init from seed rewards: v0 = e = 2.718, N_eff = 64)", "_retire/bandit_strategist_spo_rs_method.txt:580 (\"SPO-RS, called SPO² in the slides\")"],
+    refs: ["training/spo_rs.py:57-82 (advantages), :136-196 (tracker update)", "orchestrator.py (train_step, advantage assembly)", "orchestrator.py (initial rewards and tracker startup)", "_retire/bandit_strategist_spo_rs_method.txt:580 (\"SPO-RS, called SPO² in the slides\")"],
     files: ["…rolloutRRR.meta.json (advantage, beta, spo_rs)", "stepNN.summary.json → spo_rs_updates"],
   },
   {
