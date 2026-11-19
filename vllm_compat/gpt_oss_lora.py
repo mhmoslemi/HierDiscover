@@ -12,6 +12,14 @@ def _interleave_legacy_w13(original, interleaved_activation):
                 or self.moe_config.activation != interleaved_activation):
             return original(self, lora_context, y=y, add_inputs=add_inputs, **kwargs)
 
+        # Punica already skips its projection for a base-policy batch.
+        # Keep its routing metadata without zeroing and adding a delta.
+        punica = getattr(lora_context, "punica_wrapper", None)
+        metadata = getattr(punica, "token_mapping_meta", None)
+        no_lora = getattr(metadata, "no_lora_flag_cpu", None)
+        if add_inputs and no_lora is not None and no_lora.item():
+            return original(self, lora_context, y=y, add_inputs=True, **kwargs)
+
         # vLLM #60812: the split kernel emits [all gate; all up] while
         # GPT-OSS SwiGLU consumes alternating gate/up columns.
         delta = torch.zeros_like(y)

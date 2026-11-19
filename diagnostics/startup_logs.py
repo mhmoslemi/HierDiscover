@@ -136,7 +136,7 @@ class StartupLog:
 
 def dashboard_sections(fields, run_dir, *, resuming=False):
     """Group the existing resolved banner fields; never reinterpret config."""
-    used = set()
+    used = {"Max new tokens", "Max seq length", "Training memory cap", "Fused long attention"}
 
     def row(*keys):
         parts = []
@@ -154,7 +154,7 @@ def dashboard_sections(fields, run_dir, *, resuming=False):
         ]),
         ("MODELS & SAMPLING", 95, [
             row("Coder model"), row("Coder sampling"),
-            row("Coder reasoning"), row("Max new tokens", "Max seq length"),
+            row("Coder reasoning"),
             row("Frozen solver"), row("Frozen sampling"),
         ]),
         ("ROLLOUTS", 93, [
@@ -165,7 +165,6 @@ def dashboard_sections(fields, run_dir, *, resuming=False):
             row("Advantage mode", "LR", "KL coef", "Reference KL"),
             row("Training layout"), row("Training scheduler"), row("LoRA"),
             row("Logprob chunk"),
-            row("Training memory cap"), row("Fused long attention"),
             row("MoE policy ratio"), row("Sequence clip eps low/high"),
             row("SPO-RS beta", "SPO-RS D_half"),
             row("SPO-RS rho min/max"),
@@ -184,7 +183,6 @@ def dashboard_sections(fields, run_dir, *, resuming=False):
         sections.append(("OTHER SETTINGS", 97, remaining))
     sections.append(("OUTPUT · RESUMING" if resuming else "OUTPUT", 96, [
         f"Run directory: {Path(run_dir).resolve()}",
-        "Settings: setting.log   |   Terminal: temirnal.log   |   Results: result.txt",
     ]))
     return [(name, color, [r for r in rows if r]) for name, color, rows in sections]
 

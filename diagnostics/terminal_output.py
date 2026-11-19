@@ -38,14 +38,15 @@ def setting_log_only(*values, sep=" ", end="\n", flush=False, file=None):
         builtins.print(
             *values, sep=sep, end=end, file=file, flush=flush)
         return
-    value = sep.join(str(item) for item in values) + end
+    if not _append_setting_log(sep.join(str(item) for item in values) + end):
+        terminal_log_only(*values, sep=sep, end=end, flush=flush)
+
+
+def _append_setting_log(value):
     with _SETTING_LOG_LOCK:
         path = _SETTING_LOG_PATH
     if path is None:
-        # Preserve diagnostics in standalone utilities and early failures.
-        terminal_log_only(
-            *values, sep=sep, end=end, flush=flush)
-        return
+        return False
     timestamp = log_timestamp()
     rendered = "".join(
         (timestamp + line if line else line)
@@ -54,16 +55,20 @@ def setting_log_only(*values, sep=" ", end="\n", flush=False, file=None):
     if value and not rendered:
         rendered = timestamp + value
     payload = rendered.encode("utf-8", errors="replace")
-    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
     try:
-        remaining = memoryview(payload)
-        while remaining:
-            written = os.write(descriptor, remaining)
-            if written <= 0:
-                raise OSError("setting.log append made no progress")
-            remaining = remaining[written:]
-    finally:
-        os.close(descriptor)
+        descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+        try:
+            remaining = memoryview(payload)
+            while remaining:
+                written = os.write(descriptor, remaining)
+                if written <= 0:
+                    raise OSError("setting.log append made no progress")
+                remaining = remaining[written:]
+        finally:
+            os.close(descriptor)
+    except OSError:
+        return False
+    return True
 
 
 def terminal_log_only(*values, sep=" ", end="\n", flush=False, file=None):

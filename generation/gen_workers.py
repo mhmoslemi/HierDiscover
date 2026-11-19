@@ -68,6 +68,7 @@ import traceback
 import multiprocessing as mp
 
 from runtime.gpu_runtime import (
+    _estimated_weight_gib,
     uses_bounded_gpt_oss_repack,
     vllm_runtime_reserve_gib as _default_vllm_runtime_reserve_gib,
 )
@@ -771,6 +772,23 @@ def _resolve_vllm_quantization(model_name, load_in_4bit, quantization):
     return requested
 
 
+def gpt_oss_coder_engine_options(total_rollouts, *, use_cuda_graphs=False):
+    options = {
+        "enable_moe_shared_loras": True,
+        "enable_mixed_moe_lora_format": True,
+    }
+    if use_cuda_graphs:
+        # A coder step makes at most this many decode requests, including
+        # after a redistribution. Keep captures dense near the live batches.
+        total = max(1, int(total_rollouts))
+        sizes = sorted({n for n in (1, 2, 4, *range(8, total, 8), total) if n <= total})
+        options["compilation_config"] = {
+            "cudagraph_mode": "FULL_DECODE_ONLY",
+            "cudagraph_capture_sizes": sizes,
+        }
+    return options
+
+
 def _vllm_engine_kwargs(model_name, max_seq_length, load_in_4bit,
                         lora_rank, gpu_memory_utilization,
                         enforce_eager=False, enable_prefix_caching=True,
@@ -1028,9 +1046,11 @@ def _redirect_vllm_output(log_path, rank, gpu_group):
     return handle
 
 
-async def _serve_generation_requests(task_queue, generate, *, done_marker="__strategies_done__"):
+async def _serve_generation_requests(task_queue, generate, *, done_marker="__strategies_done__",
+                                     log_stats=None):
     """Accept ready requests while other requests are still decoding."""
     pending = set()
+    next_stats_log = time.monotonic() + 10.0
     try:
         while True:
             while True:
@@ -1049,6 +1069,9 @@ async def _serve_generation_requests(task_queue, generate, *, done_marker="__str
                 if not isinstance(task, tuple) or len(task) != 4:
                     raise RuntimeError("unexpected task during continuous generation")
                 pending.add(asyncio.create_task(generate(task)))
+            if log_stats is not None and time.monotonic() >= next_stats_log:
+                await log_stats()
+                next_stats_log = time.monotonic() + 10.0
             if pending:
                 done, _ = await asyncio.wait(
                     pending, timeout=0.01, return_when=asyncio.FIRST_COMPLETED)
@@ -1074,7 +1097,7 @@ def _vllm_worker_loop(rank, gpu_id, model_name, max_seq_length, load_in_4bit,
                       enable_expert_parallel=False, enable_sleep_mode=False,
                       sleep_level=1, control_queue=None, vllm_log_path=None,
                       disable_custom_all_reduce=False, engine_options=None,
-                      enable_log_stats=False,
+                      enable_log_stats=False, frozen_strategy=False,
                       hardware_profile="RTX6000"):
     """Persistent vLLM engine spanning one physical GPU group."""
     # vLLM creates EngineCore grandchildren. If a wrapper exits after an
@@ -1203,6 +1226,8 @@ def _vllm_worker_loop(rank, gpu_id, model_name, max_seq_length, load_in_4bit,
         nonlocal next_adapter_id
         if adapter_path is None:
             return None
+        if engine_options and not engine_options.get("enable_lora", True):
+            raise RuntimeError("this vLLM engine cannot receive a LoRA adapter")
         adapter_key = os.path.realpath(os.fspath(adapter_path))
         if adapter_key not in adapter_ids:
             adapter_ids[adapter_key] = next_adapter_id
@@ -1241,12 +1266,9 @@ def _vllm_worker_loop(rank, gpu_id, model_name, max_seq_length, load_in_4bit,
         step, adapter_path, jobs, options = task
         if len(jobs) != 1 or int(jobs[0][2]) != 1:
             raise RuntimeError("continuous generation requests must contain exactly one sample")
-        if (engine_options and not engine_options.get("enable_lora", True)
-                and adapter_path is not None):
-            raise RuntimeError("a frozen strategist cannot receive a LoRA adapter")
         chain, prompt, _count = jobs[0]
         tokenizer = llm.get_tokenizer()
-        if engine_options and not engine_options.get("enable_lora", True):
+        if frozen_strategy:
             prompt_ids = tokenizer.encode(prompt, add_special_tokens=False)
             prompt = {"prompt_token_ids": prompt_ids}
         else:
@@ -1274,8 +1296,7 @@ def _vllm_worker_loop(rank, gpu_id, model_name, max_seq_length, load_in_4bit,
             sampling["logprobs"] = 0
         output = await _async_final_output(
             prompt, SamplingParams(**sampling), _lora_request(adapter_path),
-            _next_request_id("strategy" if engine_options and not engine_options.get("enable_lora", True)
-                             else "rollout"))
+            _next_request_id("strategy" if frozen_strategy else "rollout"))
         candidates = getattr(output, "outputs", None) or []
         if candidates:
             candidate = candidates[0]
@@ -1316,6 +1337,7 @@ def _vllm_worker_loop(rank, gpu_id, model_name, max_seq_length, load_in_4bit,
     ready_detail = f"sleep:{sleep_level}" if can_sleep else ""
     if async_engine:
         ready_detail += ";async"
+    log_stats = getattr(llm, "do_log_stats", None) if enable_log_stats and async_engine else None
     ready_queue.put(("ready", rank, ready_detail))
 
     while True:
@@ -1329,7 +1351,8 @@ def _vllm_worker_loop(rank, gpu_id, model_name, max_seq_length, load_in_4bit,
                 stopping = _run_async(_serve_generation_requests(
                     task_queue, _generate_single_request,
                     done_marker=("__strategies_done__" if task == ("__strategies__",)
-                                 else "__rollouts_done__")))
+                                 else "__rollouts_done__"),
+                    log_stats=log_stats))
             except Exception:
                 detail = traceback.format_exc()
                 print(f"[vllm worker {rank}] continuous generation failed:\n{detail}",
@@ -1517,9 +1540,6 @@ def _vllm_worker_loop(rank, gpu_id, model_name, max_seq_length, load_in_4bit,
             continue
 
         try:
-            if (engine_options and not engine_options.get("enable_lora", True)
-                    and adapter_path is not None):
-                raise RuntimeError("a frozen strategist cannot receive a LoRA adapter")
             lora_request = _lora_request(adapter_path)
 
             # One call gives vLLM the whole worker workload so its scheduler can
@@ -1528,7 +1548,7 @@ def _vllm_worker_loop(rank, gpu_id, model_name, max_seq_length, load_in_4bit,
             runnable_jobs = []
             max_tokens_by_job = []
             for group_idx, prompt, count in jobs:
-                if engine_options and not engine_options.get("enable_lora", True):
+                if frozen_strategy:
                     # Native strategy templates already include BOS. Pass
                     # exact ids so the serving tokenizer cannot add it twice.
                     prompt_ids = tokenizer.encode(prompt, add_special_tokens=False)
@@ -1805,6 +1825,7 @@ class GenerationPool:
                  vllm_runtime_reserve_gib=None,
                  vllm_staged_loading=False,
                  vllm_log_path=None, vllm_engine_options=None,
+                 vllm_base_policy_only=False,
                  hardware_profile="RTX6000", host_memory_admission=None):
         self.model_name = model_name
         self.hardware_profile = hardware_profile
@@ -1824,6 +1845,14 @@ class GenerationPool:
         if self.sleep_level not in (1, 2):
             raise ValueError("vllm_sleep_level must be 1 or 2")
         self.vllm_staged_loading = bool(vllm_staged_loading)
+        vllm_engine_options = dict(vllm_engine_options or {})
+        self._frozen_strategy = not vllm_engine_options.get("enable_lora", True)
+        if vllm_base_policy_only:
+            # Match the LoRA engine's native GPT-OSS kernels for exact
+            # consecutive-policy scoring after the first adapter update.
+            vllm_engine_options.update(enable_lora=False, moe_backend="marlin")
+            vllm_engine_options.pop("enable_moe_shared_loras", None)
+            vllm_engine_options.pop("enable_mixed_moe_lora_format", None)
         self.sleep_supported = False
         self.vllm_log_path = (os.path.abspath(os.fspath(vllm_log_path))
                               if vllm_log_path else None)
@@ -2025,6 +2054,7 @@ class GenerationPool:
         }
         if self.backend == "vllm":
             self._worker_options["hardware_profile"] = hardware_profile
+            self._worker_options["frozen_strategy"] = self._frozen_strategy
         if self.backend == "vllm" and hardware_profile in {"B200", "B200_full_ram"}:
             # Evaluation avoids reserved cores; inference can use the full allowed cpuset.
             self._worker_options["enable_log_stats"] = True
@@ -2593,7 +2623,7 @@ class GenerationPool:
             prompts_by_group, group_size, self.num_workers,
             counts_by_group=counts_by_group)
         if (getattr(self, "_async_worker_ids", set()) == set(range(self.num_workers))
-                and (getattr(self, "_worker_options", {}).get("engine_options") or {}).get("enable_lora", True)):
+                and not self._frozen_strategy):
             # Let idle engines pick up unstarted coder requests.
             counts = ([int(group_size)] * len(prompts_by_group) if counts_by_group is None
                       else [int(count) for count in counts_by_group])
@@ -3200,6 +3230,11 @@ class PhasedVLLMGenerationPool:
         self._force_transient = bool(self._b200_transient or (
             self._sleep_level == 2 and "gpt-oss" in model_name))
         self._pool = None
+        self._base_policy_only = False
+        engine_options = self._pool_kwargs.get("vllm_engine_options") or {}
+        self._shared_gpt_oss = (
+            uses_bounded_gpt_oss_repack(model_name, effective_quantization)
+            and bool(engine_options.get("enable_moe_shared_loras")))
         self._persistent = False
         self._awake = False
         self._sleep_mode_announced = False
@@ -3228,34 +3263,63 @@ class PhasedVLLMGenerationPool:
         return True
 
     def _create_pool(self, **options):
-        startup_reservation = nullcontext()
+        startup_reservation = nullcontext(0)
+        parallel_bytes = 0
         if self.host_memory_admission is not None:
             cards = int(self._pool_kwargs["num_workers"])
             # Lazy checkpoint pages are reclaimable. Reserve staging memory.
+            staging_bytes = int(4 * cards * 2**30 * 1.05)
+            tp = int(self._pool_kwargs.get("vllm_tensor_parallel_size") or 0)
+            pp = int(self._pool_kwargs.get("vllm_pipeline_parallel_size") or 1)
+            engines = cards // (tp * pp) if tp > 0 else 1
+            if (self._shared_gpt_oss and engines > 1
+                    and self._pool_kwargs.get("hardware_profile") == "B200_full_ram"
+                    and self._pool_kwargs.get("vllm_staged_loading")):
+                # Reserve a complete model's host footprint for each parallel
+                # load in addition to the small per-rank staging estimate.
+                model_gib = _estimated_weight_gib(self._pool_kwargs["model_name"], "auto")
+                parallel_bytes = staging_bytes + int(engines * model_gib * 2**30)
             startup_reservation = self.host_memory_admission.reservation(
-                int(4 * cards * 2**30 * 1.05), wait_for_external=False,
+                parallel_bytes or staging_bytes, minimum_bytes=staging_bytes,
+                wait_for_external=False,
                 stage="generation worker initialization", priority=True)
-        with startup_reservation:
-            if getattr(self, "_b200_transient", False):
+        with startup_reservation as reserved:
+            if parallel_bytes and reserved >= parallel_bytes:
+                options["vllm_staged_loading"] = False
+                print("[pool] loading GPT-OSS replicas concurrently with "
+                      f"{reserved / 2**30:.1f} GiB of host RAM admitted", flush=True)
+            if self._b200_transient:
                 options["host_memory_admission"] = self.host_memory_admission
-            return GenerationPool(**self._pool_kwargs, **options)
+            return GenerationPool(**(self._pool_kwargs | options))
 
-    def _ensure_started(self):
-        if self._awake:
+    def _ensure_started(self, *, base_policy_only=False, require_lora=False):
+        if self._pool is not None and self._base_policy_only and require_lora:
+            self._pool.shutdown()
+            self._pool = None
+            self._persistent = False
+        if self._awake and self._pool is not None:
             return self._pool
-        self._before_start()
+        if not self._awake:
+            self._before_start()
+        self._awake = False
         try:
             if self._pool is None:
                 # Start lazily at the first real rollout. The old eager probe
                 # loaded every engine, immediately slept it, restored training,
                 # then reloaded the same weights for step 0. More importantly,
                 # a broken initial sleep could hang before the run even began.
+                self._base_policy_only = base_policy_only
+                options = dict(vllm_base_policy_only=base_policy_only)
+                if base_policy_only:
+                    print("[pool] initial GPT-OSS policy is the base model; "
+                          "serving it without LoRA kernels", flush=True)
                 if self._force_transient or self._pool_kwargs.get("vllm_persistent_workers") == 0:
-                    self._pool = self._create_pool()
+                    self._pool = self._create_pool(**options)
                 else:
                     self._pool = self._create_pool(
                         vllm_enable_sleep_mode=True,
                         vllm_sleep_level=self._sleep_level,
+                        **options,
                     )
                 self.num_workers = self._pool.num_workers
                 self._persistent = bool(
@@ -3327,6 +3391,7 @@ class PhasedVLLMGenerationPool:
                     self._pool = self._create_pool(
                         vllm_enable_sleep_mode=True,
                         vllm_sleep_level=1,
+                        vllm_base_policy_only=self._base_policy_only,
                     )
                     self.num_workers = self._pool.num_workers
                     self._persistent = self._pool.sleep_supported
@@ -3339,13 +3404,26 @@ class PhasedVLLMGenerationPool:
             self._after_stop()
             raise
 
-    def iter_group_jobs(self, *args, **kwargs):
-        yield from self._ensure_started().iter_group_jobs(*args, **kwargs)
+    def _pool_for_adapter(self, adapter_path):
+        base_policy = False
+        if self._shared_gpt_oss and adapter_path is not None:
+            from models.gpt_oss_lora import is_base_policy_snapshot
 
-    def run_sequential_chains(self, *args, **kwargs):
-        pool = self._ensure_started()
+            base_policy = is_base_policy_snapshot(adapter_path)
+        if base_policy:
+            adapter_path = None
+        pool = self._ensure_started(base_policy_only=base_policy,
+                                    require_lora=adapter_path is not None)
+        return pool, adapter_path
+
+    def iter_group_jobs(self, prompts_by_group, group_size, adapter_path, *args, **kwargs):
+        pool, adapter_path = self._pool_for_adapter(adapter_path)
+        yield from pool.iter_group_jobs(prompts_by_group, group_size, adapter_path, *args, **kwargs)
+
+    def run_sequential_chains(self, *, adapter_path, **kwargs):
+        pool, adapter_path = self._pool_for_adapter(adapter_path)
         try:
-            return pool.run_sequential_chains(*args, **kwargs)
+            return pool.run_sequential_chains(adapter_path=adapter_path, **kwargs)
         except BaseException:
             # A failed chain can leave other requests in flight.
             # Stop those workers directly; sending sleep commands into their
@@ -3359,11 +3437,15 @@ class PhasedVLLMGenerationPool:
                 self._after_stop()
             raise
 
-    def generate_groups(self, *args, **kwargs):
-        return self._ensure_started().generate_groups(*args, **kwargs)
+    def generate_groups(self, prompts_by_group, group_size, adapter_path, *args, **kwargs):
+        pool, adapter_path = self._pool_for_adapter(adapter_path)
+        return pool.generate_groups(prompts_by_group, group_size, adapter_path, *args, **kwargs)
 
-    def score_token_logprobs(self, *args, **kwargs):
-        return self._ensure_started().score_token_logprobs(*args, **kwargs)
+    def score_token_logprobs(self, prompt_response_pairs, show_progress=True,
+                             adapter_path=None, *args, **kwargs):
+        pool, adapter_path = self._pool_for_adapter(adapter_path)
+        return pool.score_token_logprobs(prompt_response_pairs, show_progress,
+                                         adapter_path, *args, **kwargs)
 
     def release_for_training(self, trainer):
         """Restore each trainer group as its coder engines release the GPUs."""

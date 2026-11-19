@@ -15,6 +15,18 @@ ATTENTION_AND_HEAD_TARGETS = r"(?:.*\.(?:q_proj|k_proj|v_proj|o_proj)|lm_head)"
 PARAMETERS_PER_RANK = 41_074_624
 
 
+class _AlignedGroupedMMGradient(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, output):
+        return output
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        # Stack backward returns strided gate/up views. The up view starts
+        # one element into the buffer, which native grouped GEMM rejects.
+        return grad_output.clone(memory_format=torch.contiguous_format)
+
+
 class SharedExpertLoRA(nn.Module):
     def __init__(self, experts, hidden, intermediate, rank, alpha, dropout, device):
         super().__init__()
@@ -50,7 +62,11 @@ class SharedExpertLoRA(nn.Module):
         gate = F.linear(self.dropout(inputs), self.gate_a[0].to(inputs.dtype))
         up = F.linear(self.dropout(inputs), self.up_a[0].to(inputs.dtype))
         gate = grouped_mm(gate, self.gate_b.to(inputs.dtype).transpose(-1, -2), offsets)
+        if interleaved:
+            gate = _AlignedGroupedMMGradient.apply(gate)
         up = grouped_mm(up, self.up_b.to(inputs.dtype).transpose(-1, -2), offsets)
+        if interleaved:
+            up = _AlignedGroupedMMGradient.apply(up)
         gate_base, up_base = (base[..., ::2], base[..., 1::2]) if interleaved else base.chunk(2, dim=-1)
         gate = torch.add(gate_base, gate, alpha=self.scale)
         up = torch.add(up_base, up, alpha=self.scale)
@@ -157,7 +173,7 @@ def _expert_tensors(model):
     }
 
 
-def save_shared_adapter(model, directory):
+def save_shared_adapter(model, directory, *, base_policy=False):
     from peft import get_peft_model_state_dict
     from safetensors.torch import save_file
 
@@ -168,12 +184,36 @@ def save_shared_adapter(model, directory):
     weights = {name: tensor.detach().cpu().contiguous() for name, tensor in weights.items()}
     target = directory / "adapter_model.safetensors"
     temp = target.with_suffix(".safetensors.tmp")
+    metadata = {"format": "pt"}
+    if base_policy:
+        metadata["ttt_base_policy"] = "true"
     try:
-        save_file(weights, str(temp), metadata={"format": "pt"})
+        save_file(weights, str(temp), metadata=metadata)
         temp.replace(target)
     finally:
         temp.unlink(missing_ok=True)
     model.peft_config[model.active_adapter].save_pretrained(directory)
+
+
+def is_base_policy_snapshot(directory):
+    from safetensors import safe_open
+
+    directory = Path(directory)
+    path = directory / "adapter_model.safetensors"
+    if not path.is_file():
+        return False
+    with safe_open(str(path), framework="pt", device="cpu") as saved:
+        if (saved.metadata() or {}).get("ttt_base_policy") == "true":
+            return True
+        if directory.name != "adapter_initial":
+            return False
+        # Runs started before the marker was added can still skip LoRA if
+        # their saved initial policy consists entirely of zero-output LoRAs.
+        keys = set(saved.keys())
+        b_keys = {key for key in keys if key.endswith(".lora_B.weight")}
+        a_keys = {key.removesuffix(".lora_B.weight") + ".lora_A.weight" for key in b_keys}
+        return bool(b_keys and keys == a_keys | b_keys and all(
+            not torch.count_nonzero(saved.get_tensor(key)).item() for key in b_keys))
 
 
 @torch.no_grad()

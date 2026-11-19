@@ -6,6 +6,7 @@ import sys
 import types
 
 import torch
+from diagnostics.console import setting_log_only
 
 
 def release_checkpoint_workspaces():
@@ -41,10 +42,10 @@ def release_checkpoint_workspaces():
             with torch.cuda.device(device):
                 torch.cuda.empty_cache()
         reclaim_unused_host_memory(torch, force=True)
-        print("[memory] released idle Unsloth checkpoint workspaces: "
-              f"GPU={released['cuda'] / 2**30:.2f} GiB, "
-              f"CPU={released['cpu'] / 2**30:.2f} GiB; "
-              "compiled kernels and double buffering retained", flush=True)
+        setting_log_only("[memory] released idle Unsloth checkpoint workspaces: "
+                         f"GPU={released['cuda'] / 2**30:.2f} GiB, "
+                         f"CPU={released['cpu'] / 2**30:.2f} GiB; "
+                         "compiled kernels and double buffering retained", flush=True)
     return released
 
 

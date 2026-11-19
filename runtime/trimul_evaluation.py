@@ -146,7 +146,6 @@ def evaluate_batch(path):
                 raise
     finally:
         bar.close()
-    problem.begin_evaluation_batch()
     batch.update(completed=True, evaluation_seconds=time.monotonic() - begin)
     _save_batch(path, batch)
 

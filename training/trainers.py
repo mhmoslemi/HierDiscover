@@ -743,7 +743,7 @@ def _run_oom_resilient_backward(
                 setattr(model, "_ttt_gradient_checkpointing_min_work", int(checkpoint_threshold))
                 if set_gradient_checkpointing(model, True):
                     checkpointing = True
-                    print(
+                    setting_log_only(
                         f"[train-oom] {device_label}: retrying the same "
                         "workload with gradient checkpointing",
                         flush=True,
@@ -1777,11 +1777,11 @@ class ProcessDistributedTrainer:
             "oom_quarantined_examples": quarantined_examples,
             "grad_norm": grad_norm,
         }]
-        print(f"[train-fast] trained examples/GPU={trained_per_gpu}; "
-              f"backward batches/GPU={batches_per_gpu}; final padded-token "
-              f"budgets/GPU={self._token_budgets}; peak memory/GPU="
-              f"{peak_percentages}%; allocator caps/GPU="
-              f"{allocator_percentages}%", flush=True)
+        setting_log_only(
+            f"[train-fast] trained examples/GPU={trained_per_gpu}; "
+            f"backward batches/GPU={batches_per_gpu}; final padded-token "
+            f"budgets/GPU={self._token_budgets}; peak memory/GPU="
+            f"{peak_percentages}%; allocator caps/GPU={allocator_percentages}%", flush=True)
         print(f"[step {step_idx}] {cfg.advantage_mode} epoch 1/1: "
               f"loss={totals['loss']:.6f} "
               f"reference=off "
@@ -2256,11 +2256,11 @@ class ProcessDistributedTrainer:
                   flush=True)
         peak_percentages = [round(100.0 * fraction, 1) for fraction in peak_fractions]
         allocator_percentages = [round(100.0 * fraction, 1) for fraction in allocator_fractions]
-        print(f"[{self._process_label}] trained examples/GPU="
-              f"{trained_per_gpu}; backward batches/GPU={batches_per_gpu}; "
-              f"final padded-token budgets/GPU={self._token_budgets}; "
-              f"peak memory/GPU={peak_percentages}%; allocator caps/GPU="
-              f"{allocator_percentages}%", flush=True)
+        setting_log_only(
+            f"[{self._process_label}] trained examples/GPU={trained_per_gpu}; "
+            f"backward batches/GPU={batches_per_gpu}; final padded-token "
+            f"budgets/GPU={self._token_budgets}; peak memory/GPU="
+            f"{peak_percentages}%; allocator caps/GPU={allocator_percentages}%", flush=True)
         completed_at = state["computed_at"] or time.time()
         elapsed = max(0.0, completed_at - state["started_at"])
         ratio_message = ""
@@ -2506,11 +2506,11 @@ class ProcessDistributedTrainer:
             "oom_quarantined_examples": quarantined_examples,
             "grad_norm": grad_norm,
         }]
-        print(f"[{self._process_label}] trained examples/GPU="
-              f"{trained_per_gpu}; backward batches/GPU={batches_per_gpu}; "
-              f"final padded-token budgets/GPU={self._token_budgets}; "
-              f"peak memory/GPU={peak_percentages}%; allocator caps/GPU="
-              f"{allocator_percentages}%", flush=True)
+        setting_log_only(
+            f"[{self._process_label}] trained examples/GPU={trained_per_gpu}; "
+            f"backward batches/GPU={batches_per_gpu}; final padded-token "
+            f"budgets/GPU={self._token_budgets}; peak memory/GPU="
+            f"{peak_percentages}%; allocator caps/GPU={allocator_percentages}%", flush=True)
         print(f"[step {step_idx}] {cfg.advantage_mode} epoch 1/1: "
               f"loss={totals['loss']:.6f} "
               f"reference=off "
@@ -2635,11 +2635,11 @@ class ProcessDistributedTrainer:
                   flush=True)
         peak_percentages = [round(100.0 * fraction, 1) for fraction in peak_fractions]
         allocator_percentages = [round(100.0 * fraction, 1) for fraction in allocator_fractions]
-        print(f"[{process_label}] trained examples/GPU={trained_per_gpu}; "
-              f"backward batches/GPU={batches_per_gpu}; final padded-token "
-              f"budgets/GPU={self._token_budgets}; peak memory/GPU="
-              f"{peak_percentages}%; allocator caps/GPU="
-              f"{allocator_percentages}%", flush=True)
+        setting_log_only(
+            f"[{process_label}] trained examples/GPU={trained_per_gpu}; "
+            f"backward batches/GPU={batches_per_gpu}; final padded-token "
+            f"budgets/GPU={self._token_budgets}; peak memory/GPU="
+            f"{peak_percentages}%; allocator caps/GPU={allocator_percentages}%", flush=True)
         elapsed = time.time() - started
         ratio_message = ""
         if ratio_count:

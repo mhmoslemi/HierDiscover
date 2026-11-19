@@ -15,6 +15,11 @@ from diagnostics.terminal_output import log_timestamp
 # deployment; a complete deployment still uses the direct setting.log sink.
 setting_log_only = getattr(_terminal_output, "setting_log_only", _terminal_output.terminal_log_only)
 _native_bind_setting_log = getattr(_terminal_output, "bind_setting_log", None)
+_append_setting_log = getattr(_terminal_output, "_append_setting_log", None)
+_UNSLOTH_SETTING_NOTICES = {
+    "Unsloth: Will smartly offload gradients to save VRAM!",
+    "Unsloth: Double buffering enabled (parallel H2D + compute) for backward pass.",
+}
 
 
 def bind_setting_log(path):
@@ -37,6 +42,7 @@ class _TimestampedLineStream:
         self.stream = stream
         self._line_start = True
         self._dynamic_progress = False
+        self._skip_notice_newline = False
         self._lock = threading.Lock()
 
     def write(self, value):
@@ -49,6 +55,7 @@ class _TimestampedLineStream:
             and ("\r" in value or (self._dynamic_progress and "\n" in value and not value.strip())))
         if route_progress:
             with self._lock:
+                self._skip_notice_newline = False
                 progress_stream.write(value)
                 if "\r" in value and "\n" not in value:
                     self._dynamic_progress = True
@@ -59,13 +66,25 @@ class _TimestampedLineStream:
         parts = value.split("\n")
         with self._lock:
             for index, part in enumerate(parts):
+                newline = index + 1 < len(parts)
+                if self._skip_notice_newline:
+                    self._skip_notice_newline = False
+                    if newline and not part:
+                        continue
                 if part and self._line_start:
+                    if (_append_setting_log is not None
+                            and part.strip() in _UNSLOTH_SETTING_NOTICES
+                            and _append_setting_log(part + "\n")):
+                        # print() sends its trailing newline in a separate write.
+                        if not newline:
+                            self._skip_notice_newline = True
+                        continue
                     timestamp = log_timestamp()
                     self.stream.write(timestamp)
                 if part:
                     self.stream.write(part)
                     self._line_start = False
-                if index + 1 < len(parts):
+                if newline:
                     self.stream.write("\n")
                     self._line_start = True
         return len(value)

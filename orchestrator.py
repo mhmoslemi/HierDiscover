@@ -314,7 +314,7 @@ def _adapter_exists(exp_dir):
     return any(p.glob("adapter_step*"))
 
 
-def _save_adapter(model, exp_dir, step_idx, *, directory_name=None):
+def _save_adapter(model, exp_dir, step_idx, *, directory_name=None, base_policy=False):
     """
     Save the current LoRA adapter to disk so generation workers can load it.
     The caller writes a new step directory before advancing the checkpoint,
@@ -326,7 +326,7 @@ def _save_adapter(model, exp_dir, step_idx, *, directory_name=None):
                else _adapter_dir(exp_dir, step_idx))
     if getattr(model, "_ttt_gpt_oss_shared_lora", False):
         from models.gpt_oss_lora import save_shared_adapter
-        save_shared_adapter(model, out_dir)
+        save_shared_adapter(model, out_dir, base_policy=base_policy)
     else:
         model.save_pretrained(out_dir)
     return out_dir
@@ -339,7 +339,7 @@ def _ensure_initial_adapter_for_recovery(model, exp_dir):
         return path, False
     return Path(_save_adapter(
         model, exp_dir, -1,
-        directory_name="adapter_initial")), True
+        directory_name="adapter_initial", base_policy=True)), True
 
 
 def _prune_adapter_snapshots(exp_dir, keep_paths):
@@ -3566,7 +3566,6 @@ def main():
         with (Path(exp_dir) / "runtime.json").open("w", encoding="utf-8") as handle:
             json.dump(runtime, handle, indent=2)
         runtime_message = (f"[runtime] checkout={runtime['checkout']}; memory handoff: {runtime['memory_handoff']}")
-        console_print(runtime_message, flush=True)
         setting_log_only(runtime_message, flush=True)
     print(f"[logs] terminal output: {terminal_log_path}", flush=True)
     result_log_path = Path(exp_dir).resolve() / "result.txt"
@@ -3736,6 +3735,7 @@ def main():
     # ---- seed states (problem-defined) ----
     seeds = problem.seed_states()
     print(f"[init] problem produced {len(seeds)} seed state(s)")
+    setting_log_only("Settings: setting.log   |   Terminal: temirnal.log   |   Results: result.txt")
     print = console_print
     print_dashboard(startup_log.fields, exp_dir, resuming=bool(resume_dir))
 
@@ -3758,7 +3758,7 @@ def main():
         training_precision = "original packed MXFP4 (no NF4 re-quantization)"
     else:
         training_precision = ("BitsAndBytes 4-bit" if effective_4bit else "checkpoint/default precision")
-    print(f"[precision] training copy: {training_precision}")
+    setting_log_only(f"[precision] training copy: {training_precision}")
 
     if cfg.generation_backend == "vllm":
         from runtime.gpu_runtime import validate_attention_heads
@@ -3968,7 +3968,9 @@ def main():
                 raise ValueError(
                     "a fresh SPO-RS run requires at least one finite "
                     "initial reward to initialize its pre-step baseline")
-            initial_adapter = Path(_save_adapter(model, exp_dir, -1, directory_name="adapter_initial"))
+            initial_adapter = Path(_save_adapter(
+                model, exp_dir, -1, directory_name="adapter_initial",
+                base_policy=True))
             transformed = spo_rs_tracker.transformed_rewards(seed_rewards)
             initialization = spo_rs_tracker.update(
                 transformed, divergence=0.0,
@@ -3983,7 +3985,8 @@ def main():
     if is_trimul and resume_payload is None:
         if current_policy_adapter_path is None:
             current_policy_adapter_path = Path(_save_adapter(
-                model, exp_dir, start_step, directory_name="adapter_initial"))
+                model, exp_dir, start_step, directory_name="adapter_initial",
+                base_policy=True))
         _save_training_checkpoint(exp_dir, start_step, current_policy_adapter_path,
                                   sampler, optimizer, spo_rs_tracker)
 
@@ -4060,10 +4063,11 @@ def main():
             hardware_profile=cfg.hardware_profile,
         )
         if getattr(model, "_ttt_gpt_oss_shared_lora", False):
-            pool_options["vllm_engine_options"] = {
-                "enable_moe_shared_loras": True,
-                "enable_mixed_moe_lora_format": True,
-            }
+            from generation.gen_workers import gpt_oss_coder_engine_options
+            pool_options["vllm_engine_options"] = gpt_oss_coder_engine_options(
+                cfg.groups_per_step * cfg.group_size,
+                use_cuda_graphs=cfg.hardware_profile in {"B200", "B200_full_ram"},
+            )
         if cfg.generation_backend == "vllm":
             from runtime.host_memory import HostMemoryAdmission
             import multiprocessing

@@ -540,14 +540,14 @@ class GpuMode(Problem):
             self._kernel_gpu_slots.put(gpu_id)
         self.gpu_lease_timeout_s = float(cfg.get("gpu_lease_timeout_s", 0.0))
         self._verified_kernel_environments = {}
-        self._gpu_idle_error = None
+        self._gpu_lease_error = None
         # entrypoint is implicit (custom_kernel inside submission.py)
         self.entrypoint = "custom_kernel"
 
     def begin_evaluation_batch(self):
-        """Check all TriMul devices after generation and training handoff."""
+        """Check each TriMul device once before evaluating a batch."""
         self._verified_kernel_environments.clear()
-        self._gpu_idle_error = None
+        self._gpu_lease_error = None
         if self.problem_type == "trimul":
             removed = _reap_orphaned_kernel_evaluators(self.kernel_gpu_ids)
             if removed:
@@ -555,19 +555,9 @@ class GpuMode(Problem):
                       flush=True)
             for gpu_id in self.kernel_gpu_ids:
                 with gpu_lease(gpu_id, self.gpu_lease_timeout_s, purpose="TriMul idle check"):
-                    self._wait_for_benchmark_gpu(gpu_id)
+                    wait_for_idle_gpu(
+                        gpu_id, on_busy=lambda: _reap_orphaned_kernel_evaluators((gpu_id,)))
             print(f"[gpu-eval] idle check passed on physical GPUs {self.kernel_gpu_ids}", flush=True)
-
-    def _wait_for_benchmark_gpu(self, gpu_id):
-        if self._gpu_idle_error is not None:
-            raise GPUNotIdle(self._gpu_idle_error)
-        try:
-            wait_for_idle_gpu(gpu_id,
-                              on_busy=lambda: _reap_orphaned_kernel_evaluators((gpu_id,)))
-        except GPUNotIdle as exc:
-            # queued candidates should not each repeat the wait on a blocked batch
-            self._gpu_idle_error = str(exc)
-            raise
 
     # ------------------------------------------------------------------
     def build_prompt(self, parent: ParentContext) -> List[dict]:
@@ -668,8 +658,8 @@ class GpuMode(Problem):
                 "AVAILABLE_GPUS", failure_kind="infrastructure")
 
         timeout = float(self.kernel_timeout_s or 0.0) or float(timeout_s or 0.0)
-        if self._gpu_idle_error is not None:
-            raise GPUNotIdle(self._gpu_idle_error)
+        if self._gpu_lease_error is not None:
+            raise GPUNotIdle(self._gpu_lease_error)
         gpu_id = self._kernel_gpu_slots.get()
         try:
             with gpu_lease(gpu_id, self.gpu_lease_timeout_s,
@@ -677,7 +667,6 @@ class GpuMode(Problem):
                 environment_verified = False
                 environment_key = None
                 if self.problem_type == "trimul":
-                    self._wait_for_benchmark_gpu(gpu_id)
                     try:
                         stat = os.stat(self.kernel_python)
                         environment_key = (
@@ -719,8 +708,8 @@ class GpuMode(Problem):
                         self._verified_kernel_environments.pop(gpu_id, None)
         except TimeoutError as exc:
             if self.problem_type == "trimul":
-                self._gpu_idle_error = str(exc)
-                raise GPUNotIdle(self._gpu_idle_error) from exc
+                self._gpu_lease_error = str(exc)
+                raise GPUNotIdle(self._gpu_lease_error) from exc
             return self._fail(str(exc), failure_kind="infrastructure")
         finally:
             self._kernel_gpu_slots.put(gpu_id)
