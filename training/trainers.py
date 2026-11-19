@@ -1421,6 +1421,12 @@ class ProcessDistributedTrainer:
     def is_offloaded(self):
         return self._offloaded
 
+    def parked_cuda_pids(self):
+        if not self._workers_idle or len(self._offloaded_ranks) != self._world_size:
+            raise RuntimeError("GPU benchmarking requires every trainer replica to be parked")
+        return (os.getpid(), *(process.pid for process in self._processes.values()
+                               if process.is_alive()))
+
     def estimated_host_offload_bytes(self, *, frozen_to_disk=False):
         """RAM required to move every live trainer replica off its GPU."""
         from runtime.host_memory import (GIB, estimated_module_bytes, estimated_optimizer_bytes)
@@ -2697,6 +2703,9 @@ class ProcessDistributedTrainer:
                     self.backend.offload_for_generation()
             gc.collect()
             with torch.cuda.device(0):
+                if self.cfg.evaluation_shares_generation:
+                    torch.cuda.synchronize(0)
+                    torch.cuda.ipc_collect()
                 torch.cuda.empty_cache()
             self._collect_event("offloaded", range(1, self._world_size))
         except BaseException:

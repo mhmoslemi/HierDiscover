@@ -98,6 +98,7 @@ def main(argv=None):
         gpu_id=args.gpu)
     print(f"Evaluator: {problem.kernel_python}; {identity['gpu']}; "
           f"Triton {identity['triton']}; physical GPU {args.gpu}", flush=True)
+    problem.begin_evaluation_batch()
     output_dir = ROOT / ".runtime/kernel_eval_check" / step_dir.parent.name / step_dir.name
     results = evaluate_saved(
         problem, step_dir, output_dir,

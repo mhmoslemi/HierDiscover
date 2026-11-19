@@ -1226,6 +1226,9 @@ def worker_main(rank, world_size, cfg_dict, init_method, work_queue,
                         backend.offload_for_generation()
                     gc.collect()
                     with torch.cuda.device(int(rank)):
+                        if cfg.evaluation_shares_generation:
+                            torch.cuda.synchronize(int(rank))
+                            torch.cuda.ipc_collect()
                         torch.cuda.empty_cache()
                     offloaded = True
                 result_queue.put({"event": "offloaded", "rank": int(rank)})

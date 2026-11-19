@@ -1014,7 +1014,7 @@ def _prepare_recoverable_response_tokens(model, tokenizer, artifacts):
 def _finalize_pending_spo_rs_artifacts(
         tokenizer, sampler, step_idx, cfg, exp_dir, problem, gen_pool,
         spo_rs_tracker, sampling_adapter_path, artifacts, *,
-        prepare_gpu_evaluation=None):
+        prepare_gpu_evaluation=None, parallel_trainer=None):
     """Evaluate and score a generated interrupted step, then seal its metadata.
 
     No policy sampling occurs here. Exact generated token IDs come from the
@@ -1211,7 +1211,9 @@ def _finalize_pending_spo_rs_artifacts(
             if prepare_gpu_evaluation is None:
                 raise RuntimeError("TriMul recovery requires the trainer GPU handoff")
             prepare_gpu_evaluation()
-            problem.begin_evaluation_batch()
+            parked_pids = (parallel_trainer.parked_cuda_pids() if parallel_trainer is not None
+                           else (os.getpid(),))
+            problem.begin_evaluation_batch(parked_trainer_pids=parked_pids)
             evaluation_futures = {
                 evaluation_pool.submit(evaluate, item): index
                 for index, item in enumerate(artifacts)}
@@ -1890,13 +1892,18 @@ def _open_reward_pool(cfg, problem, rollout_count, step_idx, gen_pool,
 
 
 def _prepare_gpu_evaluation(backend, optimizer, cfg, problem, step_idx, count,
-                            *, trainer_parked=False):
+                            *, trainer_parked=False, parallel_trainer=None):
     import gc
     import torch
 
-    if getattr(problem, "problem_type", "") == "trimul":
-        problem.begin_evaluation_batch()
+    is_trimul = getattr(problem, "problem_type", "") == "trimul"
+    parked_pids = (os.getpid(),)
+    if is_trimul and parallel_trainer is not None:
+        parked_pids = parallel_trainer.parked_cuda_pids()
+        trainer_parked = True
     if trainer_parked:
+        if is_trimul:
+            problem.begin_evaluation_batch(parked_trainer_pids=parked_pids)
         return False
     print(f"[step {step_idx}] releasing trainer memory before {count} benchmark(s); "
           "one benchmark at a time per evaluation GPU")
@@ -1905,8 +1912,8 @@ def _prepare_gpu_evaluation(backend, optimizer, cfg, problem, step_idx, count,
         _move_optimizer_state(optimizer, "cpu", hardware_profile=getattr(cfg, "hardware_profile", "RTX6000"))
         backend.offload_for_generation()
         gc.collect()
-        torch.cuda.empty_cache()
         torch.cuda.ipc_collect()
+        torch.cuda.empty_cache()
     except Exception as exc:
         try:
             backend.restore_after_generation()
@@ -1917,6 +1924,8 @@ def _prepare_gpu_evaluation(backend, optimizer, cfg, problem, step_idx, count,
             "shared-GPU evaluation requires the trainer to offload before "
             "candidate benchmark evaluation, but this model/runtime "
             "cannot move the training state to CPU") from exc
+    if is_trimul:
+        problem.begin_evaluation_batch(parked_trainer_pids=parked_pids)
     return True
 
 
@@ -2099,7 +2108,8 @@ def _run_frozen_search_pass(backend, model, tokenizer, sampler, optimizer,
                 offloaded = _prepare_gpu_evaluation(
                     backend, optimizer, cfg, problem, step_idx, rollout_count,
                     trainer_parked=(cfg.generation_backend == "vllm"
-                                    and getattr(pool, "sequential", False)))
+                                    and getattr(pool, "sequential", False)),
+                    parallel_trainer=parallel_trainer)
                 for group, rows in enumerate(rows_by_group):
                     rows_by_group[group] = [
                         (text, final, meta,
@@ -2664,7 +2674,8 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
             evaluation_trainer_offloaded = _prepare_gpu_evaluation(
                 backend, optimizer, cfg, problem, step_idx, len(deferred_rollouts),
                 trainer_parked=(not training_enabled and cfg.generation_backend == "vllm"
-                                and getattr(gen_pool, "sequential", False)))
+                                and getattr(gen_pool, "sequential", False)),
+                parallel_trainer=parallel_trainer)
             for record in deferred_rollouts:
                 _submit_rollout(record)
 
@@ -4322,6 +4333,7 @@ def main():
                         gen_pool, spo_rs_tracker,
                         current_policy_adapter_path,
                         pending_spo_rs_artifacts,
+                        parallel_trainer=parallel_trainer,
                         prepare_gpu_evaluation=(
                             _offload_trainer_for_generation
                             if getattr(problem, "problem_type", "") == "trimul"
