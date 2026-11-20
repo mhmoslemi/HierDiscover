@@ -288,6 +288,21 @@ def _evaluated_rollout_meta(pending_meta, result):
     }
 
 
+def _rollout_advantage_fields(advantage, *, ttt_advantage, spo_rs_advantage,
+                              ttt_sibling_max, ttt_adaptive_beta, parent_raw_score,
+                              spo_rs_v_t):
+    """Write the unweighted components and the applied advantage together."""
+    return {
+        "ttt_advantage": float(ttt_advantage),
+        "spo_rs_advantage": float(spo_rs_advantage) if spo_rs_advantage is not None else None,
+        "advantage": float(advantage),
+        "ttt_sibling_max": float(ttt_sibling_max),
+        "ttt_adaptive_beta": float(ttt_adaptive_beta),
+        "parent_raw_score": float(parent_raw_score) if parent_raw_score is not None else None,
+        "spo_rs_v_t": float(spo_rs_v_t) if spo_rs_v_t is not None else None,
+    }
+
+
 def _advance_live_best_raw(result, current, maximize):
     if not bool(getattr(result, "valid", False)):
         return current, None
@@ -1169,7 +1184,12 @@ def _finalize_pending_spo_rs_artifacts(
         "transformed_reward": float(transformed[index]),
         "used_for_policy_update": True,
     } for index in range(len(artifacts))]
-    beta_by_index = np.full(len(artifacts), float(cfg.spo_rs_beta), dtype=np.float64)
+    group_size = int(cfg.group_size)
+    ttt_groups = []
+    for start in range(0, len(rewards), group_size):
+        group_rewards = rewards[start:start + group_size]
+        ttt_advantages, ttt_adaptive_beta = compute_group_advantages(group_rewards)
+        ttt_groups.append((ttt_advantages, ttt_adaptive_beta, max(group_rewards)))
 
     save_ctor = bool(getattr(problem, "saves_construction", False))
     sampler_type = ("UCTSampler" if getattr(sampler, "use_uct", False) else type(sampler).__name__)
@@ -1188,6 +1208,7 @@ def _finalize_pending_spo_rs_artifacts(
             poisson=result.poisson)
         archive_eligible = bool(result.valid and result.code)
         info = rollout_infos[index]
+        ttt_advantages, ttt_adaptive_beta, ttt_sibling_max = ttt_groups[group]
         meta = {key: value for key, value in pending.items() if key != "status"}
         meta.update({
             "node_id": child.id,
@@ -1202,13 +1223,16 @@ def _finalize_pending_spo_rs_artifacts(
             "ran": bool(result.ran),
             "msg": result.msg,
             "failure_kind": result.failure_kind,
-            "advantage": float(advantages[index]),
-            "beta": float(beta_by_index[index]),
+            **_rollout_advantage_fields(
+                advantages[index], ttt_advantage=ttt_advantages[rollout],
+                spo_rs_advantage=advantages[index], ttt_sibling_max=ttt_sibling_max,
+                ttt_adaptive_beta=ttt_adaptive_beta, parent_raw_score=parent.raw_score,
+                spo_rs_v_t=info["value_before"]),
+            "beta": float(cfg.spo_rs_beta),
             "advantage_mode": str(cfg.advantage_mode).lower(),
-            "advantage_scale": float(beta_by_index[index]),
+            "advantage_scale": float(cfg.spo_rs_beta),
             "sandbox_stdout": _saved_evaluator_output(result.stdout),
             "parent_value": (float(parent.value) if parent.value is not None else None),
-            "parent_raw_score": (float(parent.raw_score) if parent.raw_score is not None else None),
             "parent_is_seed": parent.id in sampler._seed_ids,
             "parent_visit_count": int(parent_row.get("visit_count", 0)),
             "parent_q_value": parent_row.get("q_value"),
@@ -2802,32 +2826,35 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
             print(f"  group {g}: no rollouts returned; no update for this group")
             continue
         adv_mode = active_advantage_mode
+        spo_rs_advantages = None
+        spo_rs_v_t = None
         spo_rs_rollout_info = [None] * len(responses)
         spo_rs_trainable = [True] * len(responses)
         if history_mode:
             prepared = [spo_rs_prepared[(g, r_idx)] for r_idx in range(len(responses))]
-            advantages = np.asarray([item["advantage"] for item in prepared], dtype=np.float64)
+            spo_rs_advantages = np.asarray([item["advantage"] for item in prepared], dtype=np.float64)
             spo_rs_trainable = [item["trainable"] for item in prepared]
             spo_rs_rollout_info = [item["info"] for item in prepared]
-            adv_scale = float(cfg.spo_rs_beta)
-            adv_scale_label = "beta"
-            if hybrid_mode:
-                advantages, sibling_beta = hybrid_advantages(
-                    rewards_np, advantages, ttt_weight=cfg.hybrid_ttt_weight,
-                    spo_weight=cfg.hybrid_spo_weight)
+            spo_rs_v_t = spo_rs_rollout_info[0]["value_before"]
+        if hybrid_mode:
+            advantages, ttt_adaptive_beta, ttt_advantages = hybrid_advantages(
+                rewards_np, spo_rs_advantages, ttt_weight=cfg.hybrid_ttt_weight,
+                spo_weight=cfg.hybrid_spo_weight, return_ttt=True)
         else:
-            advantages, adv_scale = compute_group_advantages(rewards_np)
-            adv_scale_label = "beta"
-        constant = (float(rewards_np.max() - rewards_np.min()) < 1e-12)
+            ttt_advantages, ttt_adaptive_beta = compute_group_advantages(rewards_np)
+            advantages = spo_rs_advantages if history_mode else ttt_advantages
+        adv_scale = float(cfg.spo_rs_beta) if history_mode else ttt_adaptive_beta
+        ttt_sibling_max = float(rewards_np.max())
+        constant = (ttt_sibling_max - float(rewards_np.min()) < 1e-12)
 
         step_valid_count += sum(valids)
         step_rollout_count += len(valids)
         step_code_failure_count += sum(is_code_failure(res) for res in outs)
 
         print(f"  group {g}: rewards min={rewards_np.min():.9f} "
-              f"mean={rewards_np.mean():.9f} max={rewards_np.max():.9f}  "
+              f"mean={rewards_np.mean():.9f} max={ttt_sibling_max:.9f}  "
               f"valid={sum(valids)}/{len(valids)}  "
-              f"{adv_scale_label}={adv_scale:.9f}")
+              f"beta={adv_scale:.9f}")
 
         # Save every rollout (response + meta) to disk for debugging
         for r_idx, record in enumerate(responses):
@@ -2858,6 +2885,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
             if archive_eligible:
                 all_children.append((child, parent))
             pick_info = (sampler.last_picks_info[parent_group] if parent_group < len(sampler.last_picks_info) else {})
+            spo_rs_advantage = spo_rs_advantages[r_idx] if history_mode else None
             meta = {
                 "output_format_issue": record["output_format_issue"],
                 "step": step_idx,
@@ -2878,7 +2906,11 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                 "ran": bool(res.ran),
                 "msg": res.msg,
                 "failure_kind": res.failure_kind,
-                "advantage": float(advantages[r_idx]) if hasattr(advantages, "__len__") else 0.0,
+                **_rollout_advantage_fields(
+                    advantages[r_idx], ttt_advantage=ttt_advantages[r_idx],
+                    spo_rs_advantage=spo_rs_advantage,
+                    ttt_sibling_max=ttt_sibling_max, ttt_adaptive_beta=ttt_adaptive_beta,
+                    parent_raw_score=parent.raw_score, spo_rs_v_t=spo_rs_v_t),
                 "beta": float(adv_scale),
                 "advantage_mode": adv_mode,
                 "advantage_scale": (float(adv_scale) if math.isfinite(adv_scale) else None),
@@ -2886,7 +2918,6 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                 "coder_reasoning_effort": job.get("coder_reasoning_effort"),
                 "sandbox_stdout": _saved_evaluator_output(res.stdout),
                 "parent_value": float(parent.value) if parent.value is not None else None,
-                "parent_raw_score": (float(parent.raw_score) if parent.raw_score is not None else None),
                 "parent_is_seed": parent.id in sampler._seed_ids,
                 "parent_visit_count": int(pick_info.get("n", 0)),
                 "parent_q_value": (float(pick_info["Q"]) if pick_info.get("Q") is not None else None),
@@ -2911,8 +2942,8 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
             if history_mode:
                 meta["spo_rs"] = spo_rs_rollout_info[r_idx]
             if hybrid_mode:
-                meta["hybrid_sibling_beta"] = float(sibling_beta)
-                meta["hybrid_spo_adjustment"] = cfg.hybrid_spo_weight * prepared[r_idx]["advantage"]
+                meta["hybrid_sibling_beta"] = float(ttt_adaptive_beta)
+                meta["hybrid_spo_adjustment"] = float(cfg.hybrid_spo_weight * spo_rs_advantage)
             save_rollout(exp_dir, step_idx, g, artifact_rollout_index,
                          text, meta,
                          prompt_text=job["prompt_text"],
