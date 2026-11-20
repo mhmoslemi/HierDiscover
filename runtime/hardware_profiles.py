@@ -6,22 +6,14 @@ from pathlib import Path
 
 
 B200_MODEL_DIR = Path("/root/nas/Mohammad/models")
-B200_LOCAL_MODELS = {
-    "openai/gpt-oss-120b": "gpt-oss-120b",
-    "Qwen/Qwen3.8-27B": "Qwen3.8-27B",
-    "deepseek-ai/DeepSeek-R1-Distill-Qwen-32B": "DeepSeek-R1-Distill-Qwen-32B",
-    "deepseek-ai/DeepSeek-R1-0528-Qwen3-8B": "DeepSeek-R1-0528-Qwen3-8B",
-}
 
 
 def local_checkpoint(model_name, profile):
-    if profile in {"B200", "B200_full_ram"}:
-        for model_id, folder in B200_LOCAL_MODELS.items():
-            if str(model_name).lower() == model_id.lower():
-                path = B200_MODEL_DIR / folder
-                if path.is_dir():
-                    print(f"[hardware] local checkpoint: {path}")
-                    return str(path)
+    if profile == "B200_full_ram" and str(model_name).lower() == "openai/gpt-oss-120b":
+        path = B200_MODEL_DIR / "gpt-oss-120b"
+        if path.is_dir():
+            print(f"[hardware] local checkpoint: {path}")
+            return str(path)
     return model_name
 
 
@@ -29,14 +21,14 @@ def hardware_profile(value):
     name = str(value).strip().upper()
     if name == "B200_FULL_RAM":
         return "B200_full_ram"
-    if name not in {"RTX6000", "B200"}:
-        raise ValueError("hardware_profile must be RTX6000, B200 or B200_full_ram")
+    if name != "RTX6000":
+        raise ValueError("hardware_profile must be RTX6000 or B200_full_ram")
     return name
 
 
 def generation_cpu_ids(profile, gpu_count):
     """Keep evaluation off inference cores, including their SMT siblings."""
-    if profile not in {"B200", "B200_full_ram"} or not hasattr(os, "sched_getaffinity"):
+    if profile != "B200_full_ram" or not hasattr(os, "sched_getaffinity"):
         return []
     cores = {}
     for cpu in sorted(os.sched_getaffinity(0)):
@@ -66,7 +58,7 @@ def restore_hardware_settings(merged, current_yaml, saved):
     previous = hardware_profile(saved.get("hardware_profile", "RTX6000"))
     merged["hardware_profile"] = selected
     if selected == "B200_full_ram" and previous != selected:
-        # Saved low-RAM launch flags must not defeat the requested RTX policy.
+        # Use the current launch's coder residency setting when changing hardware.
         merged["reload_coder_between_phases"] = current_yaml.get("reload_coder_between_phases", False)
     if saved and previous != selected:
         for key, default in {
@@ -74,7 +66,7 @@ def restore_hardware_settings(merged, current_yaml, saved):
             "vllm_max_num_batched_tokens": "auto", "logprob_chunk": "auto",
         }.items():
             merged[key] = current_yaml.get(key, default)
-    if selected in {"B200", "B200_full_ram"}:
+    if selected == "B200_full_ram":
         # Resolved checkpoint values must not freeze vLLM's automatic B200
         # scheduler when the current launch still requests auto.
         merged["gen_micro_batch"] = current_yaml.get("gen_micro_batch", "auto")

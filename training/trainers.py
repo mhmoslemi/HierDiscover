@@ -11,11 +11,10 @@ from types import SimpleNamespace
 import numpy as np
 
 from diagnostics.console import setting_log_only
-from models.coder_profiles import _uses_sequence_level_policy_ratio
 from runtime.configuration import (
-    SEQUENCE_CLIP_EPSILON_DEFAULT, SPO_RS_CLIP_EPSILON_DEFAULT, SPO_RS_CLIP_EPSILON_HIGH_DEFAULT,
+    SPO_RS_CLIP_EPSILON_DEFAULT, SPO_RS_CLIP_EPSILON_HIGH_DEFAULT,
     SPO_RS_CLIP_EPSILON_LOW_DEFAULT,
-    _is_spo_rs_mode, _parse_gpu_ids, _uses_reward_history,
+    _parse_gpu_ids, _uses_reward_history,
 )
 from training.exact_overflow import (
     ExactLongContextTrainingOOM, _clip_sharded_grad_norm_,
@@ -30,22 +29,13 @@ from training.hybrid import DEFAULT_SPO_WEIGHT, DEFAULT_TTT_WEIGHT, hybrid_advan
 _FUSED_LONG_SINGLETON_MIN_TOKENS = 8192
 
 
-def _detached_behavior_importance_ratio(cfg, current_logprobs, behavior_logprobs):
-    """Return the existing token ratios or the A3B trajectory ratio.
-
-    Entropic updates use a detached importance weight rather
-    than the differentiable clipped surrogate. Keep that objective unchanged
-    except that plain Qwen3-30B-A3B receives one geometric-mean response weight
-    instead of volatile individual-token MoE weights.
-    """
+def _detached_behavior_importance_ratio(current_logprobs, behavior_logprobs):
+    """Return the detached per-token importance weights for entropic updates."""
     import torch
 
     current = current_logprobs.detach()
     behavior = torch.as_tensor(behavior_logprobs, dtype=current.dtype, device=current.device)
-    log_ratios = current - behavior
-    if _uses_sequence_level_policy_ratio(cfg):
-        return log_ratios.mean().exp()
-    return log_ratios.exp()
+    return (current - behavior).exp()
 
 
 def compute_group_advantages(rewards_np):
@@ -130,16 +120,13 @@ def _decoder_token_logprobs(model, input_ids, attention_mask,
     if components is None:
         return None
     decoder, output_head = components
-    from training.training_checkpointing import grouped_qwen_hidden
-    hidden = (grouped_qwen_hidden(decoder, input_ids, attention_mask) if with_grad else None)
+    outputs = decoder(input_ids=input_ids, attention_mask=attention_mask, use_cache=False, return_dict=True)
+    hidden = getattr(outputs, "last_hidden_state", None)
     if hidden is None:
-        outputs = decoder(input_ids=input_ids, attention_mask=attention_mask, use_cache=False, return_dict=True)
-        hidden = getattr(outputs, "last_hidden_state", None)
-        if hidden is None:
-            try:
-                hidden = outputs[0]
-            except (IndexError, KeyError, TypeError):
-                return None
+        try:
+            hidden = outputs[0]
+        except (IndexError, KeyError, TypeError):
+            return None
     scored = []
     for row, ((start, end), targets) in enumerate(zip(response_ranges, response_targets)):
         scored.append(_score_hidden_token_chunks(
@@ -889,17 +876,14 @@ def _initialize_behavior_logprobs(examples):
 
 def clipped_surrogate_loss(
         current_logprobs, old_logprobs, reference_logprob,
-        advantage, *, clip_epsilon=SEQUENCE_CLIP_EPSILON_DEFAULT,
+        advantage, *, clip_epsilon=SPO_RS_CLIP_EPSILON_DEFAULT,
         clip_epsilon_low=None, clip_epsilon_high=None, kl_coef=0.0,
-        sequence_level_ratio=False, return_tensor_metrics=False):
+        return_tensor_metrics=False):
     """One trajectory's loss; callers average equally within each parent.
 
-    Normally, per-token rho = exp(current_lp - old_lp) is differentiable. For
-    the plain Qwen3-30B-A3B MoE coder, callers select the GSPO-style trajectory
-    ratio exp(mean(current_lp - old_lp)); the same scalar ratio and asymmetric
-    bounds are then used for the complete response. Old log-probabilities and
-    the scalar group advantage are frozen. Policy/reference regularization uses
-    the same centered log-probability correction as entropic mode:
+    The per-token ratio exp(current_lp - old_lp) is differentiable. Old
+    log-probabilities and the scalar group advantage are frozen. Reference
+    regularization uses the same centered correction as entropic mode:
         d = log pi_theta - log pi_ref
         A_KL = kl_coef * (mean(d) - d).
     Its policy-gradient surrogate is kept separate from the clipped PPO surrogate
@@ -933,11 +917,7 @@ def clipped_surrogate_loss(
     if not torch.isfinite(cur).all() or not torch.isfinite(old).all():
         raise ValueError("policy logprobs must be finite")
 
-    log_ratios = cur - old
-    if sequence_level_ratio:
-        policy_ratios = log_ratios.mean().exp()
-    else:
-        policy_ratios = log_ratios.exp()
+    policy_ratios = (cur - old).exp()
     clipped_policy_ratios = policy_ratios.clamp(1.0 - epsilon_low, 1.0 + epsilon_high)
     policy_loss = -torch.minimum(policy_ratios * adv, clipped_policy_ratios * adv).mean()
     ratio = policy_ratios.mean()
@@ -952,10 +932,6 @@ def clipped_surrogate_loss(
         logp_difference = (cur - ref).detach()
         policy_reference_delta = logp_difference.mean()
         kl_advantage = kl_coef * (policy_reference_delta - (cur - ref))
-        # This is the KL component of entropic mode's policy-gradient loss.
-        # Keep the current/reference centering unchanged. In sequence-ratio
-        # mode, one detached trajectory weight replaces volatile per-token MoE
-        # weights without changing how pi_theta and pi_ref are compared.
         kl_policy_loss = -(policy_ratios.detach() * kl_advantage.detach() * cur).mean()
 
     prefix_ratio_max = cur.new_ones(())
@@ -1004,31 +980,10 @@ def _policy_dropout_disabled(model):
 
 def _clipped_policy_options(cfg):
     """Return PPO epsilon, lower epsilon, upper epsilon, and reference-KL coef."""
-    if _is_spo_rs_mode(getattr(cfg, "advantage_mode", "entropic")):
-        epsilon = float(getattr(cfg, "spo_rs_clip_epsilon", SPO_RS_CLIP_EPSILON_DEFAULT))
-        epsilon_low = float(getattr(cfg, "spo_rs_clip_epsilon_low", SPO_RS_CLIP_EPSILON_LOW_DEFAULT))
-        epsilon_high = float(getattr(cfg, "spo_rs_clip_epsilon_high", SPO_RS_CLIP_EPSILON_HIGH_DEFAULT))
-        return epsilon, epsilon_low, epsilon_high, 0.0
-    epsilon = SEQUENCE_CLIP_EPSILON_DEFAULT
-    epsilon_low = float(getattr(cfg, "sequence_clip_epsilon_low", epsilon))
-    epsilon_high = float(getattr(cfg, "sequence_clip_epsilon_high", epsilon))
-    return epsilon, epsilon_low, epsilon_high, float(cfg.kl_penalty_coef)
-
-
-def clipped_policy_loss(cfg, current_logprobs, old_logprobs,
-                       reference_logprob, advantage, *,
-                       clip_epsilon, clip_epsilon_low,
-                       clip_epsilon_high, kl_coef=0.0,
-                       return_tensor_metrics=False):
-    """Dispatch the shared fast trainer to the active clipped objective."""
-    return clipped_surrogate_loss(
-        current_logprobs, old_logprobs, reference_logprob, advantage,
-        clip_epsilon=clip_epsilon,
-        clip_epsilon_low=clip_epsilon_low,
-        clip_epsilon_high=clip_epsilon_high,
-        kl_coef=kl_coef,
-        sequence_level_ratio=_uses_sequence_level_policy_ratio(cfg),
-        return_tensor_metrics=return_tensor_metrics)
+    epsilon = float(getattr(cfg, "spo_rs_clip_epsilon", SPO_RS_CLIP_EPSILON_DEFAULT))
+    epsilon_low = float(getattr(cfg, "spo_rs_clip_epsilon_low", SPO_RS_CLIP_EPSILON_LOW_DEFAULT))
+    epsilon_high = float(getattr(cfg, "spo_rs_clip_epsilon_high", SPO_RS_CLIP_EPSILON_HIGH_DEFAULT))
+    return epsilon, epsilon_low, epsilon_high, 0.0
 
 
 def historical_policy_loss(cfg, current_logprobs, example, clip_options, *,
@@ -1042,8 +997,8 @@ def historical_policy_loss(cfg, current_logprobs, example, clip_options, *,
             return_tensor_metrics=return_tensor_metrics, check_finite=check_finite)
 
     epsilon, low, high, kl = clip_options
-    return clipped_policy_loss(
-        cfg, current_logprobs, example["old_policy_logprobs"], None,
+    return clipped_surrogate_loss(
+        current_logprobs, example["old_policy_logprobs"], None,
         example["advantage"], clip_epsilon=epsilon, clip_epsilon_low=low,
         clip_epsilon_high=high, kl_coef=kl,
         return_tensor_metrics=return_tensor_metrics)
@@ -1052,29 +1007,6 @@ def historical_policy_loss(cfg, current_logprobs, example, clip_options, *,
 def _historical_grad_clip(cfg):
     # Keep the nonfinite gradient check when the TTT update clips no gradient.
     return math.inf if cfg.advantage_mode == "hybrid" else cfg.grad_clip
-
-
-def _a3b_sequence_clipped_standard_loss(cfg, current_logprobs, behavior_logprobs, reference_logprobs, advantage):
-    """Apply the A3B sequence surrogate inside entropic training.
-
-    Entropic training retains its existing advantages, centered
-    current/reference correction and sample normalization. Only the
-    reward-policy importance ratio and clipping unit become one
-    length-normalized response ratio. The helper is deliberately unavailable
-    to every other coder model.
-    """
-    if not _uses_sequence_level_policy_ratio(cfg):
-        raise ValueError("the sequence-clipped standard loss is Qwen3-30B-A3B only")
-    epsilon, epsilon_low, epsilon_high, kl_coef = (_clipped_policy_options(cfg))
-    old = (current_logprobs.detach() if behavior_logprobs is None else behavior_logprobs)
-    loss, metrics = clipped_policy_loss(
-        cfg, current_logprobs, old, reference_logprobs, advantage,
-        clip_epsilon=epsilon,
-        clip_epsilon_low=epsilon_low,
-        clip_epsilon_high=epsilon_high,
-        kl_coef=kl_coef,
-        return_tensor_metrics=True)
-    return loss, metrics
 
 
 def _prepare_entropic_overlap_group(
@@ -1352,15 +1284,10 @@ class ProcessDistributedTrainer:
 
         from runtime.host_memory import (
             GIB, TokenWeightedActivationOffloadGate,
-            automatic_activation_offload_budget_bytes, host_memory_info,
-            host_memory_reserve_bytes,
+            automatic_activation_offload_budget_bytes,
         )
         hardware_profile = getattr(cfg, "hardware_profile", "RTX6000")
-        memory_info = host_memory_info() if hardware_profile == "B200" else None
-        self._activation_offload_budget_bytes = automatic_activation_offload_budget_bytes(
-            **({"memory_info": memory_info,
-                "free_reserve_bytes": host_memory_reserve_bytes(memory_info, hardware_profile)}
-               if memory_info else {}))
+        self._activation_offload_budget_bytes = automatic_activation_offload_budget_bytes()
         self._activation_offload_semaphore = (
             TokenWeightedActivationOffloadGate(
                 self._context,
@@ -1615,16 +1542,8 @@ class ProcessDistributedTrainer:
             for example in copied:
                 example["_cooperative_overflow"] = bool(
                     int(example["prompt_ids"].shape[1] + example["response_ids"].shape[1]) >= overflow_floor)
-        # Packing response branches behind one shared prompt is exact for
-        # ordinary transformer attention because the registered branch mask
-        # isolates every response.  It is not valid for GPT-OSS (learned
-        # attention sinks and alternating sliding attention), nor for
-        # Qwen3.8's recurrent Gated-DeltaNet layers, whose state cannot be
-        # reset by an attention mask.  Keep those profiles as independent
-        # batch rows throughout scheduling and scoring.
-        shared_prefix_packing = str(getattr(self.cfg, "coder_model_profile", "")) not in {
-                "gpt-oss-120b", "qwen3.8-27b",
-            }
+        # GPT-OSS-120B's attention sinks and sliding attention require independent batch rows.
+        shared_prefix_packing = getattr(self.cfg, "coder_model_profile", "") != "gpt-oss-120b"
         for example in copied:
             example["_shared_prefix_packing_allowed"] = shared_prefix_packing
 
@@ -1862,9 +1781,6 @@ class ProcessDistributedTrainer:
     def recover_spo_rs_overflow(self, examples, cfg, step_idx, overflow_state):
         """Finish saved SPO-RS overflow without replaying completed gradients.
 
-        Older Qwen checkpoints first try grouped checkpointing on every GPU
-        replica. Work that exhausted that mode uses warm cooperative groups.
-        Legacy backends retain RAM-bounded replica recovery.
         Normal gradients already stored in ``overflow_state`` are never
         replayed. Remaining trajectories are work-stolen by all replicas. A
         trajectory that exhausts card memory may use the shared host-RAM
@@ -1873,14 +1789,7 @@ class ProcessDistributedTrainer:
         residual trajectories on supported checkpoints.
         """
         from training.exact_overflow import supports_warm_overflow, complete_warm_overflow
-        grouped_recovery = bool(
-            overflow_state is not None
-            and overflow_state.get("remaining_keys")
-            and not overflow_state.get("replica_checkpoint_groups_attempted", False)
-            and any(hasattr(module, "_ttt_group_checkpoint_min_tokens") for module in self.model.modules()))
-        from training.context_parallel import availability as context_parallel_availability
-        context_supported, _ = context_parallel_availability(self.model, cfg, self._world_size)
-        if supports_warm_overflow(cfg) and (context_supported or not grouped_recovery):
+        if supports_warm_overflow(cfg):
             return complete_warm_overflow(self, examples, cfg, step_idx, overflow_state)
 
         import torch
@@ -1912,30 +1821,16 @@ class ProcessDistributedTrainer:
 
         started = time.time()
         recovery_cfg = SimpleNamespace(**dict(vars(cfg)))
-        recovery_cfg._exact_replica_force_activation_offload = not grouped_recovery
-        if grouped_recovery:
-            # A saved OOM belongs to the old layer-checkpoint execution mode.
-            # Give every remaining trajectory the new GPU-only mode once.
-            recovery_cfg._exact_replica_overflow_min_tokens = 0
-            self.__dict__.pop("_warm_overflow_min_tokens", None)
-            examples = [{key: value for key, value in item.items()
-                         if key != "_cooperative_overflow"} for item in examples]
-        queued_examples = self._queue_examples(examples, weighted_offload=not grouped_recovery)
-        if grouped_recovery:
-            print(f"[recovery] step {step_idx}: dispatching {len(queued_examples)} "
-                  f"saved trajectories across all {self._world_size} GPU replicas "
-                  "with grouped GPU checkpoints; completed gradients retained",
-                  flush=True)
-        else:
-            print(
-                f"[recovery] step {step_idx}: dispatching "
-                f"{len(queued_examples)} saved oversized trajectories across "
-                f"{self._world_size} GPU replicas; CPU activation admission "
-                f"starts conservatively, measures real footprint, then shares "
-                f"its {self._activation_offload_budget_gib:.0f}-GiB RAM budget "
-                "across every rank whose current trajectory fits",
-                flush=True,
-            )
+        recovery_cfg._exact_replica_force_activation_offload = True
+        queued_examples = self._queue_examples(examples, weighted_offload=True)
+        print(
+            f"[recovery] step {step_idx}: dispatching "
+            f"{len(queued_examples)} saved oversized trajectories across "
+            f"{self._world_size} GPU replicas. CPU activation admission "
+            f"shares a {self._activation_offload_budget_gib:.0f}-GiB RAM budget "
+            "across every rank whose current trajectory fits",
+            flush=True,
+        )
         self.model.zero_grad(set_to_none=True)
         self.optimizer.zero_grad(set_to_none=True)
         self._workers_idle = False
@@ -2027,8 +1922,6 @@ class ProcessDistributedTrainer:
                 # gradient, otherwise successful recovery work is doubled.
                 self.model.zero_grad(set_to_none=True)
                 if deferred_keys:
-                    if grouped_recovery:
-                        overflow_state["replica_checkpoint_groups_attempted"] = True
                     overflow_state["replica_offload_exhausted"] = True
                     _write_exact_spo_rs_overflow_state(overflow_state)
                     marker = _read_exact_sharded_recovery(self._exp_dir) or {}
@@ -2062,8 +1955,6 @@ class ProcessDistributedTrainer:
             if update_error is not None:
                 raise update_error
             if overflow_error is not None:
-                if grouped_recovery and supports_warm_overflow(cfg):
-                    return complete_warm_overflow(self, examples, cfg, step_idx, overflow_state)
                 raise overflow_error
         except BaseException:
             if not self._workers_idle:
@@ -2107,9 +1998,7 @@ class ProcessDistributedTrainer:
             f"reference={'on' if cfg.advantage_mode == 'hybrid' and cfg.kl_penalty_coef else 'off'} "
             f"ratio={totals['ratio']:.6f} max={max_ratio:.6f} "
             f"clipped={totals['clipped_fraction']:.1%} "
-            "OOM-quarantined=0 "
-            + ("(grouped-checkpoint GPU replica recovery)" if grouped_recovery else
-             "(RAM-bounded replicated exact overflow recovery)"),
+            "OOM-quarantined=0 (RAM-bounded replicated exact overflow recovery)",
             flush=True,
         )
         return {

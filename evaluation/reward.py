@@ -78,18 +78,13 @@ def _extract_code_from_scope(text: str) -> str | None:
     return None
 
 
-def extract_python_code(response: str, *, require_final_marker: bool = False,
-                        final_answer_text: str | None = None
-                        ) -> str | None:
+def extract_python_code(response: str, *, final_answer_text: str | None = None) -> str | None:
     """
     Pull the final Python answer out of a response.
 
     When a reasoning-model final-answer delimiter is present, only text after
     the last delimiter is eligible. This prevents executable-looking Python
     drafts in the visible reasoning trace from being evaluated as the answer.
-    Models without an explicit delimiter retain the existing last-fence
-    behavior unless ``require_final_marker`` is set for a reasoning template
-    whose completed answers are contractually delimited.
 
     Returns None if the final-answer scope contains no code. Returns code with
     no fences otherwise.
@@ -118,8 +113,6 @@ def extract_python_code(response: str, *, require_final_marker: bool = False,
         # than executing one of its earlier experimental snippets.
         return _extract_code_from_scope(response[marker_end:])
 
-    if require_final_marker:
-        return None
     if re.search(r"<think\b", response, flags=re.IGNORECASE):
         # An opening reasoning tag with no closing marker has no final answer.
         return None

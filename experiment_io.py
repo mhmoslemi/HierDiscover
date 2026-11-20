@@ -157,7 +157,7 @@ def load_rollout_logprobs(path):
 
 
 class StepPlotter:
-    """Refresh evaluated-step plots and HTML off the training thread, in order.
+    """Refresh evaluated-step plots off the training thread, in order.
 
     Use the same Python environment, headless CPU-only subprocesses, and a
     bounded timeout per script. A single worker avoids competing plot writes;
@@ -177,9 +177,6 @@ class StepPlotter:
 
     def submit(self, step):
         self.executor.submit(self._refresh, int(step))
-
-    def submit_explorer(self, step):
-        self.executor.submit(self._refresh_explorer, int(step))
 
     def close(self, *, wait=True):
         # On interruption, cancel queued plots; an already-running plot is
@@ -231,33 +228,6 @@ class StepPlotter:
                               flush=True)
         except OSError as error:
             print(f"[plots] step {step}: cannot write plots.log: {error}", flush=True)
-        if not self.stopping.is_set():
-            self._refresh_explorer(step)
-
-    def _refresh_explorer(self, step):
-        import os
-        import subprocess
-        import sys
-
-        explorer_dir = Path(__file__).resolve().parent / "run_explorer"
-        log_path = self.run_dir / "explorer.log"
-        try:
-            with log_path.open("a", encoding="utf-8") as log:
-                log.write(f"\n=== evaluated step {step}: unified explorer ===\n")
-                log.flush()
-                result = subprocess.run(
-                    ["./make_explorer.sh", "--code-per-step", "25", "--unified"],
-                    cwd=explorer_dir, stdin=subprocess.DEVNULL,
-                    env={**os.environ, "PYTHON": sys.executable,
-                         "CUDA_VISIBLE_DEVICES": "", "TTT_EVALUATED_RUN": str(self.run_dir)},
-                    stdout=log, stderr=subprocess.STDOUT,
-                    timeout=600, check=False,
-                )
-                if result.returncode:
-                    raise RuntimeError(f"exit status {result.returncode}")
-        except (OSError, subprocess.TimeoutExpired, RuntimeError) as error:
-            print(f"[explorer] step {step}: not updated ({error}); "
-                  f"see {log_path}", flush=True)
 
 
 def _slugify(s: str) -> str:

@@ -28,7 +28,7 @@ def can_incrementally_offload(model, cfg, disk_directory=None):
     """Custom packed/quantized Parameters retain their backend's move path."""
     import torch
 
-    if disk_directory or getattr(cfg, "hardware_profile", "") not in ("B200", "B200_full_ram"):
+    if disk_directory or getattr(cfg, "hardware_profile", "") != "B200_full_ram":
         return False
     return all(type(tensor) in (torch.Tensor, torch.nn.Parameter)
                and tensor.layout == torch.strided and not tensor.is_quantized

@@ -18,7 +18,7 @@ from runtime.hardware_profiles import generation_cpu_ids, local_checkpoint, rest
 
 from prompts.base import UPSTREAM_COMMIT
 from models.coder_profiles import (
-    _apply_coder_model_profile, _is_exact_qwen3_30b_a3b, _resolve_coder_token_limits,
+    _apply_coder_model_profile, _model_basename, _resolve_coder_token_limits,
 )
 from training.exact_overflow import (
     _clear_exact_sharded_recovery, _infer_exact_sharded_recovery, _read_exact_sharded_recovery,
@@ -27,7 +27,6 @@ from training.exact_overflow import (
 from training.hybrid import DEFAULT_SPO_WEIGHT, DEFAULT_TTT_WEIGHT
 
 
-SEQUENCE_CLIP_EPSILON_DEFAULT = 0.2
 SPO_RS_BETA_DEFAULT = 2.0
 SPO_RS_D_HALF_DEFAULT = 0.06
 SPO_RS_RHO_MIN_DEFAULT = 0.875
@@ -64,13 +63,6 @@ def _normalize_saved_advantage_config(saved):
         raise ValueError("saved run uses retired adaptive SPO-RS reward shaping")
     for key in RETIRED_TRAINER_KEYS:
         saved.pop(key, None)
-    if mode == "entropic":
-        for side in ("low", "high"):
-            value = saved.get(f"rank_clip_epsilon_{side}")
-            if value is None:
-                value = saved.get("rank_clip_epsilon")
-            if value is not None:
-                saved.setdefault(f"sequence_clip_epsilon_{side}", value)
     for key in list(saved):
         if key.startswith(("rank_", "x_grpo_", "cvar_", "binary_coder_")):
             saved.pop(key)
@@ -78,18 +70,10 @@ def _normalize_saved_advantage_config(saved):
 
 
 def _resolve_policy_options(merged):
-    """Resolve full-policy sampling and the entropic MoE clipping bounds."""
-    for side in ("low", "high"):
-        name = f"sequence_clip_epsilon_{side}"
-        value = merged.get(name)
-        value = SEQUENCE_CLIP_EPSILON_DEFAULT if value is None else float(value)
-        if not math.isfinite(value) or not 0.0 < value < 1.0:
-            raise ValueError(f"{name} must be finite and in (0, 1)")
-        merged[name] = value
-    sequence_policy = _is_exact_qwen3_30b_a3b(merged["coder_model_name"])
-    clipped = _uses_clipped_policy_loss(merged.get("advantage_mode")) or sequence_policy
+    """Resolve full-policy sampling for SPO-RS and hybrid updates."""
+    clipped = _uses_clipped_policy_loss(merged.get("advantage_mode"))
     if clipped and int(merged["group_size"]) < 2:
-        raise ValueError("sequence/clipped policy modes require group_size >= 2")
+        raise ValueError("SPO-RS requires group_size >= 2")
     if clipped or merged.get("advantage_mode") == "hybrid":
         kl_coef = float(merged["kl_penalty_coef"])
         if not math.isfinite(kl_coef) or kl_coef < 0.0:
@@ -201,7 +185,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
                         "differentiable training backend.")
     p.add_argument(
         "--coder-model-name", default=None,
-        help="Base checkpoint for program generation and LoRA training.")
+        help="GPT-OSS checkpoint name or local path for generation and LoRA training.")
     p.add_argument("--load-in-4bit", action="store_const", const=True, default=None)
     p.add_argument("--max-seq-length", type=int, default=None)
     p.add_argument("--lora-rank", type=int, default=None)
@@ -230,12 +214,6 @@ def _build_arg_parser() -> argparse.ArgumentParser:
                    choices=list(ADVANTAGE_MODES), default=None,
                    help="Objective: entropic (adaptive beta), spo-rs (historical "
                         "baseline), or hybrid (TTT credit plus a weighted historical correction).")
-    p.add_argument("--sequence-clip-epsilon-low", type=float, default=None,
-                   help="Entropic Qwen3-30B-A3B sequence-ratio clipping distance "
-                        "below 1 (default 0.2).")
-    p.add_argument("--sequence-clip-epsilon-high", type=float, default=None,
-                   help="Entropic Qwen3-30B-A3B sequence-ratio clipping distance "
-                        "above 1 (default 0.2).")
     p.add_argument("--spo-rs-beta", type=float, default=None,
                    help="Fixed exponential coefficient and advantage divisor for SPO-RS "
                         f"(default {SPO_RS_BETA_DEFAULT}).")
@@ -271,13 +249,6 @@ def _build_arg_parser() -> argparse.ArgumentParser:
                         "large-vocabulary models.")
     p.add_argument("--temperature", type=float, default=None)
     p.add_argument("--top-p", type=float, default=None)
-    p.add_argument("--thinking", dest="thinking",
-                   action="store_const", const=True, default=None,
-                   help="Enable thinking mode in chat templates that support it "
-                        "(for example hybrid Qwen3 checkpoints).")
-    p.add_argument("--no-thinking", dest="thinking",
-                   action="store_const", const=False,
-                   help="Disable thinking mode, overriding the YAML.")
     p.add_argument("--seed", type=int, default=None)
     p.add_argument("--deterministic", dest="deterministic",
                    action="store_const", const=True, default=None,
@@ -286,7 +257,6 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--no-deterministic", dest="deterministic",
                    action="store_const", const=False,
                    help="Force determinism off, overriding the YAML.")
-    p.add_argument("--print-responses", type=int, default=None)
     p.add_argument("--max-saved-construction", type=int, default=None,
                    help="Max construction length stored per rollout meta. "
                         "0 disables saving it.")
@@ -502,6 +472,9 @@ def load_config():
     ydict.pop(LEGACY_CODER_CAP_KEY, None)
     for key in RETIRED_BATCH_GROWTH_KEYS:
         ydict.pop(key, None)
+    if saved and from_snapshot:
+        for key in RETIRED_TRAINER_KEYS:
+            ydict.pop(key, None)
     # Old external configs may retain the retired repair-feature settings.
     for key in list(ydict):
         if key == "feedback" or key.startswith("feedback_"):
@@ -533,6 +506,8 @@ def load_config():
     if saved:
         # Older runs stored the effective rollout base under model_name.
         saved_coder = saved.pop("model_name", None) or saved.get("coder_model_name")
+        if not _model_basename(saved_coder).startswith("gpt-oss-"):
+            raise ValueError("--resume requires a saved GPT-OSS checkpoint. Start a fresh run with GPT-OSS.")
         saved_trainer = saved.pop("training_model_name", None)
         saved.pop("coder_training_model_name", None)
         if saved_trainer and saved_trainer != saved_coder:
@@ -609,6 +584,8 @@ def load_config():
     if not isinstance(coder_name, str) or not coder_name.strip():
         raise ValueError("coder_model_name must be a non-empty checkpoint name or path")
     coder_name = local_checkpoint(coder_name.strip(), merged["hardware_profile"])
+    if not _model_basename(coder_name).startswith("gpt-oss-"):
+        raise ValueError("coder_model_name must select a GPT-OSS checkpoint")
     merged["coder_model_name"] = coder_name
     _apply_coder_model_profile(merged, profile_explicit_keys)
     if merged.get("coder_model_profile") == "gpt-oss-120b":
@@ -616,8 +593,8 @@ def load_config():
         merged["gpt_oss_shared_lora"] = (
             bool(saved.get("gpt_oss_shared_lora", False)) if resume_dir is not None
             else not merged["no_train"])
-    if (merged.get("coder_model_profile") == "gpt-oss-120b"
-            and str(merged.get("coder_reasoning_effort", "")).lower()
+    if ("coder_reasoning_effort" in merged
+            and str(merged["coder_reasoning_effort"]).lower()
             not in {"low", "medium", "high"}):
         raise ValueError(
             "GPT-OSS coder reasoning supports low, medium, or high; high is "
@@ -834,7 +811,7 @@ def load_config():
             if not recovery.get("overflow_gradient_file"):
                 merged["_exact_replica_capture_step"] = step
                 failed_length = re.search(r"(\d+)-token rollout", str(recovery.get("reason", "")))
-                if failed_length is not None and merged.get("coder_model_profile") != "qwen3.8-27b":
+                if failed_length is not None:
                     merged["_exact_replica_overflow_min_tokens"] = max(1, int(failed_length.group(1)) - 16)
                 print("[recovery] replaying only backward for the saved step on the GPU replicas")
             elif supports_warm_overflow(SimpleNamespace(**merged)):
@@ -891,7 +868,7 @@ def load_config():
     if (merged.get("problem") in {"ac1", "ac2"}
             and merged.get("coder_model_profile") == "gpt-oss-120b"
             and merged.get("generation_backend") == "vllm"
-            and merged.get("hardware_profile") not in {"B200", "B200_full_ram"}):
+            and merged.get("hardware_profile") == "RTX6000"):
         # Legacy runners project exact prompt logprobs in one large chunk.
         merged["vllm_max_num_batched_tokens"] = min(int(merged["vllm_max_num_batched_tokens"]), 2048)
         print('[memory] AC GPT-OSS exact scoring: vLLM max batched tokens=2048')
@@ -940,7 +917,6 @@ def load_config():
         print(f"[config] vLLM engines: {int(cfg.num_gpus or 0) // engine_gpus} "
               f"replica(s), TP={resolved_tp}, PP={pp}, "
               f"{engine_gpus} GPU(s)/engine")
-    print(f"[config] rollout thinking: {('enabled' if cfg.thinking else 'disabled')}")
     merged["_resume_dir"] = str(resume_dir) if resume_dir is not None else None
     return cfg, merged
 

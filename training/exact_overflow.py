@@ -71,7 +71,7 @@ def plan_overflow_wave(examples, world_size, minimum_gpus=None):
     return wave
 
 
-def require_parking_capacity(model, world_size, optimizer=None, *, generation_pools=(), hardware_profile="RTX6000"):
+def require_parking_capacity(model, world_size, optimizer=None, *, generation_pools=()):
     """Reclaim sleeping inference backups before admitting CPU trainer copies."""
     from runtime.host_memory import (host_memory_info, GIB, estimated_module_bytes,
                              estimated_optimizer_bytes)
@@ -79,11 +79,6 @@ def require_parking_capacity(model, world_size, optimizer=None, *, generation_po
     weight_bytes = estimated_module_bytes(model)
     optimizer_bytes = estimated_optimizer_bytes(optimizer)
     required = int(1.10 * (weight_bytes * int(world_size) + optimizer_bytes))
-    if hardware_profile == "B200":
-        from runtime.host_memory import wait_for_host_memory
-        wait_for_host_memory(required, hardware_profile=hardware_profile,
-                             stage="cooperative trainer CPU offload")
-        return
     info = host_memory_info()
     if info is None:
         raise RuntimeError("cannot safely park replicas: host RAM is unknown")
@@ -341,11 +336,6 @@ def complete_warm_overflow(trainer, examples, cfg, step_idx, state):
     if trainer._closed or not trainer._workers_idle:
         raise RuntimeError("replicas must finish their current work before borrowing GPUs")
     training._validate_precomputed_exact_gradients(trainer.model, state, step_idx)
-    from training.context_parallel import complete_context_overflow
-
-    context_result = complete_context_overflow(trainer, examples, cfg, step_idx, state)
-    if context_result is not None:
-        return context_result
     by_key = {}
     for item in examples:
         key = trajectory_key(item)
@@ -378,7 +368,7 @@ def complete_warm_overflow(trainer, examples, cfg, step_idx, state):
                 from runtime.incremental_offload import can_incrementally_offload
                 from runtime.host_memory import RAM_WAIT_TIMEOUT_S
                 transfer_options = {}
-                if getattr(cfg, "hardware_profile", "RTX6000") in ("B200", "B200_full_ram"):
+                if getattr(cfg, "hardware_profile", "RTX6000") == "B200_full_ram":
                     # Hold the shared claim through all CPU copies. A preflight
                     # alone lets evaluation consume the space before the move.
                     if can_incrementally_offload(trainer.model, cfg):
@@ -392,8 +382,7 @@ def complete_warm_overflow(trainer, examples, cfg, step_idx, state):
                 else:
                     require_parking_capacity(trainer.model, trainer.world_size,
                                              trainer.optimizer,
-                                             generation_pools=getattr(trainer, "_generation_pools", ()),
-                                             hardware_profile=getattr(cfg, "hardware_profile", "RTX6000"))
+                                             generation_pools=getattr(trainer, "_generation_pools", ()))
                     parking = nullcontext()
                 with parking:
                     trainer.offload_for_generation(purge_host_cache=False, **transfer_options)
@@ -669,9 +658,6 @@ def _save_exact_spo_rs_overflow(run_dir, step, model, rank_stats, *, normal_trai
         # failed, or the warm path deliberately bypassed it. Do not replay
         # a huge CPU activation graph when resuming this residual tail.
         "replica_offload_exhausted": True,
-        "replica_checkpoint_groups_attempted": any(
-            hasattr(module, "_ttt_group_checkpoint_min_tokens")
-            for module in model.modules()),
         "normal_stats": normal_stats,
         "overflow_stats": {
             "totals": {key: 0.0 for key in METRICS},
@@ -697,9 +683,6 @@ def _save_exact_spo_rs_overflow(run_dir, step, model, rank_stats, *, normal_trai
         deferred_keys=[list(key) for key in deferred_keys],
         normal_trained_examples=int(normal_stats["trained_examples"]),
         replica_offload_exhausted=True,
-        replica_checkpoint_groups_attempted=any(
-            hasattr(module, "_ttt_group_checkpoint_min_tokens")
-            for module in model.modules()),
     )
     return destination, marker, deferred_keys, normal_stats
 

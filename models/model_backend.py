@@ -3,7 +3,6 @@
 import importlib.util
 import os
 import torch
-import types
 import weakref
 import diagnostics.terminal_output as _terminal_output
 
@@ -18,20 +17,6 @@ _FUSED_LONG_ATTENTION_ACTIVE_REPORTED = False
 _FUSED_LONG_ATTENTION_FALLBACK_REPORTED = False
 _SHARED_PREFIX_ATTENTION_LAYOUTS = {}
 _CURRENT_SHARED_PREFIX_ATTENTION_LAYOUT = None
-
-# Bound one dense MLP projection tile to 128 MiB. Long decoder trajectories
-# otherwise ask each gate/up LoRA projection to materialize an output for every
-# token at once (several GiB for Qwen3.8). The MLP is position-wise, so slicing
-# only its token dimension preserves every token and the exact autograd graph.
-_EXACT_MLP_PROJECTION_TILE_BYTES = 128 * 1024 * 1024
-
-# Qwen3.8 flattens every token/value-head pair before its gated RMSNorm.  The
-# stock fallback casts that entire matrix and its SiLU gate to FP32 at once.
-# At 100K+ tokens that single elementwise operation needs several additional
-# GiB even though the surrounding Gated DeltaNet and MLP are already bounded.
-# Tile the flattened row dimension so each exact FP32 norm/gate call stays
-# bounded as well.
-_EXACT_GATED_NORM_TILE_BYTES = 128 * 1024 * 1024
 
 
 def register_shared_prefix_attention_mask(mask, prefix_end, branches):
@@ -421,33 +406,6 @@ def _ttt_shared_prefix_attention_forward(
 def _ttt_blockwise_attention_forward(
         module, query, key, value, attention_mask, dropout=0.0,
         scaling=None, sliding_window=None, **kwargs):
-    context = getattr(module, "_ttt_context_parallel", None)
-    if context is not None:
-        from functools import partial
-        from training.context_parallel import attention
-        return attention(
-            query, key, value, context, scale=scaling, dropout=dropout,
-            kernel=partial(_ttt_local_attention_forward, module))
-    # Calibration only: compare the same independent head-kernel shapes so
-    # BF16 rounding does not masquerade as a cross-GPU routing error.
-    width = getattr(module, "_ttt_calibration_heads", None)
-    if width is not None and query.shape[1] > width:
-        groups = query.shape[1] // key.shape[1]
-        key, value = (_repeat_kv_heads(item, groups) for item in (key, value))
-        outputs = [_ttt_local_attention_forward(
-            module, query[:, start:start + width], key[:, start:start + width],
-            value[:, start:start + width], attention_mask, dropout=dropout,
-            scaling=scaling, sliding_window=sliding_window, **kwargs)[0]
-            for start in range(0, query.shape[1], width)]
-        return torch.cat(outputs, dim=2), None
-    return _ttt_local_attention_forward(
-        module, query, key, value, attention_mask, dropout=dropout,
-        scaling=scaling, sliding_window=sliding_window, **kwargs)
-
-
-def _ttt_local_attention_forward(
-        module, query, key, value, attention_mask, dropout=0.0,
-        scaling=None, sliding_window=None, **kwargs):
     """Exact causal attention with a bounded score tensor and autograd.
 
     Small calls retain native SDPA speed. Large calls split only the query
@@ -705,11 +663,9 @@ def _prepare_sparse_moe_for_kbit_training(model):
     those frozen tensors in checkpoint precision.  PEFT's generic k-bit
     preparation casts every non-4-bit FP16/BF16 Parameter to FP32, which can
     nearly double a sparse model's resident size even though those expert
-    weights will never be trained.  Mixing FP32 norm vectors with checkpoint-
-    precision router/expert matrices is also invalid for implementations such
-    as Qwen3-MoE: the norm promotes hidden states to FP32, then the BF16 router
-    receives mismatched inputs.  Keep every frozen base tensor in its original
-    dtype; LoRA parameters are attached separately below.
+    weights will never be trained. Promoting the norms can also produce inputs
+    that differ in dtype from the router. Keep frozen base tensors in their
+    original dtype and attach LoRA parameters separately.
     """
     retained_parameters = 0
     retained_values = 0
@@ -731,17 +687,6 @@ def _prepare_sparse_moe_for_kbit_training(model):
 def _resolve_lora_target_modules(cfg, model_config):
     """Avoid allocating a separate large LoRA across every MoE expert."""
     targets = list(cfg.target_modules)
-    if str(getattr(cfg, "coder_model_profile", "")) == "qwen3.8-27b":
-        # Qwen3.8's full-attention blocks use q/k/v/o_proj, while each Gated
-        # DeltaNet block uses four input projections plus out_proj. Keep both
-        # members of every vLLM packed-LoRA group together (qkv+z and b+a), so
-        # the adapter is applied identically by PEFT during training and vLLM
-        # during the following rollout step.
-        for name in (
-                "in_proj_qkv", "in_proj_z", "in_proj_b", "in_proj_a",
-                "out_proj"):
-            if name not in targets:
-                targets.append(name)
     experts = _expert_count(model_config)
     expert_mlp_targets = {"gate_proj", "up_proj", "down_proj"}
     removed = [name for name in targets if name in expert_mlp_targets]
@@ -752,239 +697,6 @@ def _resolve_lora_target_modules(cfg, model_config):
         targets = kept
     cfg.effective_target_modules = tuple(targets)
     return targets
-
-
-def _projection_output_width(projection):
-    """Best-effort output width for Linear or PEFT Linear wrappers."""
-    candidates = [projection]
-    get_base_layer = getattr(projection, "get_base_layer", None)
-    if callable(get_base_layer):
-        try:
-            candidates.append(get_base_layer())
-        except (AttributeError, TypeError):
-            pass
-    base_layer = getattr(projection, "base_layer", None)
-    if base_layer is not None:
-        candidates.append(base_layer)
-    for candidate in candidates:
-        width = getattr(candidate, "out_features", None)
-        if width is not None and int(width) > 0:
-            return int(width)
-        weight = getattr(candidate, "weight", None)
-        shape = getattr(weight, "shape", ())
-        if len(shape) >= 2 and int(shape[0]) > 0:
-            return int(shape[0])
-    return None
-
-
-def _projection_output_element_bytes(projection, fallback):
-    """Account for FP32 trainable LoRA outputs on a BF16 base model."""
-    size = max(1, int(fallback))
-    parameters = getattr(projection, "parameters", None)
-    if not callable(parameters):
-        return size
-    for parameter in parameters():
-        element_size = getattr(parameter, "element_size", None)
-        if callable(element_size):
-            size = max(size, int(element_size()))
-    return size
-
-
-def _exact_mlp_token_chunk_size(module, hidden_states):
-    """Choose an automatic token tile from the real dtype and MLP width."""
-    sequence = int(hidden_states.shape[-2])
-    hidden = max(1, int(hidden_states.shape[-1]))
-    leading_rows = max(
-        1, int(hidden_states.numel()) // max(1, sequence * hidden))
-    width = max(
-        filter(None, (
-            _projection_output_width(module.gate_proj),
-            _projection_output_width(module.up_proj),
-        )),
-        default=hidden,
-    )
-    element_bytes = max(
-        _projection_output_element_bytes(
-            module.gate_proj, hidden_states.element_size()),
-        _projection_output_element_bytes(
-            module.up_proj, hidden_states.element_size()),
-    )
-    bytes_per_token = max(1, leading_rows * width * element_bytes)
-    tokens = max(1, _EXACT_MLP_PROJECTION_TILE_BYTES // bytes_per_token)
-    # Multiples of 128 retain efficient GEMM shapes without ever enlarging the
-    # memory-derived tile. Very wide layers may legitimately need fewer.
-    if tokens >= 128:
-        tokens = (tokens // 128) * 128
-    return max(1, min(sequence, int(tokens)))
-
-
-def _exact_chunked_qwen35_mlp_forward(module, hidden_states):
-    """Run Qwen3.8's position-wise MLP in exact checkpointed token tiles.
-
-    No context, token, loss term, or gradient is removed. Each slice executes
-    the checkpoint's original gate/up/activation/down formula, and outputs are
-    concatenated in their original order. Checkpointing each slice prevents a
-    decoder-layer checkpoint recomputation from recreating all wide MLP
-    intermediates simultaneously during backward.
-    """
-    if hidden_states.ndim < 3:
-        return module._ttt_exact_mlp_original_forward(hidden_states)
-    sequence = int(hidden_states.shape[-2])
-    minimum = int(getattr(module, "_ttt_exact_mlp_min_tokens", 0) or 0)
-    original = module._ttt_exact_mlp_original_forward
-    if sequence < minimum:
-        return original(hidden_states)
-
-    chunk = _exact_mlp_token_chunk_size(module, hidden_states)
-    if chunk >= sequence:
-        return original(hidden_states)
-
-    def project(token_slice):
-        return module.down_proj(
-            module.act_fn(module.gate_proj(token_slice))
-            * module.up_proj(token_slice)
-        )
-
-    outputs = []
-    use_checkpoint = bool(
-        torch.is_grad_enabled() and hidden_states.requires_grad)
-    # One split avoids a full-sequence gradient scatter for every tile.
-    for token_slice in hidden_states.split(chunk, dim=-2):
-        if use_checkpoint:
-            from torch.utils.checkpoint import checkpoint
-            output = checkpoint(project, token_slice, use_reentrant=False)
-        else:
-            output = project(token_slice)
-        outputs.append(output)
-    return torch.cat(outputs, dim=-2)
-
-
-def _install_exact_qwen38_mlp_chunking(model, cfg):
-    """Patch dense Qwen3.8 MLPs after PEFT so base and LoRA paths are tiled."""
-    if str(getattr(cfg, "coder_model_profile", "")) != "qwen3.8-27b":
-        return 0
-    minimum = int(getattr(
-        cfg, "long_training_headroom_min_tokens", 32_768))
-    installed = 0
-    for module in model.modules():
-        if type(module).__name__ != "Qwen3_5MLP":
-            continue
-        if hasattr(module, "_ttt_exact_mlp_original_forward"):
-            installed += 1
-            continue
-        required = ("gate_proj", "up_proj", "down_proj", "act_fn")
-        if not all(hasattr(module, name) for name in required):
-            raise RuntimeError(
-                "Qwen3.8 MLP no longer exposes the position-wise "
-                "gate/up/down contract required for exact token chunking")
-        module._ttt_exact_mlp_original_forward = module.forward
-        module._ttt_exact_mlp_min_tokens = minimum
-        module.forward = types.MethodType(
-            _exact_chunked_qwen35_mlp_forward, module)
-        installed += 1
-    if installed < 1:
-        raise RuntimeError(
-            "Qwen3.8 exact long training found no Qwen3_5MLP modules to "
-            "token-chunk; refusing an unbounded long-sequence MLP path")
-    print(
-        "[memory] Qwen3.8 exact token-chunked MLP training ON "
-        f"({installed} layers; activates from {minimum} tokens; "
-        "all tokens and gradients retained)",
-        flush=True,
-    )
-    return installed
-
-
-def _exact_gated_norm_row_chunk_size(hidden_states, gate):
-    """Bound one FP32 gated-normalization tile using its actual row width."""
-    width = max(1, int(hidden_states.shape[-1]), int(gate.shape[-1]))
-    # Both operands are explicitly promoted to FP32 by the checkpoint's
-    # original implementation, regardless of their input dtype.
-    rows = max(1, _EXACT_GATED_NORM_TILE_BYTES // (width * 4))
-    if rows >= 128:
-        rows = (rows // 128) * 128
-    return max(1, min(int(hidden_states.shape[-2]), int(rows)))
-
-
-def _exact_chunked_qwen35_gated_norm_forward(module, hidden_states, gate):
-    """Run Qwen3.8's gated RMSNorm in exact checkpointed row tiles.
-
-    Qwen3.8 passes a two-dimensional ``(tokens * value_heads, head_dim)``
-    matrix here.  RMS normalization and SiLU gating are independent per row,
-    so slicing only that row dimension changes neither values nor gradients.
-    Per-tile checkpointing prevents backward recomputation from materializing
-    the original multi-GiB FP32 gate for the complete trajectory.
-    """
-    original = module._ttt_exact_gated_norm_original_forward
-    if hidden_states.ndim < 2 or gate.ndim != hidden_states.ndim:
-        return original(hidden_states, gate)
-    if tuple(hidden_states.shape) != tuple(gate.shape):
-        return original(hidden_states, gate)
-    rows = int(hidden_states.shape[-2])
-    minimum = int(getattr(
-        module, "_ttt_exact_gated_norm_min_rows", 0) or 0)
-    if rows < minimum:
-        return original(hidden_states, gate)
-
-    chunk = _exact_gated_norm_row_chunk_size(hidden_states, gate)
-    if chunk >= rows:
-        return original(hidden_states, gate)
-
-    def normalize(hidden_slice, gate_slice):
-        return original(hidden_slice, gate_slice)
-
-    outputs = []
-    use_checkpoint = bool(
-        torch.is_grad_enabled()
-        and (hidden_states.requires_grad or gate.requires_grad))
-    for hidden_slice, gate_slice in zip(
-            hidden_states.split(chunk, dim=-2), gate.split(chunk, dim=-2)):
-        if use_checkpoint:
-            from torch.utils.checkpoint import checkpoint
-            output = checkpoint(
-                normalize, hidden_slice, gate_slice, use_reentrant=False)
-        else:
-            output = normalize(hidden_slice, gate_slice)
-        outputs.append(output)
-    return torch.cat(outputs, dim=-2)
-
-
-def _install_exact_qwen38_gated_norm_chunking(model, cfg):
-    """Patch Qwen3.8's FP32 gated-norm fallback with exact bounded tiles."""
-    if str(getattr(cfg, "coder_model_profile", "")) != "qwen3.8-27b":
-        return 0
-    # The module receives value-head rows rather than decoder-token rows.  Use
-    # the memory-derived tile for every nontrivial matrix; short calls remain a
-    # single original forward when they already fit under the tile bound.
-    installed = 0
-    for module in model.modules():
-        if type(module).__name__ != "Qwen3_5RMSNormGated":
-            continue
-        if hasattr(module, "_ttt_exact_gated_norm_original_forward"):
-            installed += 1
-            continue
-        # Older Transformers hard-code SiLU instead of exposing `activation`.
-        # Row tiling invokes the original forward, preserving either variant.
-        required = ("weight", "variance_epsilon")
-        if not all(hasattr(module, name) for name in required):
-            raise RuntimeError(
-                "Qwen3.8 gated RMSNorm no longer exposes the exact "
-                "normalization/gating contract required for row chunking")
-        module._ttt_exact_gated_norm_original_forward = module.forward
-        module._ttt_exact_gated_norm_min_rows = 1
-        module.forward = types.MethodType(
-            _exact_chunked_qwen35_gated_norm_forward, module)
-        installed += 1
-    if installed < 1:
-        raise RuntimeError(
-            "Qwen3.8 exact long training found no Qwen3_5RMSNormGated "
-            "modules to row-chunk; refusing an unbounded FP32 gate path")
-    print(
-        "[memory] Qwen3.8 exact token-chunked gated RMSNorm training ON "
-        f"({installed} layers; all tokens and gradients retained)",
-        flush=True,
-    )
-    return installed
 
 
 def _configure_exact_long_training(model, cfg):
@@ -1001,13 +713,6 @@ def _configure_exact_long_training(model, cfg):
     model._ttt_activation_offload_min_work = (
         None if cpu_offload_threshold is None
         else int(cpu_offload_threshold))
-    _install_exact_qwen38_mlp_chunking(model, cfg)
-    _install_exact_qwen38_gated_norm_chunking(model, cfg)
-    if str(getattr(cfg, "coder_model_profile", "")) == "qwen3.8-27b":
-        for module in model.modules():
-            if type(module).__name__ == "Qwen3_5TextModel":
-                module._ttt_group_checkpoint_min_tokens = int(getattr(
-                    cfg, "long_training_headroom_min_tokens", 32_768))
     offload_description = (
         "CPU activation offload only after a proven OOM"
         if model._ttt_activation_offload_min_work is None else
@@ -1072,61 +777,6 @@ def _validate_gpt_oss_training_attention(model, cfg):
         f"{implementation} via Unsloth; generic Flash-SDPA is prohibited",
         flush=True,
     )
-
-
-def _validate_hf_training_attention(model, cfg):
-    """Validate the structural assumptions behind exact fused Qwen training."""
-    profile = str(getattr(cfg, "coder_model_profile", ""))
-    if profile != "qwen3.8-27b":
-        return
-
-    config = getattr(model, "config", None)
-    get_text_config = getattr(config, "get_text_config", None)
-    if callable(get_text_config):
-        try:
-            text_config = get_text_config()
-        except (AttributeError, TypeError):
-            text_config = config
-    else:
-        text_config = getattr(config, "text_config", None) or config
-
-    implementation = getattr(text_config, "_attn_implementation", None)
-    if isinstance(implementation, dict):
-        implementation = (
-            implementation.get("")
-            or implementation.get("text_config")
-            or implementation.get("model")
-        )
-    if str(implementation) != _hf_training_attention_implementation():
-        raise RuntimeError(
-            f"{profile} did not install the exact TTT attention backend "
-            f"(got {implementation!r})")
-
-    attention_dropout = float(
-        getattr(text_config, "attention_dropout", 0.0) or 0.0)
-    if attention_dropout != 0.0:
-        raise RuntimeError(
-            f"{profile} now configures attention_dropout="
-            f"{attention_dropout}; fused and blockwise dropout consume "
-            "different RNG streams, so refusing to claim equivalent "
-            "training behavior")
-
-    if any(getattr(module, "sinks", None) is not None
-           for module in model.modules()):
-        raise RuntimeError(
-            f"{profile} unexpectedly contains learned attention sinks; "
-            "generic Flash-SDPA cannot preserve their normalization")
-
-    layer_types = tuple(getattr(text_config, "layer_types", ()) or ())
-    if not ({"linear_attention", "full_attention"} <= set(layer_types)):
-        raise RuntimeError(
-            "Qwen3.8 training config lost its expected hybrid "
-            "Gated-DeltaNet/full-attention layout")
-
-    model._ttt_attention_backend = f"qwen-exact:{implementation}"
-    print(f"[memory] {profile} exact long attention: Flash-SDPA for eligible "
-          "full-attention layers; exact FLA Gated-DeltaNet; independent rollout states; "
-          "exact bounded fallback retained", flush=True)
 
 
 def _require_packed_mxfp4_training_runtime(cfg):
@@ -1365,15 +1015,6 @@ class HFBackend(_ModelPlacementBackend):
             trust_remote_code=True,
             attn_implementation=attention_implementation,
         )
-        qwen_training_kernels = None
-        if str(getattr(self.cfg, "coder_model_profile", "")) == "qwen3.8-27b":
-            # Qwen3.8 interleaves full attention with Gated DeltaNet. Its Hub
-            # inference kernel does not provide the backward implementation we
-            # need here. Require FLA's training-capable chunked GDN kernel and
-            # the matching causal-convolution kernel so Transformers cannot
-            # silently fall back to the token-by-token PyTorch recurrence.
-            from models.qwen_training_kernels import load_training_kernels
-            qwen_training_kernels = load_training_kernels()
         attention_detail = (
             "native SDPA + exact fused long-context attention + exact "
             "bounded fallback"
@@ -1403,13 +1044,7 @@ class HFBackend(_ModelPlacementBackend):
         model = retry_host_allocation(lambda: AutoModelForCausalLM.from_pretrained(
             training_name, **model_kwargs), hardware_profile=getattr(self.cfg, "hardware_profile", "RTX6000"),
             stage="trainer loading", required_bytes=8 * GIB)
-        if qwen_training_kernels is not None:
-            from models.qwen_training_kernels import install_training_kernels
-            count = install_training_kernels(model, qwen_training_kernels)
-            print(f"[memory] Qwen3.8 native training kernels bound to {count} "
-                  "DeltaNet layers (FLA + causal-conv1d)", flush=True)
         self._remember_training_placement(model)
-        _validate_hf_training_attention(model, self.cfg)
 
         if use_4bit:
             if _expert_count(hf_config) > 0:

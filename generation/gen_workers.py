@@ -427,8 +427,8 @@ def _canonical_generated_text(tokenizer, token_ids, generated_text):
 
     Some tokenizer/vLLM combinations expose the reversible byte alphabet in
     incremental ``candidate.text`` (for example ``Ġ`` for a space and ``Ċ``
-    for a newline). Healthy Qwen/GPT-OSS/DeepSeek text takes the zero-work fast
-    path. Suspicious text is reconstructed from the generated token IDs with
+    for a newline). Clean text returns immediately. Suspicious text is
+    reconstructed from the generated token IDs with
     whichever tokenizer belongs to the currently loaded model; the generic
     ByteLevel inverse is only a fallback for a misdeclared tokenizer backend.
     """
@@ -462,7 +462,7 @@ def _canonical_generated_text(tokenizer, token_ids, generated_text):
     return decoded or original
 
 
-def native_final_answer_scope(tokenizer, token_ids, *, require_final_marker=False, prompt_text=""):
+def native_final_answer_scope(tokenizer, token_ids, *, prompt_text=""):
     """Decode the final channel from original IDs, not lookalike text markers.
 
     None retains legacy extraction for tokenizers without a native reasoning
@@ -477,8 +477,6 @@ def native_final_answer_scope(tokenizer, token_ids, *, require_final_marker=Fals
     channel_id, message_id = native.get("<|channel|>"), native.get("<|message|>")
     harmony = channel_id is not None and message_id is not None
     if not closing_ids and not harmony:
-        if require_final_marker:
-            raise RuntimeError("the coder tokenizer does not expose its required native reasoning boundary")
         return None
 
     def decode(ids):
@@ -510,7 +508,7 @@ def native_final_answer_scope(tokenizer, token_ids, *, require_final_marker=Fals
                     break
                 reasoning = reasoning or channel == "analysis"
     if final_start is None:
-        if require_final_marker or reasoning:
+        if reasoning:
             return ""
         final_start = 0
     final_ids = list(token_ids[final_start:])
@@ -881,10 +879,9 @@ def _vllm_engine_kwargs(model_name, max_seq_length, load_in_4bit,
             for key in ("max_lora_rank", "max_loras", "max_cpu_loras",
                         "fully_sharded_loras"):
                 kwargs.pop(key, None)
-    if hardware_profile in {"B200", "B200_full_ram"}:
+    if hardware_profile == "B200_full_ram":
         basename = str(model_name).rstrip("/").rsplit("/", 1)[-1].lower()
-        if basename in {"qwen3.8-27b", "qwen3-30b-a3b", "gpt-oss-120b",
-                        "deepseek-r1-0528-qwen3-8b"}:
+        if basename == "gpt-oss-120b":
             # B200's automatic FlashInfer/TRTLLM path downloads kernels at
             # startup; bundled FlashAttention (FA4 on SM100) works offline.
             attention = dict(kwargs.get("attention_config") or {})
@@ -1831,10 +1828,9 @@ class GenerationPool:
                  vllm_staged_loading=False,
                  vllm_log_path=None, vllm_engine_options=None,
                  vllm_base_policy_only=False,
-                 hardware_profile="RTX6000", host_memory_admission=None):
+                 hardware_profile="RTX6000"):
         self.model_name = model_name
         self.hardware_profile = hardware_profile
-        self.host_memory_admission = host_memory_admission
         requested_num_gpus = int(num_workers)
         self.gpu_ids = gpu_ids or list(range(num_workers))
         self.seed = seed
@@ -1913,7 +1909,7 @@ class GenerationPool:
         effective_max_batched_tokens = int(
             vllm_max_num_batched_tokens or 0)
         if (self.backend == "vllm" and self.vllm_token_scoring
-                and hardware_profile not in {"B200", "B200_full_ram"}
+                and hardware_profile == "RTX6000"
                 and (effective_max_batched_tokens <= 0
                      or effective_max_batched_tokens
                      > VLLM_TOKEN_SCORING_MAX_BATCHED_TOKENS)):
@@ -2030,11 +2026,11 @@ class GenerationPool:
             "performance_mode": (
                 "throughput"
                 if self.backend == "vllm"
-                and hardware_profile in {"B200", "B200_full_ram"}
+                and hardware_profile == "B200_full_ram"
                 else None),
             "use_v2_model_runner": bool(
                 self.backend == "vllm"
-                and hardware_profile in {"B200", "B200_full_ram"}),
+                and hardware_profile == "B200_full_ram"),
             "enable_expert_parallel": bool(vllm_enable_expert_parallel),
             "engine_options": vllm_engine_options,
             # Separate TP engines remap different physical GPU pairs to the
@@ -2052,7 +2048,7 @@ class GenerationPool:
         }
         if self.backend == "vllm":
             self._worker_options["hardware_profile"] = hardware_profile
-        if self.backend == "vllm" and hardware_profile in {"B200", "B200_full_ram"}:
+        if self.backend == "vllm" and hardware_profile == "B200_full_ram":
             # Evaluation avoids reserved cores; inference can use the full allowed cpuset.
             self._worker_options["enable_log_stats"] = True
         self._load_in_4bit = bool(load_in_4bit)
@@ -2155,8 +2151,7 @@ class GenerationPool:
                     f"while waiting for workers {sorted(pending)}; details: "
                     f"{self.vllm_log_path or 'console'}")
             try:
-                status, rank, detail = self._get_worker_message(self._ready_queue,
-                    timeout=min(1.0, remaining))
+                status, rank, detail = self._ready_queue.get(timeout=min(1.0, remaining))
             except queue.Empty:
                 dead = [
                     (rank, None if self.procs[rank] is None
@@ -2219,13 +2214,6 @@ class GenerationPool:
             for rank in worker_ids:
                 self._start_worker(rank)
             self._wait_workers(worker_ids)
-
-    def _get_worker_message(self, worker_queue, *, timeout):
-        admission = getattr(self, "host_memory_admission", None)
-        if admission is not None and admission._ram_wait_failed.value:
-            from runtime.host_memory import HostMemoryTimeout
-            raise HostMemoryTimeout("a shared RAM wait exceeded 2 hours; stopping generation")
-        return worker_queue.get(timeout=timeout)
 
     def _remember_worker_children(self, rank):
         """Retain engine identities even if their wrapper exits before cleanup."""
@@ -2514,7 +2502,7 @@ class GenerationPool:
         try:
             while collected < total_expected:
                 try:
-                    rank, group_idx, job_results = self._get_worker_message(self.result_queue, timeout=1.0)
+                    rank, group_idx, job_results = self.result_queue.get(timeout=1.0)
                 except queue.Empty:
                     dead = [
                         (idx, None if proc is None else proc.exitcode)
@@ -2621,7 +2609,7 @@ class GenerationPool:
             1, (total_expected + self.num_workers - 1) // self.num_workers)
         # Keep replacements waiting inside vLLM on B200 without preallocating KV.
         queue_capacity = capacity + (
-            8 if getattr(self, "hardware_profile", "RTX6000") in {"B200", "B200_full_ram"}
+            8 if getattr(self, "hardware_profile", "RTX6000") == "B200_full_ram"
             else 0)
         collected = 0
         try:
@@ -2642,7 +2630,7 @@ class GenerationPool:
                         available.append(rank)
 
                 try:
-                    rank, sample, results = self._get_worker_message(self.result_queue, timeout=0.01)
+                    rank, sample, results = self.result_queue.get(timeout=0.01)
                 except queue.Empty:
                     dead = [(rank, None if proc is None else proc.exitcode)
                             for rank, proc in enumerate(self.procs)
@@ -2740,8 +2728,7 @@ class GenerationPool:
 
             while waiting:
                 try:
-                    rank, group_idx, job_results = self._get_worker_message(self.result_queue,
-                        timeout=1.0)
+                    rank, group_idx, job_results = self.result_queue.get(timeout=1.0)
                 except queue.Empty:
                     dead = {
                         idx for idx in waiting
@@ -3046,12 +3033,6 @@ class PhasedVLLMGenerationPool:
         self._after_stop = after_stop
         self.host_memory_admission = pool_kwargs.pop("host_memory_admission", None)
         self._pool_kwargs = dict(pool_kwargs)
-        self._b200_transient = self._pool_kwargs.get("hardware_profile", "RTX6000") == "B200"
-        if self._b200_transient:
-            self._pool_kwargs["vllm_persistent_workers"] = 0
-            options = dict(self._pool_kwargs.get("vllm_engine_options") or {})
-            options["safetensors_load_strategy"] = "lazy"
-            self._pool_kwargs["vllm_engine_options"] = options
         requested_sleep_level = int(
             self._pool_kwargs.pop("vllm_sleep_level", 1))
         if requested_sleep_level not in (1, 2):
@@ -3075,8 +3056,6 @@ class PhasedVLLMGenerationPool:
             level_one_model = "BitsAndBytes"
         elif "gpt-oss-20b" in model_name:
             level_one_model = "GPT-OSS-20B"
-        elif "qwen2.5-coder-7b" in model_name:
-            level_one_model = "Qwen2.5-Coder-7B"
         self._level_one_override_model = (
             level_one_model if requested_sleep_level == 2 else None)
         self._sleep_level = (
@@ -3087,8 +3066,7 @@ class PhasedVLLMGenerationPool:
         # original parameter names and fails (for example, w2_bias is no
         # longer present).  A fresh process is exact and also releases the
         # residual CUDA allocations that level-2 sleep keeps alive.
-        self._force_transient = bool(self._b200_transient or (
-            self._sleep_level == 2 and "gpt-oss" in model_name))
+        self._force_transient = self._sleep_level == 2 and "gpt-oss" in model_name
         self._pool = None
         self._base_policy_only = False
         engine_options = self._pool_kwargs.get("vllm_engine_options") or {}
@@ -3148,8 +3126,6 @@ class PhasedVLLMGenerationPool:
                 options["vllm_staged_loading"] = False
                 print("[pool] loading GPT-OSS replicas concurrently with "
                       f"{reserved / 2**30:.1f} GiB of host RAM admitted", flush=True)
-            if self._b200_transient:
-                options["host_memory_admission"] = self.host_memory_admission
             return GenerationPool(**(self._pool_kwargs | options))
 
     def _ensure_started(self, *, base_policy_only=False, require_lora=False):
@@ -3186,10 +3162,7 @@ class PhasedVLLMGenerationPool:
                     not self._force_transient
                     and self._pool.sleep_supported)
                 if not self._sleep_mode_announced:
-                    if self._b200_transient:
-                        print("[pool] B200: inference workers exit at phase handoff; "
-                              "no sleep or host weight backups", flush=True)
-                    elif self._force_transient:
+                    if self._force_transient:
                         print(
                             "[pool] GPT-OSS level-2 weight reload is unsafe; "
                             "using a fresh transient vLLM pool for each phase",

@@ -35,9 +35,9 @@ num_seed_states learning_rate adam_beta1 adam_beta2 adam_epsilon weight_decay
 kl_penalty_coef grad_clip
 spo_rs_beta logprob_chunk
 puct_c max_buffer_size topk_children_per_parent
-temperature top_p top_k thinking
+temperature top_p top_k
 deterministic seed
-sandbox_timeout_s reward_workers print_responses max_saved_construction
+sandbox_timeout_s reward_workers max_saved_construction
 """.split())
 
 COMMON_OPTIONAL_KEYS = frozenset({
@@ -51,7 +51,6 @@ COMMON_OPTIONAL_KEYS = frozenset({
     "spo_rs_clip_epsilon", "spo_rs_clip_epsilon_low",
     "spo_rs_clip_epsilon_high",
     "hybrid_ttt_weight", "hybrid_spo_weight",
-    "sequence_clip_epsilon_low", "sequence_clip_epsilon_high",
 })
 
 # Compatibility filter only: these keys cannot activate any runtime behavior.
@@ -63,6 +62,8 @@ RETIRED_BATCH_GROWTH_KEYS = frozenset({
 
 RETIRED_TRAINER_KEYS = frozenset({
     "fast", "training_layout", "train_examples_per_microbatch", "spo_rs_update_epochs",
+    "print_responses", "thinking", "coder_template_kind", "coder_preserve_thinking",
+    "sequence_clip_epsilon_low", "sequence_clip_epsilon_high",
 })
 
 CPU_PROBLEMS = frozenset({
@@ -191,7 +192,7 @@ def validate_problem_config(
     retired_trainer_keys = data.keys() & RETIRED_TRAINER_KEYS
     if retired_trainer_keys:
         raise ValueError(
-            f"{_label(source)}: remove retired trainer settings {sorted(retired_trainer_keys)}")
+            f"{_label(source)}: remove retired settings {sorted(retired_trainer_keys)}")
 
     retired_search = retired_search_keys(data)
     if retired_search:
@@ -276,9 +277,6 @@ def validate_problem_config(
     for key in ("hybrid_ttt_weight", "hybrid_spo_weight"):
         if key in data:
             validate_hybrid_weight(key, data[key], source=source)
-    for key in ("sequence_clip_epsilon_low", "sequence_clip_epsilon_high"):
-        if key in data and not 0.0 < float(data[key]) < 1.0:
-            raise ValueError(f"{_label(source)}: {key} must be in (0, 1)")
     if "eval_cpus" in data:
         _positive_int(data, "eval_cpus", source)
     if "num_circles" in data:

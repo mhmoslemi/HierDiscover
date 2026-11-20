@@ -36,7 +36,6 @@ from diagnostics.console import (
 from models.coder_profiles import (
     _coder_model_profile as _coder_model_profile,
     _coder_vllm_persistent_workers, _model_basename as _model_basename,
-    _uses_sequence_level_policy_ratio,
 )
 from runtime.configuration import (
     _build_arg_parser as _build_arg_parser, _isolated_evaluation_cpu_ids,
@@ -60,7 +59,7 @@ from training.trainers import (
     _clipped_policy_options as _clipped_policy_options, _complete_spo_rs_overlap_examples,
     _initialize_behavior_logprobs as _initialize_behavior_logprobs,
     _prepare_entropic_overlap_group, _prepare_spo_rs_overlap_inputs,
-    _valid_example_token_logprobs, clipped_policy_loss as clipped_policy_loss,
+    _valid_example_token_logprobs,
     clipped_surrogate_loss as clipped_surrogate_loss,
     compute_group_advantages, compute_token_logprobs as compute_token_logprobs,
 )
@@ -125,8 +124,7 @@ def _generate_batch(model, tokenizer, inputs, input_len, n_samples, cfg):
         policy_sampling["top_k"] = int(sampling_top_k)
     if sampling_min_p is not None:
         policy_sampling["min_p"] = float(sampling_min_p)
-    if (_uses_clipped_policy_loss(getattr(cfg, "advantage_mode", "entropic"))
-            or _uses_sequence_level_policy_ratio(cfg)):
+    if _uses_clipped_policy_loss(getattr(cfg, "advantage_mode", "entropic")):
         policy_sampling.update(top_k=0, repetition_penalty=1.0)
 
     with torch.inference_mode():
@@ -233,8 +231,6 @@ def generate_prompt_jobs(model, tokenizer, prompts_by_group, counts_by_group,
         gen_kwargs["top_k"] = int(resolved_top_k)
     if resolved_min_p is not None:
         gen_kwargs["min_p"] = float(resolved_min_p)
-    if _uses_sequence_level_policy_ratio(cfg):
-        gen_kwargs.update(top_k=0, repetition_penalty=1.0)
     yield from _iter_hf_job_batches(
         model, tokenizer, jobs, model.device, int(cfg.max_seq_length),
         gen_kwargs, cap_state=cap_state, log_prefix="trainer rollout")
@@ -1039,11 +1035,8 @@ def _finalize_pending_spo_rs_artifacts(
         response_text = item["response_path"].read_text(encoding="utf-8", errors="replace")
         final_text = native_final_answer_scope(
             tokenizer, item["response_token_ids"],
-            require_final_marker=bool(getattr(problem, "require_final_code_marker", False)),
             prompt_text=item["prompt_path"].read_text(encoding="utf-8", errors="replace"))
-        issue = coder_output_issue(
-            response_text, require_final_marker=bool(getattr(problem, "require_final_code_marker", False)),
-            final_answer_text=final_text)
+        issue = coder_output_issue(response_text, final_answer_text=final_text)
         meta["output_format_issue"] = issue
         if issue:
             return RewardResult(reward=float(problem.fail_score), msg=str(issue), failure_kind="code")
@@ -1541,7 +1534,6 @@ def _resume_spo_rs_step_from_artifacts(
         # Re-encoded legacy text cannot prove where a native token occurred.
         final_text = (native_final_answer_scope(
             tokenizer, response_tokens,
-            require_final_marker=bool(getattr(problem, "require_final_code_marker", False)),
             prompt_text=prompt_text)
             if bool(recovery.get("exact", False)) else None)
         code = extract_python_code(response_text, final_answer_text=final_text)
@@ -1992,45 +1984,20 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
         base_messages.append(problem.build_prompt(pc))
 
     coder_effort = getattr(cfg, "coder_reasoning_effort", None)
+    template_options = {} if coder_effort is None else {"reasoning_effort": str(coder_effort)}
 
     def _render(messages):
-        template_kind = str(getattr(cfg, "coder_template_kind", "generic"))
-        template_options = {}
-        if template_kind == "gpt-oss":
-            template_options["reasoning_effort"] = str(cfg.coder_reasoning_effort)
-        elif template_kind == "qwen3.8":
-            template_options.update({
-                "enable_thinking": True,
-                "preserve_thinking": bool(cfg.coder_preserve_thinking),
-                "reasoning_effort": str(coder_effort),
-            })
-        else:
-            template_options["enable_thinking"] = bool(cfg.thinking)
         try:
             return tokenizer.apply_chat_template(
                 messages, tokenize=False, add_generation_prompt=True,
                 **template_options,
             )
-        except TypeError:
-            # Older Qwen templates may not expose preserve_thinking even when
-            # they support enable_thinking/reasoning_effort. Remove only that
-            # optional history-control argument before the generic fallback.
-            if "preserve_thinking" in template_options:
-                reduced = dict(template_options)
-                reduced.pop("preserve_thinking", None)
-                try:
-                    return tokenizer.apply_chat_template(
-                        messages, tokenize=False,
-                        add_generation_prompt=True, **reduced)
-                except TypeError:
-                    pass
-            if template_kind in {"gpt-oss", "qwen3.8"}:
-                raise RuntimeError(
-                    f"the installed tokenizer/chat template cannot apply "
-                    f"the required {template_kind} reasoning controls "
-                    f"{template_options}; update transformers and refresh "
-                    "the model tokenizer files")
-            return tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        except TypeError as error:
+            if coder_effort is None:
+                raise
+            raise RuntimeError(
+                f"the installed GPT-OSS tokenizer cannot apply reasoning_effort={coder_effort}. "
+                "Update Transformers and refresh the tokenizer files.") from error
 
     prompt_jobs = []
     for g, _parent in enumerate(parents):
@@ -2160,7 +2127,6 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
         job = prompt_jobs[int(job_idx)]
         final_text = native_final_answer_scope(
             tokenizer, token_ids,
-            require_final_marker=bool(getattr(problem, "require_final_code_marker", False)),
             prompt_text=job["prompt_text"])
         group_id = int(job["parent_group"])
         rollout_index = queued_by_parent[group_id]
@@ -2176,9 +2142,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
             "token_ids": token_ids,
             "behavior_logprobs": behavior_logprobs,
             "reference_logprobs": None,
-            "output_format_issue": coder_output_issue(
-                text, require_final_marker=bool(getattr(problem, "require_final_code_marker", False)),
-                final_answer_text=final_text),
+            "output_format_issue": coder_output_issue(text, final_answer_text=final_text),
         }
         pending_meta = {
             "output_format_issue": record["output_format_issue"],
@@ -2255,7 +2219,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                     "top_k": getattr(cfg, "sampling_top_k", None),
                     "min_p": getattr(cfg, "sampling_min_p", None),
                     "step_idx": step_idx,
-                    "full_policy_sampling": (hybrid_mode or _uses_sequence_level_policy_ratio(cfg)),
+                    "full_policy_sampling": hybrid_mode,
                 }
                 if cfg.generation_backend == "vllm":
                     generation_options["return_logprobs"] = training_enabled
@@ -3436,9 +3400,6 @@ def _main(trainer_startup):
     else:
         print(f"KL coef:            {cfg.kl_penalty_coef}")
     print(f"Advantage mode:     {getattr(cfg, 'advantage_mode', 'entropic')}")
-    if _uses_sequence_level_policy_ratio(cfg):
-        print("MoE policy ratio:    sequence-level geometric mean "
-              "(Qwen3-30B-A3B only; existing asymmetric low/high bounds)")
     if history_mode:
         print(f"SPO-RS beta:        fixed {cfg.spo_rs_beta}")
         print(f"SPO-RS D_half:      {cfg.spo_rs_d_half}")
@@ -3453,11 +3414,6 @@ def _main(trainer_startup):
                   f"{cfg.spo_rs_clip_epsilon_high} "
                   f"(bounds {1.0 - cfg.spo_rs_clip_epsilon_low:.4f} / "
                   f"{1.0 + cfg.spo_rs_clip_epsilon_high:.4f})")
-    elif _uses_sequence_level_policy_ratio(cfg):
-        print(f"Sequence clip eps low/high: "
-              f"{cfg.sequence_clip_epsilon_low} / {cfg.sequence_clip_epsilon_high} "
-              f"(bounds {1.0 - cfg.sequence_clip_epsilon_low:.4f} / "
-              f"{1.0 + cfg.sequence_clip_epsilon_high:.4f})")
     print(f"Max new tokens:     {cfg.max_new_tokens}")
     if getattr(cfg, "coder_reasoning_effort", None) is not None:
         print(f"Coder reasoning:    {cfg.coder_reasoning_effort}")
@@ -3465,13 +3421,10 @@ def _main(trainer_startup):
         f"Coder sampling:     temperature={cfg.temperature}, "
         f"top_p={cfg.top_p}, "
         f"top_k={getattr(cfg, 'sampling_top_k', None)}, "
-        f"min_p={getattr(cfg, 'sampling_min_p', None)}, "
-        f"thinking={'on' if cfg.thinking else 'off'}")
+        f"min_p={getattr(cfg, 'sampling_min_p', None)}")
     print(f"Max seq length:     {cfg.max_seq_length}")
     if getattr(cfg, "coder_model_profile", "") == "gpt-oss-120b":
         fused_attention_label = ('GPT-OSS sink-aware Unsloth path (generic Flash-SDPA prohibited)')
-    elif getattr(cfg, "coder_model_profile", "") == "qwen3.8-27b":
-        fused_attention_label = ("on for full-attention layers; exact FLA for Gated DeltaNet")
     else:
         fused_attention_label = ("on" if cfg.fused_long_attention else "off")
     print(f"Fused long attention: {fused_attention_label}")
@@ -3807,7 +3760,7 @@ def _main(trainer_startup):
             from generation.gen_workers import gpt_oss_coder_engine_options
             pool_options["vllm_engine_options"] = gpt_oss_coder_engine_options(
                 cfg.groups_per_step * cfg.group_size,
-                use_cuda_graphs=cfg.hardware_profile in {"B200", "B200_full_ram"},
+                use_cuda_graphs=cfg.hardware_profile == "B200_full_ram",
             )
         if cfg.generation_backend == "vllm":
             from runtime.host_memory import HostMemoryAdmission
@@ -3872,7 +3825,7 @@ def _main(trainer_startup):
                 # the trainer can park safely. The coder reloads on next use.
                 reserve_bytes = None
                 if memory is not None:
-                    if frozen_to_disk or cfg.hardware_profile in ("B200", "B200_full_ram"):
+                    if frozen_to_disk or cfg.hardware_profile == "B200_full_ram":
                         from runtime.host_memory import host_memory_reserve_bytes
                         reserve_bytes = host_memory_reserve_bytes(memory, cfg.hardware_profile)
                     else:

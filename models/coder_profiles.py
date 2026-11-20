@@ -3,24 +3,13 @@
 import json
 from pathlib import Path
 
-_QWEN3_30B_A3B_MODEL_BASENAME = "qwen3-30b-a3b"
 _GPT_OSS_120B_MODEL_BASENAME = "gpt-oss-120b"
-_QWEN38_27B_MODEL_BASENAME = "qwen3.8-27b"
 
 
 def _profile_default(merged, key, value, explicit_keys):
     """Apply an automatic model default unless configuration set the key."""
     if key not in explicit_keys:
         merged[key] = value
-
-
-def _is_exact_qwen3_30b_a3b(model_name):
-    """Match only the original hybrid-thinking A3B coder checkpoint.
-
-    Match the exact checkpoint basename for both Hub IDs and local model paths.
-    """
-    normalized = str(model_name or "").strip().rstrip("/").replace("\\", "/")
-    return normalized.rsplit("/", 1)[-1].lower() == (_QWEN3_30B_A3B_MODEL_BASENAME)
 
 
 def _model_basename(model_name):
@@ -37,7 +26,6 @@ def _coder_model_profile(model_name):
             "native_context": 131_072,
             "max_output": 131_072,
             "reasoning_effort": "high",
-            "template_kind": "gpt-oss",
             # Modern Unsloth trains the published MXFP4 experts while keeping
             # them packed. This is the same base used by vLLM, without NF4
             # re-quantization or a second full-precision model copy.
@@ -45,33 +33,11 @@ def _coder_model_profile(model_name):
             "training_memory_fraction": 0.88,
             "vllm_runtime_reserve_gib": 5.0,
         }
-    if basename == _QWEN38_27B_MODEL_BASENAME:
-        return {
-            "name": "qwen3.8-27b",
-            "native_context": 262_144,
-            "max_output": 262_144,
-            "reasoning_effort": "low",
-            "template_kind": "qwen3.8",
-            "training_4bit": False,
-            # A BF16 copy plus the LoRA state fits on each 95+ GiB card.  Use
-            # one complete trainer per GPU so independent rollouts execute in
-            # parallel; layer-sharding a single copy serializes the forward
-            # and backward passes across cards.
-            "training_memory_fraction": 0.88,
-            # Qwen3.8 has a roughly 248K-token vocabulary. vLLM's exact
-            # prompt-logprob path materializes an FP32 softmax for an entire
-            # prefill chunk, so its transient projection is much larger than
-            # the ordinary generation activation. Keep enough actual card
-            # headroom instead of assigning that memory to the KV cache.
-            "vllm_runtime_reserve_gib": 15.0,
-        }
     return None
 
 
 def _coder_vllm_persistent_workers(cfg):
     """Release coder engines when requested, or for GPT-OSS adapter training."""
-    if getattr(cfg, "hardware_profile", "RTX6000") == "B200":
-        return 0
     if bool(getattr(cfg, "reload_coder_between_phases", False)):
         return 0
     if (str(getattr(cfg, "coder_model_profile", "")) == "gpt-oss-120b" and not bool(getattr(cfg, "no_train", False))):
@@ -137,12 +103,9 @@ def _apply_coder_model_profile(merged, explicit_keys=frozenset()):
 
     native_context = int(profile["native_context"])
     merged["coder_model_profile"] = str(profile["name"])
-    merged["coder_template_kind"] = str(profile["template_kind"])
     _profile_default(merged, "coder_reasoning_effort", str(profile["reasoning_effort"]), explicit_keys)
-    merged["coder_preserve_thinking"] = bool(profile["template_kind"] == "qwen3.8")
     _profile_default(merged, "max_seq_length", native_context, explicit_keys)
     _profile_default(merged, "max_new_tokens", int(profile["max_output"]), explicit_keys)
-    _profile_default(merged, "thinking", True, explicit_keys)
 
     # Quantization and placement describe only the differentiable copy. The
     # aligned GPT-OSS profile keeps the original checkpoint name on both sides.
@@ -154,7 +117,7 @@ def _apply_coder_model_profile(merged, explicit_keys=frozenset()):
     # The model profile leaves memory outside vLLM's KV cache for CUDA/NCCL
     # and the bounded exact-token projection. The layout planner also accounts
     # for startup weight conversion before choosing the smallest fitting TP
-    # group. Qwen3.8 needs a larger projection reserve than the other profiles.
+    # group.
     _profile_default(merged, "vllm_gpu_memory_utilization", 0.965, explicit_keys)
     _profile_default(merged, "vllm_quantization", "", explicit_keys)
     _profile_default(merged, "gen_micro_batch", "auto", explicit_keys)
@@ -188,9 +151,3 @@ def _apply_coder_model_profile(merged, explicit_keys=frozenset()):
         "exact long-context training enabled",
         flush=True,
     )
-
-
-def _uses_sequence_level_policy_ratio(cfg):
-    """Use the MoE-stable sequence ratio only for plain Qwen3-30B-A3B."""
-    return (getattr(cfg, "advantage_mode", "") != "hybrid"
-            and _is_exact_qwen3_30b_a3b(cfg.coder_model_name))

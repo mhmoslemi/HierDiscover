@@ -164,15 +164,7 @@ def _auto(value) -> bool:
 
 def _model_size_billions(model_name: str) -> float:
     name = str(model_name or "").lower()
-    # Some sparse models omit their total parameter count from the repository
-    # name. These totals matter for weight residency even though only a small
-    # fraction of experts is active for each token.
-    if "qwen3-coder-next" in name:
-        return 80.0
-    if "deepseek-v4" in name:
-        return 284.0
-    # Prefer a size next to the conventional B suffix.  This handles 8B, 32B,
-    # 30B-A3B and 120B without coupling to one repository naming scheme.
+    # Use the parameter count indicated by the checkpoint name.
     matches = re.findall(r"(?:^|[-_/])(\d+(?:\.\d+)?)b(?:$|[-_/])", name)
     return float(matches[0]) if matches else 8.0
 
@@ -181,7 +173,7 @@ def _native_weight_bytes(model_name: str) -> float:
     # GPT-OSS checkpoints are natively MXFP4.  Passing the training QLoRA flag
     # through as vLLM BitsAndBytes quantization is both redundant and fragile.
     name = str(model_name or "").lower()
-    if "gpt-oss" in name or "deepseek-v4" in name:
+    if "gpt-oss" in name:
         return 0.55
     if "fp8" in name:
         return 1.0
@@ -200,20 +192,8 @@ def _known_vllm_runtime_weight_floor_gib(model_name: str) -> Optional[float]:
     for a valid four-card layout.
     """
     name = str(model_name or "").lower()
-    if "deepseek-r1-0528-qwen3-8b" in name:
-        # Official BF16 safetensor shards total 16.4 decimal GB.
-        return 15.3
     if "gpt-oss-120b" in name:
         return 76.0
-    if "qwen3-32b" in name:
-        # vLLM 0.28 measured 61.55 GiB after loading the BF16 checkpoint.
-        # The parameter-count fallback is only 59.60 GiB and can therefore
-        # admit a TP=1 layout that has no room for its configured KV cache.
-        return 62.0
-    if "qwen3.8-27b" in name:
-        # The published checkpoint index is about 51.75 GiB; the simple 27B
-        # parameter-name estimate is slightly smaller than the real files.
-        return 52.0
     return None
 
 
@@ -227,12 +207,7 @@ def _kv_bytes_per_token(model_name: str) -> int:
         # generation even though vLLM's hybrid KV manager stores the windowed
         # layers at their bounded size.
         return 36_864
-    if "qwen3.8-27b" in name:
-        # Only the full-attention layers grow a KV cache with sequence length;
-        # the interleaved Gated DeltaNet layers use fixed recurrent state.
-        return 65_536
-    if ("120b" in name or "32b" in name or "30b" in name
-            or "qwen3-coder-next" in name or "deepseek-v4" in name):
+    if "120b" in name or "32b" in name or "30b" in name:
         return 262_144
     return 147_456
 
@@ -363,7 +338,7 @@ def resolve_memory_settings(cfg: dict, roles: GPURoles,
     using_vllm = str(cfg.get("generation_backend", "hf")).lower() == "vllm"
     selected = [memory[g] for g in roles.generation if g in memory]
     min_total = min((item.total_gib for item in selected),
-                    default=178.0 if cfg.get("hardware_profile") in {"B200", "B200_full_ram"} else 80.0)
+                    default=178.0 if cfg.get("hardware_profile") == "B200_full_ram" else 80.0)
     min_free = min((item.free_gib for item in selected), default=min_total)
 
     raw_util = cfg.get("vllm_gpu_memory_utilization", "auto")
@@ -415,8 +390,7 @@ def resolve_memory_settings(cfg: dict, roles: GPURoles,
             "max_seq_length, choose generation_backend=hf, or provide a "
             "larger compatible TP*PP group.")
 
-    b200 = (using_vllm
-            and cfg.get("hardware_profile") in {"B200", "B200_full_ram"})
+    b200 = using_vllm and cfg.get("hardware_profile") == "B200_full_ram"
     if _auto(cfg.get("gen_micro_batch", "auto")) and b200:
         # Zero means do not pass max_num_seqs. vLLM 0.30 then selects its
         # hardware-aware B200 throughput ceiling and admits against profiled KV.
@@ -424,9 +398,8 @@ def resolve_memory_settings(cfg: dict, roles: GPURoles,
         notes.append("generation max sequences=vLLM automatic throughput")
     elif _auto(cfg.get("gen_micro_batch", "auto")):
         # ``max_num_seqs`` is an active scheduler ceiling, not a reservation of
-        # max_model_len for every request.  Basing it on full-context requests
-        # serialized long-thinking jobs (for example, two active Qwen3.8
-        # requests despite a ~580k-token paged-KV pool).  Plan against a
+        # max_model_len for every request. Basing it on full-context requests
+        # serialized long-thinking jobs. Plan against a
         # shorter active sequence instead. vLLM owns the fixed paged
         # KV allocation and exactly preempts/recomputes unusually long requests
         # before that pool can overflow, so this raises throughput without
@@ -534,28 +507,9 @@ def derive_vllm_tensor_parallel_size(num_gpus: int,
 def known_attention_heads(model_name: str) -> Optional[int]:
     """Fast preflight for the model families explicitly supported here."""
     name = str(model_name or "").lower()
-    if "deepseek-r1-0528-qwen3-8b" in name:
-        return 32
-    if "qwen2.5-coder-7b" in name:
-        return 28
-    if "qwen3-coder-next" in name:
-        return 16
-    if "qwen3-coder-30b" in name:
-        return 32
-    if "qwen3-32b" in name:
-        return 64
-    if "qwen3.8-27b" in name:
-        return 24
-    if "deepseek-r1-distill-qwen-32b" in name:
-        # This checkpoint is distilled into the Qwen2.5-32B architecture.
-        # Knowing its 40 query heads lets eight GPUs form four independent
-        # TP=2 engines instead of conservatively forcing one TP=8 engine.
-        return 40
     if "gpt-oss-20b" in name:
         return 64
     if "gpt-oss-120b" in name:
-        return 64
-    if "deepseek-v4" in name:
         return 64
     return None
 
@@ -611,7 +565,7 @@ def derive_vllm_parallel_layout(cfg: dict, roles: GPURoles,
 
     selected = [memory[g] for g in roles.generation if g in memory]
     min_total = min((item.total_gib for item in selected),
-                    default=178.0 if cfg.get("hardware_profile") in {"B200", "B200_full_ram"} else 80.0)
+                    default=178.0 if cfg.get("hardware_profile") == "B200_full_ram" else 80.0)
     min_free = min((item.free_gib for item in selected), default=min_total)
     util = _resolved_vllm_utilization(
         cfg.get("vllm_gpu_memory_utilization", "auto"), min_total, min_free)

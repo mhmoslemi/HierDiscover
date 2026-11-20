@@ -160,9 +160,6 @@ def host_memory_reserve_bytes(info, hardware_profile="RTX6000"):
         if not math.isfinite(reserve) or reserve <= 0:
             raise ValueError("TTT_HOST_MEMORY_RESERVE_GIB must be finite and positive")
         return min(total // 4, int(reserve * GIB))
-    if hardware_profile == "B200":
-        # This job may own two GPUs on a busy multi-TiB host, not all its RAM.
-        return min(total // 4, 16 * GIB)
     if hardware_profile == "B200_full_ram":
         # Use the same user-requested headroom as trainer handoff, including
         # startup/evaluation gates; full machine RAM is not exclusive to us.
@@ -234,7 +231,7 @@ class HostMemoryAdmission:
         minimum_bytes = size_bytes if minimum_bytes is None else int(minimum_bytes)
         if not 0 <= minimum_bytes <= size_bytes:
             raise ValueError("minimum reservation must be between zero and the requested bytes")
-        bounded_wait = self.hardware_profile in ("B200", "B200_full_ram")
+        bounded_wait = self.hardware_profile == "B200_full_ram"
         if bounded_wait and deadline is None:
             deadline = time.monotonic() + RAM_WAIT_TIMEOUT_S
         next_report = 0.0
@@ -299,20 +296,10 @@ class HostMemoryAdmission:
                 self._condition.notify_all()
 
 
-def wait_for_host_memory(size_bytes, *, hardware_profile="RTX6000", stage):
-    """Preflight for cooperative CPU parking on shared B200 hosts."""
-    if hardware_profile not in ("B200", "B200_full_ram"):
-        return
-    import multiprocessing
-    admission = HostMemoryAdmission(multiprocessing.get_context("spawn"), hardware_profile=hardware_profile)
-    with admission.reservation(size_bytes, stage=stage):
-        pass
-
-
 def retry_host_allocation(allocation, *, hardware_profile="RTX6000", stage,
                           required_bytes=0):
     """Retry CPU allocation failures only; never replay a training update."""
-    if hardware_profile not in ("B200", "B200_full_ram"):
+    if hardware_profile != "B200_full_ram":
         return allocation()
     from contextlib import nullcontext
     import multiprocessing

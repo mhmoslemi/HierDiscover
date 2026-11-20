@@ -256,7 +256,7 @@ def _move_examples(examples, logical_id):
 
 def historical_training_memory_fraction(model, cfg, configured_fraction):
     if (getattr(model, "_ttt_gpt_oss_shared_lora", False)
-            and getattr(cfg, "hardware_profile", None) in {"B200", "B200_full_ram"}):
+            and getattr(cfg, "hardware_profile", None) == "B200_full_ram"):
         return LONG_ROLLOUT_MEMORY_FRACTION
     return float(configured_fraction)
 
@@ -824,7 +824,6 @@ def local_policy_update(backend, model, tokenizer, examples, cfg, logical_id,
     total_examples = int(total_examples)
     if total_examples < 1:
         raise ValueError("fast policy update requires at least one example")
-    sequence_policy = training._uses_sequence_level_policy_ratio(cfg)
 
     backend.set_training_mode()
     allocator_fraction = set_total_memory_ceiling(
@@ -1043,18 +1042,11 @@ def local_policy_update(backend, model, tokenizer, examples, cfg, logical_id,
                                 example["behavior_logprobs"].to(
                                     current_lp.device)
                                 if has_behavior else None)
-                            if sequence_policy:
-                                loss, policy_metrics = (
-                                    training.
-                                    _a3b_sequence_clipped_standard_loss(
-                                        cfg, current_lp, behavior_lp,
-                                        base_lp, advantage))
-                                importance_ratio = policy_metrics["ratio"]
-                            elif has_behavior:
+                            if has_behavior:
                                 importance_ratio = (
                                     training.
                                     _detached_behavior_importance_ratio(
-                                        cfg, current_lp, behavior_lp))
+                                        current_lp, behavior_lp))
                                 loss = -(
                                     importance_ratio
                                     * effective_advantage.detach()
@@ -1271,7 +1263,6 @@ def worker_main(rank, world_size, cfg_dict, init_method, work_queue,
         broadcast_trainable_parameters(model, source_rank=0)
         result_queue.put({"event": "ready", "rank": int(rank)})
         offloaded = False
-        context_groups = None
 
         while True:
             command = command_queue.get()
@@ -1364,23 +1355,6 @@ def worker_main(rank, world_size, cfg_dict, init_method, work_queue,
                     "event": "computed", "rank": int(rank),
                     "stats": stats,
                 })
-            elif kind == "init_context_parallel":
-                from training.context_parallel import initialize_groups
-
-                context_groups = initialize_groups(int(world_size))
-                result_queue.put({"event": "context_ready", "rank": int(rank)})
-            elif kind == "context_backward":
-                if offloaded or context_groups is None:
-                    raise RuntimeError("context-parallel training requires resident initialized replicas")
-                from training.context_parallel import compute_context_work
-
-                ranks = tuple(command["gpu_ids"])
-                result = compute_context_work(
-                    backend, tokenizer, command["example"],
-                    SimpleNamespace(**dict(command["step_cfg"])),
-                    context_groups[ranks], ranks)
-                result_queue.put({"event": "context_computed", "rank": int(rank),
-                                  "result": result})
             elif kind == "overflow_backward":
                 if not offloaded:
                     raise RuntimeError("cooperative overflow requires parked replicas")

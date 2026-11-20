@@ -115,10 +115,6 @@ class Problem(ABC):
         self.num_seed_states = int(self.cfg.get("num_seed_states", 8))
         self.seed = int(self.cfg.get("seed", 42))
         self.eval_cpus = int(self.cfg.get("eval_cpus", 1))
-        self.require_final_code_marker = bool(
-            self.cfg.get("coder_model_profile") == "qwen3.8-27b"
-            and self.cfg.get("coder_preserve_thinking", False)
-        )
         if self.eval_cpus < 1:
             raise ValueError("eval_cpus must be >= 1")
 
@@ -155,7 +151,6 @@ class Problem(ABC):
         res = RewardResult(reward=self.fail_score)
         code = extract_python_code(
             response_text,
-            require_final_marker=self.require_final_code_marker,
             final_answer_text=final_answer_text,
         )
         if code is None:
