@@ -20,6 +20,7 @@ _UNSLOTH_SETTING_NOTICES = {
     "Unsloth: Will smartly offload gradients to save VRAM!",
     "Unsloth: Double buffering enabled (parallel H2D + compute) for backward pass.",
 }
+_TORCH_ENUM_NOTICE = "is an Enum subclass and is now natively supported by torch.compile"
 
 
 def bind_setting_log(path):
@@ -72,8 +73,11 @@ class _TimestampedLineStream:
                     if newline and not part:
                         continue
                 if part and self._line_start:
+                    # PyTorch can retain this stream when a resume checkpoint
+                    # imports it before the model-loading notice router starts.
                     if (_append_setting_log is not None
-                            and part.strip() in _UNSLOTH_SETTING_NOTICES
+                            and (part.strip() in _UNSLOTH_SETTING_NOTICES
+                                 or _TORCH_ENUM_NOTICE in part)
                             and _append_setting_log(part + "\n")):
                         # print() sends its trailing newline in a separate write.
                         if not newline:
@@ -315,7 +319,7 @@ _ROUTED_DEPENDENCY_NOTICES = (
 )
 _SETTING_LOG_ONLY_NOTICES = (
     "Unrecognized keys in `rope_parameters`",
-    "is an Enum subclass and is now natively supported by torch.compile",
+    _TORCH_ENUM_NOTICE,
 )
 
 

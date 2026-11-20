@@ -1,6 +1,6 @@
 """Policy likelihood, loss, and process-distributed LoRA training."""
 
-from contextlib import contextmanager, nullcontext
+from contextlib import ExitStack, contextmanager, nullcontext
 import math
 import os
 from pathlib import Path
@@ -24,7 +24,7 @@ from training.exact_overflow import (
     _write_exact_spo_rs_overflow_state, _validate_precomputed_exact_gradients,
 )
 from training.fast_distributed import _move_optimizer_state, _restore_optimizer_state_to_parameters
-from training.hybrid import DEFAULT_SIBLING_WEIGHT, hybrid_advantages
+from training.hybrid import DEFAULT_SPO_WEIGHT, hybrid_advantages
 
 
 _FUSED_LONG_SINGLETON_MIN_TOKENS = 8192
@@ -1214,7 +1214,7 @@ def _prepare_spo_rs_overlap_inputs(tokenizer, group_responses, reward_futures, p
 
 
 def _complete_spo_rs_overlap_examples(examples, spo_rs_tracker=None, *, sibling_futures=None,
-                                      sibling_weight=DEFAULT_SIBLING_WEIGHT):
+                                      spo_weight=DEFAULT_SPO_WEIGHT):
     """Attach advantages to reward-complete trajectories."""
     if not examples:
         return []
@@ -1229,7 +1229,7 @@ def _complete_spo_rs_overlap_examples(examples, spo_rs_tracker=None, *, sibling_
     if advantages is None:
         raise RuntimeError("SPO-RS overlap lost its frozen pre-step tracker baseline")
     if sibling_futures is not None:
-        advantages, _ = hybrid_advantages(rewards, advantages, sibling_weight=sibling_weight)
+        advantages, _ = hybrid_advantages(rewards, advantages, spo_weight=spo_weight)
         advantages = [advantages[example["rollout_index"]] for example in examples]
     for example, advantage in zip(examples, advantages):
         example["advantage"] = float(advantage)
@@ -1316,30 +1316,14 @@ def _finalize_exact_spo_rs_overflow(
 class ProcessDistributedTrainer:
     """Fast LoRA trainer with one persistent Python process per GPU."""
 
-    def __init__(self, primary_backend, primary_model, primary_tokenizer,
-                 optimizer, cfg, exp_dir, dependency_log_path=None):
+    def __init__(self, cfg, exp_dir, dependency_log_path=None):
+        import multiprocessing as mp
         import queue
         import uuid
-        from datetime import timedelta
-        import torch
-        import torch.distributed as dist
-        import torch.multiprocessing as mp
-        from training.fast_distributed import (
-            broadcast_trainable_parameters, initial_training_token_budget,
-            set_total_memory_ceiling,
-            trainable_parameter_signature, validate_model_device, worker_main,
-        )
 
-        if dist.is_initialized():
-            raise RuntimeError(
-                "the process trainer cannot start because torch.distributed is already "
-                "initialized in the main process")
-        self.backend = primary_backend
-        self.model = primary_model
-        self.tokenizer = primary_tokenizer
-        self.optimizer = optimizer
         self.cfg = cfg
         self._exp_dir = Path(exp_dir).resolve()
+        self._dependency_log_path = dependency_log_path
         self._process_label = "train-fast"
         self._offloaded = False
         self._offloaded_ranks = set()
@@ -1349,20 +1333,20 @@ class ProcessDistributedTrainer:
         self._spo_rs_overlap = None
         self._dist_initialized = False
         self._queue_module = queue
+        self._physical_ids = _parse_gpu_ids(cfg.training_gpu_ids)
+        self._world_size = int(cfg.num_training_gpus)
+        self._memory_fraction = float(getattr(cfg, "training_memory_fraction", 0.80))
+        self._memory_percentage = round(100.0 * self._memory_fraction, 1)
+        if self._world_size != len(self._physical_ids):
+            raise ValueError("num_training_gpus does not match training_gpu_ids")
+        if self._world_size < 2:
+            raise ValueError("process-distributed training requires two GPUs")
+
         self._context = mp.get_context("spawn")
         self._result_queue = self._context.Queue()
         self._work_queue = self._context.Queue()
         self._command_queues = {}
         self._processes = {}
-        self._physical_ids = _parse_gpu_ids(cfg.training_gpu_ids)
-        self._world_size = int(cfg.num_training_gpus)
-        self._memory_fraction = float(getattr(cfg, "training_memory_fraction", 0.80))
-        self._memory_percentage = round(100.0 * self._memory_fraction, 1)
-        self._token_budgets = [initial_training_token_budget(self.model, cfg)] * self._world_size
-        if self._world_size != len(self._physical_ids):
-            raise ValueError("num_training_gpus does not match training_gpu_ids")
-        if self._world_size < 2:
-            raise ValueError("process-distributed training requires two GPUs")
 
         from runtime.host_memory import (
             GIB, TokenWeightedActivationOffloadGate,
@@ -1385,65 +1369,119 @@ class ProcessDistributedTrainer:
         self._activation_offload_semaphore.host_admission.hardware_profile = hardware_profile
         self._activation_offload_budget_gib = (self._activation_offload_budget_bytes / GIB)
 
-        # Eight independent Python processes must not each create a full-sized
-        # host thread pool. GPU 0 was loaded before this class is constructed;
-        # the allocator limit still constrains every subsequent allocation.
-        torch.set_num_threads(max(1, int(os.cpu_count() or self._world_size) // self._world_size))
-        torch.cuda.set_device(0)
-        set_total_memory_ceiling(0, self._memory_fraction)
-        validate_model_device(self.model, 0)
-        expected_signature = trainable_parameter_signature(self.model)
         os.environ.setdefault("TORCH_NCCL_ASYNC_ERROR_HANDLING", "1")
-
-        sync_dir = Path(exp_dir).resolve() / ".fast_trainer"
+        sync_dir = self._exp_dir / ".fast_trainer"
         sync_dir.mkdir(parents=True, exist_ok=True)
         rendezvous_path = sync_dir / (f"nccl-{os.getpid()}-{uuid.uuid4().hex}")
         self._init_method = rendezvous_path.as_uri()
-        cfg_dict = dict(vars(cfg))
-        cfg_dict["_terminal_log_path"] = str(Path(exp_dir).resolve() / "temirnal.log")
-        cfg_dict["_setting_log_path"] = str(Path(exp_dir).resolve() / "setting.log")
 
-        setting_log_only(
-            f"[{self._process_label}] starting "
-            f"{self._world_size - 1} persistent "
-            "worker processes; main process is rank 0", flush=True)
-        setting_log_only(
-            f"[{self._process_label}] loading trainer replicas one at a time "
-            "to cap host/GPU initialization peaks", flush=True)
+    def _start_replica(self, rank):
+        from training.fast_distributed import worker_main
+
+        cfg_dict = dict(vars(self.cfg))
+        cfg_dict["_terminal_log_path"] = str(self._exp_dir / "temirnal.log")
+        cfg_dict["_setting_log_path"] = str(self._exp_dir / "setting.log")
+        command_queue = self._context.Queue(maxsize=2)
+        self._command_queues[rank] = command_queue
+        process = self._context.Process(
+            target=worker_main,
+            args=(
+                rank, self._world_size, cfg_dict,
+                self._init_method, self._work_queue, command_queue,
+                self._result_queue, self._dependency_log_path,
+                self._activation_offload_semaphore,
+            ),
+            name=f"ttt-fast-trainer-rank-{rank}",
+        )
+        process.start()
+        self._processes[rank] = process
+
+    @contextmanager
+    def loading_replicas(self):
+        """Start child loads before rank zero loads when host RAM permits."""
+        from runtime.gpu_runtime import _estimated_weight_gib
+        from runtime.host_memory import GIB, HostMemoryUnavailable
+
         try:
-            for rank in range(1, self._world_size):
-                command_queue = self._context.Queue(maxsize=2)
-                process = self._context.Process(
-                    target=worker_main,
-                    args=(
-                        rank, self._world_size, cfg_dict,
-                        self._init_method, self._work_queue, command_queue,
-                        self._result_queue, dependency_log_path,
-                        self._activation_offload_semaphore,
-                    ),
-                    name=f"ttt-fast-trainer-rank-{rank}",
-                )
-                process.start()
-                self._command_queues[rank] = command_queue
-                self._processes[rank] = process
-                message = self._collect_event("loaded", [rank])[rank]
-                if message.get("parameter_signature") != expected_signature:
-                    raise RuntimeError(f'fast trainer rank {rank} has a different trainable parameter layout')
-                print(f"[{self._process_label}] trainer replica {rank + 1}/"
-                      f"{self._world_size} loaded on logical GPU {rank}",
-                      flush=True)
-            for command_queue in self._command_queues.values():
-                command_queue.put({"kind": "init_distributed"})
-            dist.init_process_group(
-                backend="nccl", init_method=self._init_method,
-                rank=0, world_size=self._world_size,
-                timeout=timedelta(minutes=30))
-            self._dist_initialized = True
-            broadcast_trainable_parameters(self.model, source_rank=0)
-            self._collect_event("ready", range(1, self._world_size))
+            with ExitStack() as reservations:
+                if self.host_memory_admission.hardware_profile == "B200_full_ram":
+                    model_gib = _estimated_weight_gib(self.cfg.coder_model_name, "auto")
+                    # Include the loader's per-replica staging allowance and
+                    # rank zero's saved state, which can be restored in parallel.
+                    required = math.ceil((model_gib + 8) * self._world_size * GIB)
+                    state_path = self._exp_dir / "training_state.pt"
+                    if state_path.is_file():
+                        required += state_path.stat().st_size
+                    try:
+                        reserved = reservations.enter_context(
+                            self.host_memory_admission.reservation(
+                                required, stage="concurrent trainer loading",
+                                priority=True, blocking=False))
+                    except HostMemoryUnavailable:
+                        print(f"[{self._process_label}] loading trainers serially; "
+                              f"{required / GIB:.1f} GiB of host RAM required for concurrent startup",
+                              flush=True)
+                    else:
+                        print(f"[{self._process_label}] loading {self._world_size} trainer replicas "
+                              f"concurrently with {reserved / GIB:.1f} GiB of host RAM reserved",
+                              flush=True)
+                        for rank in range(1, self._world_size):
+                            self._start_replica(rank)
+                yield
         except BaseException:
             self._abort_workers()
             raise
+
+    def finish_startup(self, backend, model, tokenizer, optimizer):
+        """Wait for every replica and synchronize rank zero's restored adapter."""
+        from datetime import timedelta
+        import torch.distributed as dist
+        import torch.multiprocessing  # Register tensor reducers for the queues.
+        from training.fast_distributed import (
+            broadcast_trainable_parameters, initial_training_token_budget,
+            set_total_memory_ceiling, trainable_parameter_signature, validate_model_device,
+        )
+
+        if dist.is_initialized():
+            raise RuntimeError(
+                "the process trainer cannot start because torch.distributed is already "
+                "initialized in the main process")
+        self.backend = backend
+        self.model = model
+        self.tokenizer = tokenizer
+        self.optimizer = optimizer
+        self._token_budgets = [initial_training_token_budget(model, self.cfg)] * self._world_size
+
+        torch.set_num_threads(max(1, int(os.cpu_count() or self._world_size) // self._world_size))
+        torch.cuda.set_device(0)
+        set_total_memory_ceiling(0, self._memory_fraction)
+        validate_model_device(model, 0)
+        expected_signature = trainable_parameter_signature(model)
+        ranks = range(1, self._world_size)
+        loaded = self._collect_event("loaded", ranks) if self._processes else {}
+        if not loaded:
+            setting_log_only(
+                f"[{self._process_label}] loading trainer replicas one at a time",
+                flush=True)
+        for rank in ranks:
+            message = loaded.get(rank)
+            if message is None:
+                self._start_replica(rank)
+                message = self._collect_event("loaded", (rank,))[rank]
+            if message.get("parameter_signature") != expected_signature:
+                raise RuntimeError(f'fast trainer rank {rank} has a different trainable parameter layout')
+            print(f"[{self._process_label}] trainer replica {rank + 1}/"
+                  f"{self._world_size} loaded on logical GPU {rank}", flush=True)
+
+        for command_queue in self._command_queues.values():
+            command_queue.put({"kind": "init_distributed"})
+        dist.init_process_group(
+            backend="nccl", init_method=self._init_method,
+            rank=0, world_size=self._world_size,
+            timeout=timedelta(minutes=30))
+        self._dist_initialized = True
+        broadcast_trainable_parameters(model, source_rank=0)
+        self._collect_event("ready", ranks)
 
         fallback_description = (
             "token-weighted CPU activation offload uses a "
@@ -2820,15 +2858,15 @@ class ProcessDistributedTrainer:
             raise
 
     def _abort_workers(self):
-        import torch.distributed as dist
-
         was_initialized = self._dist_initialized
         self._terminate_workers_for_restart()
-        if was_initialized and dist.is_initialized():
-            try:
-                dist.destroy_process_group()
-            except Exception:
-                pass
+        if was_initialized:
+            import torch.distributed as dist
+            if dist.is_initialized():
+                try:
+                    dist.destroy_process_group()
+                except Exception:
+                    pass
         self._dist_initialized = False
 
     def _close_queues(self):

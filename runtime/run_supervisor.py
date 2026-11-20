@@ -51,6 +51,7 @@ def supervise(command, *, initial_delay=2.0, maximum_delay=60.0):
             TTT_SUPERVISOR_RUN_FILE=str(run_file),
             TTT_SUPERVISOR_RESTART_FILE=str(restart_file),
             TTT_SUPERVISOR_EVAL_FILE=str(eval_file),
+            TTT_SUPERVISOR_CONFIG_SNAPSHOT=str(Path(temporary) / "launch.yaml"),
         )
         child = None
         stopping = False

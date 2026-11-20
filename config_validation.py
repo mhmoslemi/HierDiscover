@@ -55,7 +55,7 @@ COMMON_OPTIONAL_KEYS = frozenset({
     "spo_rs_d_half", "spo_rs_rho_min", "spo_rs_rho_max",
     "spo_rs_clip_epsilon", "spo_rs_clip_epsilon_low",
     "spo_rs_clip_epsilon_high",
-    "hybrid_sibling_weight",
+    "hybrid_spo_weight",
     "sequence_clip_epsilon_low", "sequence_clip_epsilon_high",
 })
 
@@ -160,9 +160,9 @@ def _positive_int(data: Mapping, key: str, source) -> None:
         raise ValueError(f"{_label(source)}: {key} must be a positive integer")
 
 
-def validate_hybrid_sibling_weight(value, *, source=None) -> None:
+def validate_hybrid_spo_weight(value, *, source=None) -> None:
     if isinstance(value, bool) or not isinstance(value, Real) or not isfinite(value) or value < 0:
-        raise ValueError(f"{_label(source)}: hybrid_sibling_weight must be a finite nonnegative number")
+        raise ValueError(f"{_label(source)}: hybrid_spo_weight must be a finite nonnegative number")
 
 
 def validate_problem_config(
@@ -293,8 +293,8 @@ def validate_problem_config(
             and data["advantage_mode"] not in ADVANTAGE_MODES):
         raise ValueError(
             f"{_label(source)}: advantage_mode must be one of {ADVANTAGE_MODES}")
-    if "hybrid_sibling_weight" in data:
-        validate_hybrid_sibling_weight(data["hybrid_sibling_weight"], source=source)
+    if "hybrid_spo_weight" in data:
+        validate_hybrid_spo_weight(data["hybrid_spo_weight"], source=source)
     for key in ("sequence_clip_epsilon_low", "sequence_clip_epsilon_high"):
         if key in data and not 0.0 < float(data[key]) < 1.0:
             raise ValueError(f"{_label(source)}: {key} must be in (0, 1)")

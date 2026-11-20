@@ -12,7 +12,7 @@ import yaml
 from config_validation import (
     ADVANTAGE_MODES, COMMON_OPTIONAL_KEYS, COMMON_REQUIRED_KEYS, LEGACY_CODER_CAP_KEY,
     PARENT_SELECTION_MODES, RETIRED_BATCH_GROWTH_KEYS, RETIRED_TRAINER_KEYS, reject_retired_coder_cap,
-    validate_hybrid_sibling_weight, validate_problem_config,
+    validate_hybrid_spo_weight, validate_problem_config,
 )
 from runtime.hardware_profiles import generation_cpu_ids, local_checkpoint, restore_hardware_settings
 
@@ -27,7 +27,7 @@ from training.exact_overflow import (
     _clear_exact_sharded_recovery, _infer_exact_sharded_recovery, _read_exact_sharded_recovery,
     _write_exact_sharded_recovery, supports_warm_overflow,
 )
-from training.hybrid import DEFAULT_SIBLING_WEIGHT
+from training.hybrid import DEFAULT_SPO_WEIGHT
 
 
 SEQUENCE_CLIP_EPSILON_DEFAULT = 0.2
@@ -249,7 +249,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--advantage-mode", type=str.lower,
                    choices=list(ADVANTAGE_MODES), default=None,
                    help="Objective: entropic (adaptive beta), spo-rs (historical "
-                        "baseline), or hybrid (historical and sibling credit with the TTT loss).")
+                        "baseline), or hybrid (TTT credit plus a weighted historical correction).")
     p.add_argument("--sequence-clip-epsilon-low", type=float, default=None,
                    help="Entropic Qwen3-30B-A3B sequence-ratio clipping distance "
                         "below 1 (default 0.2).")
@@ -509,10 +509,17 @@ def load_config():
         if typed.exists():
             cfg_path = str(typed)
     cfg_path = cfg_path or str(config_dir / f"{problem_name}.yaml")
-    if not Path(cfg_path).exists():
+    # TriMul intentionally restarts its trainer after GPU evaluation. Keep the
+    # launch's YAML across those processes so an edit cannot invalidate the
+    # evaluated rollout batch before its policy update.
+    snapshot_name = os.environ.get("TTT_SUPERVISOR_CONFIG_SNAPSHOT")
+    snapshot = Path(snapshot_name) if snapshot_name else None
+    from_snapshot = snapshot is not None and snapshot.is_file()
+    yaml_path = snapshot if from_snapshot else Path(cfg_path)
+    if not yaml_path.is_file():
         raise FileNotFoundError(f"complete problem config not found: {cfg_path}")
-    with open(cfg_path) as f:
-        ydict = yaml.safe_load(f) or {}
+    yaml_source = yaml_path.read_bytes()
+    ydict = yaml.safe_load(yaml_source) or {}
     if not isinstance(ydict, dict) or not ydict:
         raise ValueError(f"problem config must be a non-empty mapping: {cfg_path}")
     reject_retired_coder_cap(ydict, source=cfg_path)
@@ -529,13 +536,17 @@ def load_config():
         source=cfg_path,
         require_complete=(Path(cfg_path).expanduser().resolve().parent == config_dir.resolve()),
     )
+    if snapshot is not None and not from_snapshot:
+        from experiment_io import _atomic_write_bytes
+        _atomic_write_bytes(snapshot, yaml_source)
     merged = dict(ydict)
     # Automatic model profiles provide defaults only. Track every value that
     # came from an operator-controlled source so a profile cannot silently
     # replace it later. Explicit CLI values remain stronger than YAML, and a
     # resumed run's saved configuration remains stronger than a fresh profile.
     profile_explicit_keys = set(ydict)
-    print(f"[config] loaded {cfg_path}")
+    print(f"[config] reusing launch YAML snapshot of {cfg_path}" if from_snapshot
+          else f"[config] loaded {cfg_path}")
 
     # The registry routing key is the YAML's `problem` field when present
     # (this lets e.g. configs/gpu_mode_trimul.yaml declare `problem: gpu_mode`
@@ -591,7 +602,7 @@ def load_config():
         from search.sampler import parent_selection_mode
         merged["parent_selection"] = parent_selection_mode(saved)
         print(f"[config] resuming saved configuration from "
-              f"{resume_dir / 'config.json'}; current YAML rollout counts, "
+              f"{resume_dir / 'config.json'}; launch YAML rollout counts, "
               "evaluation resources, and strategy limits/sampling override saved values")
 
     restore_hardware_settings(merged, ydict, saved)
@@ -687,10 +698,11 @@ def load_config():
     if saved and advantage_mode != saved_mode and "hybrid" in {advantage_mode, saved_mode}:
         raise ValueError("Resume a hybrid run with its saved advantage mode and reward scale")
     if advantage_mode == "hybrid":
-        # A preexisting hybrid run used 0.10 when its config had no weight.
-        sibling_weight = (saved or merged).get("hybrid_sibling_weight", DEFAULT_SIBLING_WEIGHT)
-        validate_hybrid_sibling_weight(sibling_weight, source=saved_config_path if saved else cfg_path)
-        merged["hybrid_sibling_weight"] = float(sibling_weight)
+        if saved and "hybrid_spo_weight" not in saved:
+            raise ValueError("Start a fresh hybrid run to use the new advantage formula")
+        spo_weight = (saved or merged).get("hybrid_spo_weight", DEFAULT_SPO_WEIGHT)
+        validate_hybrid_spo_weight(spo_weight, source=saved_config_path if saved else cfg_path)
+        merged["hybrid_spo_weight"] = float(spo_weight)
         merged["grad_clip"] = 0.0
         if not saved and args.kl_penalty_coef is None:
             merged["kl_penalty_coef"] = 0.1

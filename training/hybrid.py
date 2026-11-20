@@ -1,23 +1,21 @@
-"""Historical and sibling advantages with TTT-Discover's token loss."""
+"""TTT-Discover advantages with an additive historical SPO-RS correction."""
 
 import numpy as np
 
 from training.advantage import entropic_adaptive_advantages
 
 
-DEFAULT_SIBLING_WEIGHT = 0.10
+DEFAULT_SPO_WEIGHT = 1.0
 
 
-def hybrid_advantages(rewards, historical_advantages, *, sibling_weight=DEFAULT_SIBLING_WEIGHT):
-    """Add a centered adaptive-softmax adjustment for one complete parent group."""
+def hybrid_advantages(rewards, historical_advantages, *, spo_weight=DEFAULT_SPO_WEIGHT):
+    """Add weighted historical advantages to the full entropic sibling advantages."""
     rewards = np.asarray(rewards, dtype=np.float64)
     historical_advantages = np.asarray(historical_advantages, dtype=np.float64)
     if rewards.ndim != 1 or rewards.size == 0 or historical_advantages.shape != rewards.shape:
         raise ValueError("hybrid rewards and historical advantages must align in one nonempty group")
-    _, sibling_beta = entropic_adaptive_advantages(rewards)
-    weights = np.exp(sibling_beta * (rewards - rewards.max()))
-    adjustment = sibling_weight * (weights / weights.sum() - 1.0 / rewards.size)
-    return historical_advantages + adjustment, sibling_beta
+    ttt_advantages, sibling_beta = entropic_adaptive_advantages(rewards)
+    return ttt_advantages + spo_weight * historical_advantages, sibling_beta
 
 
 def reference_logprob_mean(scored_responses):

@@ -18,7 +18,7 @@ import re
 import shutil
 import threading
 import time
-from contextlib import nullcontext
+from contextlib import ExitStack, nullcontext
 from runtime import trimul_evaluation
 from runtime.host_memory import HostMemoryUnavailable, HostMemoryTimeout
 from pathlib import Path
@@ -1490,7 +1490,7 @@ def _resume_spo_rs_step_from_artifacts(
             siblings = slice(start, start + group_size)
             recovered_advantages[siblings], _ = hybrid_advantages(
                 rewards[siblings], recovered_advantages[siblings],
-                sibling_weight=cfg.hybrid_sibling_weight)
+                spo_weight=cfg.hybrid_spo_weight)
     spo_info = spo_infos[0]
     saved_value_before = spo_info.get("value_before")
     if (saved_value_before is None
@@ -1783,7 +1783,7 @@ def _resume_spo_rs_step_from_artifacts(
         stats.update(frozen_pass["stats"])
     if hybrid_mode:
         stats["hybrid_reference_kl_mean"] = hybrid_reference_mean
-        stats["hybrid_sibling_weight"] = cfg.hybrid_sibling_weight
+        stats["hybrid_spo_weight"] = cfg.hybrid_spo_weight
     if overflow_state is not None:
         stats.update(parallel_trainer.recover_spo_rs_overflow(recovery_examples, cfg, step_idx, overflow_state))
     elif all_examples:
@@ -2860,7 +2860,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                                     _complete_spo_rs_overlap_examples(
                                         ready_examples, spo_rs_tracker,
                                         sibling_futures=reward_futures[group_id],
-                                        sibling_weight=cfg.hybrid_sibling_weight)
+                                        spo_weight=cfg.hybrid_spo_weight)
                                     parallel_trainer.queue_spo_rs_overlap(ready_examples)
                                 if not ready_groups:
                                     wait([f for g in examples_by_group for f in reward_futures[g] if not f.done()],
@@ -3150,7 +3150,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
             adv_scale_label = "beta"
             if hybrid_mode:
                 advantages, sibling_beta = hybrid_advantages(
-                    rewards_np, advantages, sibling_weight=cfg.hybrid_sibling_weight)
+                    rewards_np, advantages, spo_weight=cfg.hybrid_spo_weight)
         else:
             advantages, adv_scale = compute_group_advantages(rewards_np)
             adv_scale_label = "beta"
@@ -3248,7 +3248,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                 meta["spo_rs"] = spo_rs_rollout_info[r_idx]
             if hybrid_mode:
                 meta["hybrid_sibling_beta"] = float(sibling_beta)
-                meta["hybrid_sibling_adjustment"] = float(advantages[r_idx]) - prepared[r_idx]["advantage"]
+                meta["hybrid_spo_adjustment"] = cfg.hybrid_spo_weight * prepared[r_idx]["advantage"]
             save_rollout(exp_dir, step_idx, g, artifact_rollout_index,
                          text, meta,
                          prompt_text=job["prompt_text"],
@@ -3525,7 +3525,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
         step_stats["spo_rs_policy_updated"] = False
     if hybrid_mode:
         step_stats["hybrid_reference_kl_mean"] = hybrid_reference_mean
-        step_stats["hybrid_sibling_weight"] = cfg.hybrid_sibling_weight
+        step_stats["hybrid_spo_weight"] = cfg.hybrid_spo_weight
 
     if frozen_pass is not None:
         step_stats.update(frozen_pass["stats"])
@@ -3574,6 +3574,11 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
 # Main
 # ======================================================================
 def main():
+    with ExitStack() as trainer_startup:
+        return _main(trainer_startup)
+
+
+def _main(trainer_startup):
     _install_console_timestamps()
     terminal_log = _install_terminal_log()
     from builtins import print as console_print
@@ -3600,7 +3605,9 @@ def main():
                                    restart_changed_rollout_step,
                                    save_final_summary, save_step_summary)
         resume_dir = merged.pop("_resume_dir", None)
+        restart_step = 0
         if resume_dir:
+            bind_setting_log(Path(resume_dir) / "setting.log")
             # Read only the cursor via memory-mapped CPU storage before model
             # loading, so stale overflow recovery cannot consume a new batch.
             checkpoint = _load_training_checkpoint(resume_dir, mmap=True)
@@ -3626,7 +3633,8 @@ def main():
         setting_log_path = Path(exp_dir).resolve() / "setting.log"
         startup_log.title = ("Two-Solver Discovery" if cfg.frozen_solver else "Single-Model Discovery")
         startup_log.bind(setting_log_path)
-        bind_setting_log(setting_log_path)
+        if not resume_dir:
+            bind_setting_log(setting_log_path)
     # Keep the full resolved settings in the file; show their grouped dashboard
     # once below. Restore normal print before loading/training begins.
     print = startup_log.print
@@ -3764,7 +3772,7 @@ def main():
         print(f"SPO-RS D_half:      {cfg.spo_rs_d_half}")
         print(f"SPO-RS rho min/max: {cfg.spo_rs_rho_min} / {cfg.spo_rs_rho_max}")
         if hybrid_mode:
-            print(f"Hybrid sibling weight: {cfg.hybrid_sibling_weight:g}")
+            print(f"Hybrid SPO-RS weight: {cfg.hybrid_spo_weight:g}")
             print("Policy loss:        TTT token-summed importance sampling")
         else:
             print(f"SPO-RS clip eps low/high: "
@@ -3824,9 +3832,15 @@ def main():
     print(f"[init] problem produced {len(seeds)} seed state(s)")
     setting_log_only("Settings: setting.log   |   Terminal: temirnal.log   |   Results: result.txt")
     print = console_print
-    print_dashboard(startup_log.fields, exp_dir, resuming=bool(resume_dir))
+    if restart_step == 0:
+        print_dashboard(startup_log.fields, exp_dir, resuming=bool(resume_dir))
 
     # ---- backend + model ----
+    parallel_trainer = None
+    if not cfg.no_train:
+        parallel_trainer = ProcessDistributedTrainer(
+            cfg, exp_dir, dependency_log_path=dependency_log_path)
+        trainer_startup.enter_context(parallel_trainer.loading_replicas())
     # Load backend FIRST so Unsloth can patch transformers if used.
     with startup_log.capture(loading=True), _route_dependency_notices(dependency_log_path):
         from models.model_backend import load_backend
@@ -4089,12 +4103,9 @@ def main():
               "adapter snapshot(s) while restoring the rolling checkpoint",
               flush=True)
 
-    parallel_trainer = None
-    if not cfg.no_train:
-        parallel_trainer = ProcessDistributedTrainer(
-            backend, model, tokenizer, optimizer, cfg, exp_dir,
-            dependency_log_path=dependency_log_path,
-        )
+    if parallel_trainer is not None:
+        parallel_trainer.finish_startup(backend, model, tokenizer, optimizer)
+    trainer_startup.close()
 
     # ---- generation pool ----
     gen_pool = None
