@@ -41,7 +41,8 @@ def reference_logprob_mean(scored_responses):
     return float(total / num_tokens) if num_tokens else 0.0
 
 
-def importance_sampling_loss(current, example, kl_coef, *, return_tensor_metrics=False):
+def importance_sampling_loss(current, example, kl_coef, *, return_tensor_metrics=False,
+                             check_finite=True):
     """Apply the frozen, reference-adjusted advantage with Tinker's token sum."""
     import torch
 
@@ -64,7 +65,7 @@ def importance_sampling_loss(current, example, kl_coef, *, return_tensor_metrics
 
     ratio = (current - old).exp()
     loss = -(ratio * effective_advantage).sum()
-    if not torch.isfinite(loss):
+    if check_finite and not torch.isfinite(loss):
         raise FloatingPointError("nonfinite hybrid importance-sampling loss")
     with torch.no_grad():
         metrics = {

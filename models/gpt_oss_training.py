@@ -9,6 +9,25 @@ import torch
 from diagnostics.console import setting_log_only
 
 
+def preserve_mxfp4_allocation_errors():
+    """Keep older Unsloth releases from disabling fused decode on a full GPU."""
+    dequant = importlib.import_module("unsloth_zoo.mxfp4_dequant")
+    kernel_fail = getattr(dequant, "_kernel_fail", None)
+    if not callable(kernel_fail) or getattr(kernel_fail, "_ttt_preserves_oom", False):
+        return
+
+    @functools.wraps(kernel_fail)
+    def fail(error):
+        # An allocation error goes to the batch scheduler. The vendor's
+        # handler is for kernel failures and latches the fallback.
+        if isinstance(error, torch.cuda.OutOfMemoryError):
+            raise error
+        kernel_fail(error)
+
+    fail._ttt_preserves_oom = True
+    dequant._kernel_fail = fail
+
+
 def release_checkpoint_workspaces():
     """Release idle Unsloth scratch storage after backward, before generation.
 

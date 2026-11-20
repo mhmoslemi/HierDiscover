@@ -15,16 +15,37 @@ ATTENTION_AND_HEAD_TARGETS = r"(?:.*\.(?:q_proj|k_proj|v_proj|o_proj)|lm_head)"
 PARAMETERS_PER_RANK = 41_074_624
 
 
-class _AlignedGroupedMMGradient(torch.autograd.Function):
+def _gate_up_views(tensor, interleaved):
+    if interleaved:
+        return tensor[..., ::2], tensor[..., 1::2]
+    return tensor.chunk(2, dim=-1)
+
+
+class _AddGateUpDelta(torch.autograd.Function):
+    """Add the two expert deltas without materializing the combined delta."""
+
     @staticmethod
-    def forward(ctx, output):
-        return output
+    def forward(ctx, base, gate, up, scale, interleaved):
+        ctx.scale = scale
+        ctx.interleaved = interleaved
+        result = torch.empty_like(base)
+        base_gate, base_up = _gate_up_views(base, interleaved)
+        result_gate, result_up = _gate_up_views(result, interleaved)
+        torch.add(base_gate, gate, alpha=scale, out=result_gate)
+        torch.add(base_up, up, alpha=scale, out=result_up)
+        return result
 
     @staticmethod
     def backward(ctx, grad_output):
-        # Stack backward returns strided gate/up views. The up view starts
-        # one element into the buffer, which native grouped GEMM rejects.
-        return grad_output.clone(memory_format=torch.contiguous_format)
+        gate, up = _gate_up_views(grad_output, ctx.interleaved)
+        # Native grouped GEMM needs aligned gradients. In the interleaved
+        # layout the up view starts one element into grad_output.
+        gate = gate.contiguous()
+        up = up.contiguous()
+        if ctx.scale != 1.0:
+            gate = gate * ctx.scale
+            up = up * ctx.scale
+        return grad_output, gate, up, None, None
 
 
 class SharedExpertLoRA(nn.Module):
@@ -68,17 +89,8 @@ class SharedExpertLoRA(nn.Module):
             gate_up_a = torch.cat((self.gate_a[0], self.up_a[0])).to(inputs.dtype)
             gate, up = F.linear(inputs, gate_up_a).chunk(2, dim=-1)
         gate = grouped_mm(gate, self.gate_b.to(inputs.dtype).transpose(-1, -2), offsets)
-        if interleaved:
-            gate = _AlignedGroupedMMGradient.apply(gate)
         up = grouped_mm(up, self.up_b.to(inputs.dtype).transpose(-1, -2), offsets)
-        if interleaved:
-            up = _AlignedGroupedMMGradient.apply(up)
-            delta = torch.stack((gate, up), dim=-1).flatten(-2)
-        else:
-            delta = torch.cat((gate, up), dim=-1)
-        # Adding in the original layout sends the gradient straight to the
-        # base projection instead of scattering two slices back into it.
-        return torch.add(base, delta, alpha=self.scale)
+        return _AddGateUpDelta.apply(base, gate, up, self.scale, interleaved)
 
     def export_tensors(self):
         return {

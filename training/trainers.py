@@ -516,7 +516,7 @@ def _run_oom_resilient_backward(
         headroom_preallocated=False,
         start_activation_offload=False,
         activation_offload_semaphore=None, defer_exact_oom=False,
-        allow_activation_offload=True):
+        allow_activation_offload=True, split_failed_batches=True):
     """Retry with checkpointing, smaller batches, and memory fallbacks.
 
     Each attempt starts the local replica's gradients from zero, so an OOM
@@ -536,6 +536,7 @@ def _run_oom_resilient_backward(
     lane without discarding gradients already completed on other replicas.
     """
     import gc
+    import traceback
     import torch
     from runtime.host_memory import (ProcessRSSPeakSampler,
                              host_cache_reclaim_supported,
@@ -574,7 +575,7 @@ def _run_oom_resilient_backward(
 
     cached_work_cap = profile.get("safe_work_cap")
     reused_split = False
-    if cached_work_cap is not None:
+    if split_failed_batches and cached_work_cap is not None:
         active, reused_split = _split_training_batches_to_work_cap(active, cached_work_cap)
 
     strict_exact_training = bool(getattr(model, "_ttt_strict_exact_long_training", False))
@@ -684,12 +685,13 @@ def _run_oom_resilient_backward(
                     with rss_sampler as sampled_rss:
                         with offload_context:
                             result = attempt(active)
-                except BaseException:
+                except BaseException as error:
                     # Clean the failed graph before releasing the shared
                     # admission slot. Otherwise another rank can begin a CPU
                     # offload while this exception still retains saved
                     # tensors, recreating the node-wide host-RAM spike.
                     if activation_offload:
+                        traceback.clear_frames(error.__traceback__)
                         model.zero_grad(set_to_none=True)
                         gc.collect()
                         for cuda_device in cuda_devices:
@@ -732,6 +734,7 @@ def _run_oom_resilient_backward(
             if not cuda_oom and not kernel_unavailable:
                 set_gradient_checkpointing(model, False)
                 raise
+            traceback.clear_frames(error.__traceback__)
             model.zero_grad(set_to_none=True)
             gc.collect()
             for cuda_device in cuda_devices:
@@ -754,6 +757,11 @@ def _run_oom_resilient_backward(
                     )
                     continue
                 checkpointing_available = False
+            if not split_failed_batches and any(len(batch) > 1 for batch in active):
+                # The caller commits the children separately. Retrying a
+                # split list here could discard earlier successful backward.
+                set_gradient_checkpointing(model, False)
+                raise
             smaller, changed = _split_training_batches(active)
             if changed:
                 active = smaller
@@ -1024,14 +1032,14 @@ def clipped_policy_loss(cfg, current_logprobs, old_logprobs,
 
 
 def historical_policy_loss(cfg, current_logprobs, example, clip_options, *,
-                           return_tensor_metrics=False):
+                           return_tensor_metrics=False, check_finite=True):
     """Use one objective across the replicas and both overflow paths."""
     if cfg.advantage_mode == "hybrid":
         from training.hybrid import importance_sampling_loss
 
         return importance_sampling_loss(
             current_logprobs, example, cfg.kl_penalty_coef,
-            return_tensor_metrics=return_tensor_metrics)
+            return_tensor_metrics=return_tensor_metrics, check_finite=check_finite)
 
     epsilon, low, high, kl = clip_options
     return clipped_policy_loss(
@@ -1317,7 +1325,8 @@ class ProcessDistributedTrainer:
         import torch.distributed as dist
         import torch.multiprocessing as mp
         from training.fast_distributed import (
-            broadcast_trainable_parameters, set_total_memory_ceiling,
+            broadcast_trainable_parameters, initial_training_token_budget,
+            set_total_memory_ceiling,
             trainable_parameter_signature, validate_model_device, worker_main,
         )
 
@@ -1349,7 +1358,7 @@ class ProcessDistributedTrainer:
         self._world_size = int(cfg.num_training_gpus)
         self._memory_fraction = float(getattr(cfg, "training_memory_fraction", 0.80))
         self._memory_percentage = round(100.0 * self._memory_fraction, 1)
-        self._token_budgets = [max(1, int(cfg.max_seq_length)) for _ in range(self._world_size)]
+        self._token_budgets = [initial_training_token_budget(self.model, cfg)] * self._world_size
         if self._world_size != len(self._physical_ids):
             raise ValueError("num_training_gpus does not match training_gpu_ids")
         if self._world_size < 2:
@@ -1683,10 +1692,10 @@ class ProcessDistributedTrainer:
 
     def train_spo_rs(self, examples, cfg, step_idx):
         import torch
-        from training.fast_distributed import (broadcast_trainable_parameters,
-                                      local_spo_rs_update,
-                                      reduce_trainable_gradients,
-                                      spo_rs_initial_memory_fraction)
+        from training.fast_distributed import (
+            broadcast_trainable_parameters, historical_training_memory_fraction,
+            local_spo_rs_update, reduce_trainable_gradients,
+        )
 
         if self._offloaded:
             print(f'[train-fast] restoring {self._world_size} process trainers for the update', flush=True)
@@ -1702,21 +1711,24 @@ class ProcessDistributedTrainer:
               "vLLM supplied old="
               f"{supplied_old}/{len(examples)}, reference={reference_label}",
               flush=True)
-        update_memory_fraction = spo_rs_initial_memory_fraction(
-            self.model, self._memory_fraction)
+        update_memory_fraction = historical_training_memory_fraction(
+            self.model, cfg, self._memory_fraction)
         high_memory_update = update_memory_fraction > self._memory_fraction
         rescue = "98%->99%" if high_memory_update else "96%->98%->99%"
-        # Leave work in the shared queue for the other rank even on short rollouts.
+        packed_expert_training = getattr(self.model, "_ttt_gpt_oss_shared_lora", False)
+        # Leave multiple work claims when short rollouts fit in big batches,
+        # allowing work stealing to balance the update.
         max_examples_per_batch = (
-            math.ceil(len(queued_examples) / self._world_size)
-            if high_memory_update else 64)
+            max(1, math.ceil(len(queued_examples) / (2 * self._world_size)))
+            if packed_expert_training else 64)
         print(f"[train-fast] one process/GPU; memory ceiling="
               f"{100.0 * update_memory_fraction:g}%; "
               f"exact singleton rescue={rescue}; "
               f"initial padded-token budgets/GPU={self._token_budgets}",
               flush=True)
 
-        defer_exact_oom = _uses_reward_history(getattr(cfg, "advantage_mode", ""))
+        # Packed GPT-OSS retries complete microbatches on the live replicas.
+        defer_exact_oom = not packed_expert_training and _uses_reward_history(cfg.advantage_mode)
         self._workers_idle = False
         for rank in range(1, self._world_size):
             self._command_queues[rank].put({

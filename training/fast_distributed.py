@@ -284,10 +284,82 @@ def _move_examples(examples, logical_id):
     return moved
 
 
-def spo_rs_initial_memory_fraction(model, configured_fraction):
-    if getattr(model, "_ttt_gpu_resident_checkpoints", False):
+def historical_training_memory_fraction(model, cfg, configured_fraction):
+    if (getattr(model, "_ttt_gpt_oss_shared_lora", False)
+            and getattr(cfg, "hardware_profile", None) in {"B200", "B200_full_ram"}):
         return LONG_ROLLOUT_MEMORY_FRACTION
     return float(configured_fraction)
+
+
+def initial_training_token_budget(model, cfg):
+    context = int(cfg.max_seq_length)
+    if getattr(model, "_ttt_gpt_oss_shared_lora", False):
+        # Start with one long-context workload. Batch size grows from actual
+        # backward peaks, including after a fresh TriMul trainer launch.
+        return min(context, int(cfg.long_training_headroom_min_tokens))
+    return context
+
+
+class _PackedExpertBatchMemory:
+    """Fit padded GPT-OSS work with space for fused decode and FP32 gradients."""
+
+    def __init__(self, model, parameters, logprob_chunk):
+        config = model.config
+        hidden = int(config.hidden_size)
+        intermediate = int(config.intermediate_size)
+        experts = int(config.num_local_experts)
+        routed = int(config.num_experts_per_tok)
+        bf16_bytes = 2
+        # Gate/up is the largest decoded BF16 stack. Leave room for a
+        # second copy during grouped GEMM or transposed backward decode.
+        self.decode_bytes = experts * hidden * (2 * intermediate) * bf16_bytes
+        self.gradient_bytes = sum(p.numel() * p.element_size() for p in parameters)
+        # One BF16 logits tile and two FP32 buffers for log-softmax.
+        head_bytes = max(1, int(logprob_chunk or 256)) * int(config.vocab_size) * 10
+        self.fixed_bytes = 2 * self.decode_bytes + self.gradient_bytes + head_bytes
+        self.minimum_bytes_per_token = bf16_bytes * routed * (hidden + 2 * intermediate)
+        layers = int(config.num_hidden_layers)
+        # Eager backward retains router, expert and attention activations
+        # across all layers, even when no single layer is especially large.
+        self.eager_bytes_per_token = bf16_bytes * layers * (
+            routed * (3 * hidden + 5 * intermediate) + 12 * hidden
+        )
+        # Before a measurement, budget the routed input/output and intermediate
+        # gradients, plus hidden states at layer checkpoint boundaries.
+        self.bytes_per_token = bf16_bytes * (
+            routed * (8 * hidden + 12 * intermediate)
+            + hidden * (layers + 8)
+        )
+        self.failed_work_limit = math.inf
+
+    def available_work(self, room_bytes):
+        return max(1, int((room_bytes - self.fixed_bytes) // self.bytes_per_token))
+
+    def limit(self, budget, room_bytes):
+        return min(budget, self.available_work(room_bytes), self.failed_work_limit)
+
+    def needs_checkpointing(self, work, room_bytes):
+        return work * self.eager_bytes_per_token > room_bytes - self.fixed_bytes
+
+    def observe(self, work, used_bytes):
+        # Incoming grads and one decode stack are already covered by the fixed
+        # reserve. Learn their remaining cost from the whole forward/backward.
+        variable = max(0, used_bytes - self.gradient_bytes - self.decode_bytes)
+        self.bytes_per_token = max(
+            self.minimum_bytes_per_token,
+            self.bytes_per_token * 0.85,
+            variable * 1.15 / work,
+        )
+
+    def backoff(self, failed_work):
+        self.failed_work_limit = min(self.failed_work_limit, failed_work * 7 // 8)
+
+
+def _rank_memory(cuda):
+    allocated = int(cuda.memory_allocated())
+    reserved = int(cuda.memory_reserved())
+    free, total = cuda.mem_get_info()
+    return allocated, reserved, int(free), int(total)
 
 
 def local_spo_rs_update(backend, model, tokenizer, examples, cfg, logical_id,
@@ -308,7 +380,7 @@ def local_spo_rs_update(backend, model, tokenizer, examples, cfg, logical_id,
             "fast trainer memory_fraction must be in (0, 0.90]")
 
     backend.set_training_mode()
-    initial_fraction = spo_rs_initial_memory_fraction(model, memory_fraction)
+    initial_fraction = historical_training_memory_fraction(model, cfg, memory_fraction)
     headroom_preallocated = initial_fraction > float(memory_fraction)
     if headroom_preallocated:
         allocator_fraction = set_long_rollout_memory_ceiling(
@@ -319,6 +391,10 @@ def local_spo_rs_update(backend, model, tokenizer, examples, cfg, logical_id,
     hybrid = cfg.advantage_mode == "hybrid"
     clip_options = None if hybrid else training._clipped_policy_options(cfg)
     parameters = trainable_parameters(model)
+    packed_memory = (
+        _PackedExpertBatchMemory(model, parameters, cfg.logprob_chunk)
+        if getattr(model, "_ttt_gpt_oss_shared_lora", False) else None
+    )
     gradient_accumulators = [None for _ in parameters]
     metric_keys = (
         "loss", "policy_loss", "kl_estimate",
@@ -333,6 +409,8 @@ def local_spo_rs_update(backend, model, tokenizer, examples, cfg, logical_id,
     trained_examples = 0
     peak_memory_fraction = 0.0
     budget = max(1, int(token_budget or cfg.max_seq_length))
+    packing_budget = budget
+    pending_batches = []
     emergency_allocator_fraction = None
     emergency_allocator_stage = int(headroom_preallocated)
 
@@ -410,7 +488,7 @@ def local_spo_rs_update(backend, model, tokenizer, examples, cfg, logical_id,
                 next_maximum = max(maximum, candidate_length)
                 next_padded_tokens = next_maximum * (len(batch) + 1)
                 pack_limit = fused_pack_limit()
-                if (next_padded_tokens > budget
+                if (next_padded_tokens > packing_budget
                         or (pack_limit is not None
                             and next_padded_tokens >= pack_limit)):
                     break
@@ -432,7 +510,7 @@ def local_spo_rs_update(backend, model, tokenizer, examples, cfg, logical_id,
             nonlocal queue_finished, deferred, prefix_remainder
             if prefix_remainder:
                 batch, prefix_remainder = _take_shared_prefix_chunk(
-                    prefix_remainder, budget, max_examples_per_batch,
+                    prefix_remainder, packing_budget, max_examples_per_batch,
                     singleton_predicate=needs_fused_long_singleton,
                     packed_token_limit=fused_pack_limit())
                 return batch
@@ -448,7 +526,7 @@ def local_spo_rs_update(backend, model, tokenizer, examples, cfg, logical_id,
             if (isinstance(first, dict)
                     and SHARED_PREFIX_WORK_KEY in first):
                 batch, prefix_remainder = _take_shared_prefix_chunk(
-                    first[SHARED_PREFIX_WORK_KEY], budget,
+                    first[SHARED_PREFIX_WORK_KEY], packing_budget,
                     max_examples_per_batch,
                     singleton_predicate=needs_fused_long_singleton,
                     packed_token_limit=fused_pack_limit())
@@ -474,7 +552,7 @@ def local_spo_rs_update(backend, model, tokenizer, examples, cfg, logical_id,
                 next_maximum = max(maximum, candidate_length)
                 next_padded_tokens = next_maximum * (len(batch) + 1)
                 pack_limit = fused_pack_limit()
-                if (next_padded_tokens > budget
+                if (next_padded_tokens > packing_budget
                         or (pack_limit is not None
                             and next_padded_tokens >= pack_limit)):
                     deferred = candidate
@@ -485,7 +563,23 @@ def local_spo_rs_update(backend, model, tokenizer, examples, cfg, logical_id,
 
     model.zero_grad(set_to_none=True)
     while True:
-        cpu_batch = take_batch()
+        measurement = None
+        if packed_memory is not None:
+            with torch.cuda.device(logical_id):
+                measurement = _rank_memory(torch.cuda)
+            allocated, reserved, free, total = measurement
+            room = min(int(allocator_fraction * total), free + reserved) - allocated
+            packing_budget = packed_memory.limit(budget, room)
+        else:
+            packing_budget = budget
+
+        claimed = pending_batches.pop() if pending_batches else take_batch()
+        if packed_memory is not None and len(claimed) > 1:
+            fit = max(1, packing_budget // max(map(example_length, claimed)))
+            if fit < len(claimed):
+                pending_batches.append(claimed[fit:])
+                claimed = claimed[:fit]
+        cpu_batch = claimed
         if not cpu_batch:
             break
         forced_overflow_min_tokens = int(getattr(cfg, '_exact_replica_overflow_min_tokens', 0) or 0)
@@ -498,13 +592,21 @@ def local_spo_rs_update(backend, model, tokenizer, examples, cfg, logical_id,
                     record_deferred(example)
                 else:
                     retained.append(example)
-            cpu_batch = retained
+            claimed = cpu_batch = retained
             if not cpu_batch:
                 continue
         requested_padded_tokens = _padded_token_count(cpu_batch)
         fused_long_singleton = bool(
             len(cpu_batch) == 1
             and needs_fused_long_singleton(cpu_batch[0]))
+        packed_checkpointing = packed_memory is not None and (
+            requested_padded_tokens >= cfg.long_training_checkpoint_min_tokens
+            or packed_memory.needs_checkpointing(requested_padded_tokens, room)
+        )
+        packed_needs_headroom = (
+            packed_memory is not None and len(cpu_batch) == 1
+            and requested_padded_tokens > packed_memory.available_work(room)
+        )
         cpu_batch = [dict(example) for example in cpu_batch]
         missing_behavior = training._initialize_behavior_logprobs(cpu_batch)
         if hybrid and missing_behavior:
@@ -513,9 +615,8 @@ def local_spo_rs_update(backend, model, tokenizer, examples, cfg, logical_id,
             example.pop("behavior_logprobs", None)
 
         with torch.cuda.device(logical_id):
-            base_allocated = int(torch.cuda.memory_allocated())
-            base_reserved = int(torch.cuda.memory_reserved())
-            free_bytes, total_bytes = torch.cuda.mem_get_info()
+            base_allocated, base_reserved, free_bytes, total_bytes = (
+                measurement if measurement is not None else _rank_memory(torch.cuda))
             external_bytes = max(
                 0, int(total_bytes) - int(free_bytes) - base_reserved)
             torch.cuda.reset_peak_memory_stats()
@@ -550,7 +651,7 @@ def local_spo_rs_update(backend, model, tokenizer, examples, cfg, logical_id,
                                 batch, current_logprobs):
                             loss, metrics = training.historical_policy_loss(
                                 cfg, current_lp, example, clip_options,
-                                return_tensor_metrics=True)
+                                return_tensor_metrics=True, check_finite=False)
                             weight = float(example["sample_weight"])
                             loss_weight = 1.0 if hybrid else weight
                             weighted_losses.append(loss_weight * loss)
@@ -567,6 +668,9 @@ def local_spo_rs_update(backend, model, tokenizer, examples, cfg, logical_id,
                             attempt_prefix_ratio_values.append(
                                 metrics["prefix_ratio_max"])
                         if weighted_losses:
+                            if hybrid and not torch.isfinite(
+                                    torch.stack([loss.detach() for loss in weighted_losses])).all():
+                                raise FloatingPointError("nonfinite hybrid importance-sampling loss")
                             sum(weighted_losses[1:],
                                 weighted_losses[0]).backward()
 
@@ -588,13 +692,16 @@ def local_spo_rs_update(backend, model, tokenizer, examples, cfg, logical_id,
                     value.to(dtype=torch.float64) for value in reduced
                 ]).detach()
 
-            result, effective_batches, unprocessed = (
-                training._run_oom_resilient_backward(
+            try:
+                result, effective_batches, unprocessed = training._run_oom_resilient_backward(
                     model, [local_batch], attempt,
                     device_label=f"cuda:{logical_id}",
                     expand_memory=expand_for_long_rollout,
-                    start_checkpointed=fused_long_singleton,
-                    start_with_headroom=(fused_long_singleton and not headroom_preallocated),
+                    start_checkpointed=fused_long_singleton or packed_checkpointing,
+                    start_with_headroom=(
+                        (fused_long_singleton and not headroom_preallocated)
+                        or packed_needs_headroom
+                    ),
                     headroom_preallocated=headroom_preallocated,
                     # Selectively resumed trajectories already exhausted the
                     # complete GPU-only ladder in an earlier process. Enter
@@ -612,7 +719,24 @@ def local_spo_rs_update(backend, model, tokenizer, examples, cfg, logical_id,
                     # Other objectives/backends keep their existing policy.
                     allow_activation_offload=not (
                         defer_exact_oom and supports_warm_overflow(cfg)),
-                    defer_exact_oom=bool(defer_exact_oom)))
+                    defer_exact_oom=bool(defer_exact_oom),
+                    split_failed_batches=(packed_memory is None),
+                )
+            except RuntimeError as error:
+                if (packed_memory is None or len(claimed) == 1
+                        or not (training._is_cuda_oom(error)
+                                or training._is_attention_kernel_unavailable(error))):
+                    raise
+                # Split only the failed work. Each successful child batch
+                # commits independently to this rank's gradient accumulation.
+                packed_memory.backoff(requested_padded_tokens)
+                midpoint = (len(claimed) + 1) // 2
+                pending_batches.extend((claimed[midpoint:], claimed[:midpoint]))
+                print(f"[train-oom] cuda:{logical_id}: split failed "
+                      f"{requested_padded_tokens:,}-token batch into "
+                      f"{midpoint}+{len(claimed) - midpoint} examples", flush=True)
+                del local_batch
+                continue
             peak_allocated = int(torch.cuda.max_memory_allocated())
             peak_reserved = int(torch.cuda.max_memory_reserved())
             used_at_peak = min(
@@ -665,7 +789,17 @@ def local_spo_rs_update(backend, model, tokenizer, examples, cfg, logical_id,
                  for batch in effective_batches for example in batch),
                 default=1)
             backed_off = bool(len(effective_batches) > 1 or unprocessed)
-            if not effective_batches:
+            if packed_memory is not None:
+                if effective_batches and not backed_off:
+                    if packed_checkpointing:
+                        packed_memory.observe(
+                            successful_padded_tokens, peak_allocated - base_allocated)
+                    # A batch can leave unused capacity simply because the
+                    # next complete rollout would not fit. Allow growth even
+                    # if the current batch did not fill its entire token cap.
+                    budget = min(int(cfg.max_seq_length), math.ceil(budget * 1.25))
+                budget = min(budget, packed_memory.failed_work_limit)
+            elif not effective_batches:
                 budget = max(1, budget // 2)
             elif backed_off:
                 budget = max(
