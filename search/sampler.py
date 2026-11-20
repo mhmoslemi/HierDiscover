@@ -50,20 +50,8 @@ def parent_selection_mode(config):
     return mode.lower()
 
 
-def can_migrate_parent_selection(source, target):
-    return source == "puct" and target == "puct-jev"
-
-
-def make_sampler(*, parent_selection="puct", group_size=1, seed=0,
-                 exp_dir=None, problem=None, jev_model_path=None,
-                 jev_candidate_multiplier=3, jev_same_core_threshold=0.68, **kwargs):
+def make_sampler(*, parent_selection="puct", **kwargs):
     mode = parent_selection_mode({"parent_selection": parent_selection})
-    if mode == "puct-jev":
-        from search.jev_sampler import PUCTJevSampler
-        return PUCTJevSampler(exp_dir=exp_dir, problem=problem,
-                              model_path=jev_model_path,
-                              candidate_multiplier=jev_candidate_multiplier,
-                              same_core_threshold=jev_same_core_threshold, **kwargs)
     return PUCTSampler(use_uct=(mode == "uct"), **kwargs)
 
 
@@ -235,7 +223,7 @@ class PUCTSampler:
     # Public API
     # ------------------------------------------------------------------
     def _ranked_states(self):
-        """The unchanged PUCT/UCT scores, shared with semantic selection."""
+        """Compute PUCT or UCT scores for the current archive."""
         values = np.array([s.value if s.value is not None else -np.inf
                            for s in self._states])
         scale = self._scale()
@@ -274,7 +262,7 @@ class PUCTSampler:
             "is_seed": entry[2].id in self._seed_ids,
         }
 
-    def sample_states(self, num_states: int, *, selection_step=None, selection_root=None):
+    def sample_states(self, num_states: int):
         """Pick `num_states` parent states for the next batch."""
         if not self._states:
             return []
@@ -310,39 +298,9 @@ class PUCTSampler:
         self.last_picks_info = info
         return picks
 
-    def update(self, children_with_parents, *, strategy_keys=None,
-               strategy_top_r: int = 0):
-        """
-        Push new children into the archive and update PUCT stats.
-        children_with_parents: list of (child_state, parent_state).
-        Only children with valid (non-None) values should be passed.
-
-        When strategy_keys is supplied, it must align one-for-one with
-        children_with_parents. After exact-code deduplication,
-        at most strategy_top_r new children are admitted from each
-        (parent, strategy) pair. The ordinary top-K-per-parent and global
-        archive cap are then applied unchanged.
-
-        The whole body is guarded so checkpoint reads cannot observe a
-        partially rebuilt archive.
-        """
+    def update(self, children_with_parents):
+        """Push valid children into the archive and update search statistics."""
         children_with_parents = list(children_with_parents)
-        strategy_top_r = int(strategy_top_r or 0)
-        if strategy_top_r < 0:
-            raise ValueError("strategy_top_r must be nonnegative")
-        if strategy_keys is None:
-            strategy_keys = [None] * len(children_with_parents)
-        else:
-            strategy_keys = list(strategy_keys)
-            if len(strategy_keys) != len(children_with_parents):
-                raise ValueError(
-                    "strategy_keys must align with children_with_parents")
-            if strategy_top_r > 0 and any(
-                    key is None for key in strategy_keys):
-                raise ValueError(
-                    "strategy_keys cannot contain None when strategy_top_r "
-                    "is enabled")
-
         with self._lock:
             for child, parent in children_with_parents:
                 child.previous_raw_score = parent.raw_score
@@ -366,9 +324,8 @@ class PUCTSampler:
             # Equal code is a duplicate even when its stochastic output differs.
             existing_keys = {self._archive_key(s) for s in self._states}
             existing_keys.discard(None)
-            new_entries = []
-            for (child, parent), strategy_key in zip(
-                    children_with_parents, strategy_keys):
+            new_states = []
+            for child, parent in children_with_parents:
                 if child.value is None:
                     continue
                 key = self._archive_key(child)
@@ -378,30 +335,10 @@ class PUCTSampler:
                     [{"id": parent.id, "timestep": parent.timestep}]
                     + (parent.parents or [])
                 )
-                new_entries.append((child, parent, strategy_key))
+                new_states.append(child)
                 if key is not None:
                     existing_keys.add(key)
 
-            unique_new = len(new_entries)
-            if strategy_top_r > 0:
-                by_parent_strategy = {}
-                for child, parent, strategy_key in new_entries:
-                    key = (parent.id, strategy_key)
-                    by_parent_strategy.setdefault(key, []).append(
-                        (child, parent, strategy_key))
-                admitted_entries = []
-                for candidates in by_parent_strategy.values():
-                    candidates.sort(
-                        key=lambda entry: (
-                            entry[0].value
-                            if entry[0].value is not None else -np.inf),
-                        reverse=True,
-                    )
-                    admitted_entries.extend(candidates[:strategy_top_r])
-            else:
-                admitted_entries = new_entries
-
-            new_states = [entry[0] for entry in admitted_entries]
             self._states.extend(new_states)
 
             # Enforce top-K children per parent (excluding seeds)
@@ -437,9 +374,7 @@ class PUCTSampler:
             retained_ids = {state.id for state in self._states}
             return {
                 "submitted": len(children_with_parents),
-                "unique_new": unique_new,
-                "strategy_top_r": strategy_top_r,
-                "strategy_admitted": len(new_states),
+                "unique_new": len(new_states),
                 "retained_new": sum(
                     state.id in retained_ids for state in new_states),
                 "archive_size": len(self._states),

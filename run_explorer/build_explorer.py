@@ -27,8 +27,8 @@ from collect import collect  # noqa: E402
 
 JS_ORDER = [
     "core.js", "charts.js", "problems.js", "knowledge.js",
-    "tab_overview.js", "tab_pipeline.js", "tab_search.js", "tab_strategist.js",
-    "tab_rollouts.js", "tab_train.js", "jev_tree.js",
+    "tab_overview.js", "tab_pipeline.js", "tab_search.js",
+    "tab_rollouts.js", "tab_train.js",
     "tab_kernel.js", "tab_solution.js", "tab_published.js", "tab_concepts.js", "tab_logs.js", "main.js",
 ]
 PROBLEM_TITLES = {"ac1": "First autocorrelation inequality (AC1)", "erdos": "Erdős minimum-overlap problem (C₅)"}
@@ -111,19 +111,19 @@ def summarize(main, pub):
         "problem": pid, "title": title, "short": short, "kind": "kernel" if pid in KERNEL_PROBLEMS else "construction",
         "metric": metric, "lower_is_better": True, "effort": effort_summary(main), "gpu_type": cfg.get("gpu_type"),
         "run_name": main["meta"]["run_name"], "generated_at": main["meta"]["generated_at"],
-        "coder": nm(cfg.get("model_name") or cfg.get("coder_model_name")), "strategist": nm(cfg.get("strategy_model_name")),
+        "coder": nm(cfg.get("model_name") or cfg.get("coder_model_name")),
         "steps_done": len(done), "steps_total": cfg.get("num_steps"), "rollouts": len(rows), "valid_fraction": (n_valid / len(rows)) if rows else None,
         "best": best, "curve": curve, "pending": pending, "pub_results": pub_results, "ref_default": (pub or {}).get("default_ref"), "target": cfg.get("target"),
         "stopped": bool(el.get("stopped")), "elapsed_s": el.get("total"), "hardware": hw,
         "gpu_hours": (el.get("total") / 3600 * hw.get("n_gpus", 0)) if el.get("total") is not None and hw.get("n_gpus") else None,
-        "selection": "PUCT + JEV" if any(s.get("jev") for s in steps) else "PUCT",
+        "selection": str(cfg.get("parent_selection") or ("uct" if cfg.get("uct") else "puct")).upper(),
         "dec": {"ac1": 6, "erdos": 8, "gpu_mode": 1}.get(pid, 6),
     }
 
 
 def render_run(run_dir, code_per_step=25, all_code=False):
     """Returns (html, summary, blob_sizes) of the single-run explorer."""
-    main, heavy, strat, logs = collect(run_dir, code_per_step=code_per_step, all_code=all_code)
+    main, heavy, logs = collect(run_dir, code_per_step=code_per_step, all_code=all_code)
     tdir = os.path.join(HERE, "template")
     html = read(os.path.join(tdir, "index.html"))
     css = read(os.path.join(tdir, "style.css"))
@@ -134,7 +134,7 @@ def render_run(run_dir, code_per_step=25, all_code=False):
     pub = json.load(open(pub_path, encoding="utf-8")) if os.path.exists(pub_path) else {}
     if not pub:
         print("note: no data/published_%s.json - the explorer will work without published reference values" % (problem or "?"))
-    blobs = {"main": pack(main), "heavy": pack(heavy), "strat": pack(strat), "logs": pack(logs), "pub": pack(pub)}
+    blobs = {"main": pack(main), "heavy": pack(heavy), "logs": pack(logs), "pub": pack(pub)}
     data_tags = "\n".join('<script type="application/octet-stream" id="blob-%s">%s</script>' % (k, v) for k, v in blobs.items())
     html = (html.replace("/*__CSS__*/", css)
                 .replace("/*__JS__*/", js.replace("</script>", "<\\/script>"))
@@ -172,7 +172,6 @@ def build_unified(run_dirs, out_path, code_per_step=25, all_code=False):
             print("  measuring reasoning effort and generation speed on %d runs (effort_runs.txt) ..." % len(eruns))
             effort = effort_stats.collect(eruns)
             effort["generated"] = __import__("datetime").date.today().isoformat()
-            effort["example"] = next((ex for ex in (effort_stats.next_example(d) for d in eruns if os.path.basename(d).startswith("ac1_Qwen")) if ex), None)
             effort["speed"] = {m: dict(v, samples=[{k: x[k] for k in ("run", "step", "rollouts", "tokens", "elapsed_s", "tps_gpu", "mix")} for x in v["samples"]]) for m, v in effort["speed"].items()}
     except Exception as e:      # the landing page must still build
         print("warning: effort statistics skipped: %r" % (e,))

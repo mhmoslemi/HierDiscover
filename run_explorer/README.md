@@ -5,7 +5,7 @@ Nothing in the code base or in the run directory is modified - everything lives 
 
 **Problems supported out of the box:** `ac1` (first autocorrelation inequality) and `erdos` (Erdős minimum-overlap constant C₅). The problem is read from the run's `config.json`;
 the explorer then switches wording, the construction plots (autoconvolution f*f vs. overlap profile C(s)), the gap scale, the reference values and the Published SOTA tab accordingly.
-It also reads older runs without a JEV gate or a `best.json` snapshot.
+It also reads older runs without a `best.json` snapshot.
 
 ```bash
 cd run_explorer
@@ -48,14 +48,13 @@ the HTML is a snapshot of the directory at build time. (`python3 build_explorer.
 | Tab | What you can do |
 |---|---|
 | **Overview** | **hardware used (GPU card, memory, vLLM layout, GPU-hours)**, best-so-far vs a reference, **league table against published AC1 results**, failure breakdown, score distribution, wall-clock per phase, per-step table |
-| **Pipeline (one step)** | the 7 stages with real counts; **animated flow diagram** (parents → plan → coder attempt → result → training signal); click a stage for mechanism, formula, code references and live data; ▶ walkthrough |
-| **Search: PUCT + JEV** | PUCT components with a live *c* slider; **JEV on the search tree** (the scanned candidates as tree nodes labelled with their upper bound, accept / reject recoloured live as you move the threshold, rejection arcs with the similarity, a zoomed upper-bound strip, and threshold sweeps); JEV comparison matrix with an **animated scan**; **genealogy that grows step by step**; score landscape |
-| **Strategist** | each slot's plan or fallback and validation verdict, historical attempts when available, parent chains, reasoning, prompt anatomy, and coder results |
+| **Pipeline (one step)** | the six stages with real counts; **animated flow diagram** (parents → coder rollout → result → training signal); click a stage for mechanism, formula, code references and live data; ▶ walkthrough |
+| **Search: PUCT or UCT** | recorded scores and an exploration-constant slider; genealogy and score landscape |
 | **SPO² & training** | advantage function with β / baseline sliders, SPO² vs entropic baseline, tracker simulation (reproduces the logged baseline to 1e-10), PPO-clip plot, loss / gradient / timing curves |
-| **Rollouts explorer** | filter + scatter + sortable table; click any program for code, strategy, stdout, construction plot, **diff vs parent**, advantage derivation |
+| **Rollouts explorer** | filter + scatter + sortable table; click any program for code, stdout, construction plot, **diff vs parent**, advantage derivation |
 | **Solution (AC1)** | step function and autoconvolution recomputed in the browser; compare any two constructions (this run's best after each step **or the published ones**: AlphaEvolve, ThetaEvolve, TTT-Discover, Together AI, SimpleTES, best human); ▶ morph through the steps; **step function and f*f after every step** (small multiples) plus an overlay of all steps; sequence lengths |
 | **Published SOTA** | record progression over time, every published AC1 result with the bound **recomputed from its public height sequence**, the verbatim Table 17 of arXiv:2604.19341 (AC1/AC2/AC3), what happened in order, source links, and clearly flagged unreviewed claims |
-| **How it works** | architecture diagram, stage reference with formulas and `file:line` pointers, glossary, "easy to get wrong" list, file map |
+| **How it works** | pipeline, stage reference with formulas and `file:line` pointers, glossary, "easy to get wrong" list, file map |
 | **Config & event log** | config.json, startup banner, filtered terminal events |
 
 ### Hardware
@@ -66,11 +65,11 @@ The logs never print the card's *name*, so it is taken from `hardware_profile` w
 ### Linked what-ifs
 All parameters live in one shared store, so a change made anywhere shows up everywhere:
 `β`, `d_half`, `ρ_min/ρ_max`, the per-step baseline override and `ε_low/ε_high` (SPO² tab ⇄ Pipeline advantage and training stages ⇄ flow diagram ⇄ Rollouts advantages),
-the PUCT constant `c` (Search ⇄ Pipeline stage 1), the JEV threshold (Search replay and rejection chart ⇄ Pipeline stage 1) and the **Reference** value (every gap, line and the league table).
+the exploration constant `c` (Search ⇄ Pipeline stage 1) and the **Reference** value (every gap, line and the league table).
 A `↺ reset what-ifs` button appears in the top bar while anything differs from the logged run.
 
 ### Animation
-Charts draw in when a tab opens; the Pipeline flow reveals left → right and lights up the matching stage; the JEV scan can be animated candidate by candidate;
+Charts draw in when a tab opens. The Pipeline flow reveals left to right and highlights the matching stage.
 **▶ play steps** (top bar, or the space bar) plays through the run - the genealogy grows and every tab follows the step. Honours `prefers-reduced-motion`.
 
 ### Results key (published works only)
@@ -97,18 +96,16 @@ Re-run `python3 data/build_published.py [ac1|erdos]` (needs internet) to refresh
 ### Adding another problem
 1. In `template/js/problems.js` add a profile (name, metric, decimals, gap scale, `prep(vals)` returning the step function and the profile curve + its maximum, and the explanatory texts).
 2. Optionally create `data/published_<problem>.json` (same layout as the existing files) for the SOTA tab and the reference lines.
-Without a profile the explorer still works (pipeline, search, strategist, training, rollouts) and just skips the construction plots.
+Without a profile the explorer still works (pipeline, search, training, rollouts) and just skips the construction plots.
 
 ### GPU Mode kernels (problem `gpu_mode`)
-A run whose `config.json` says `problem: gpu_mode` is a kernel task (TriMul, B200 in the current run): the solution is a program, not an array, so the *Solution* tab becomes **Kernel (TriMul)** (`template/js/tab_kernel.js`): best runtime per step against the published references, every valid kernel, a table of what the best kernel contains after each step (Triton / `tl.dot` / cuBLAS / fp16 ... by text search) and the source with a diff against the previous best. Nothing is recomputed in the browser - a runtime only exists on the GPU it was timed on. Strategist text saved as raw byte-level tokens (`ĊĠApproachĠand…`) is decoded for display.
+A run whose `config.json` says `problem: gpu_mode` is a kernel task (TriMul, B200 in the current run): the solution is a program, not an array, so the *Solution* tab becomes **Kernel (TriMul)** (`template/js/tab_kernel.js`): best runtime per step against the published references, every valid kernel, a table of what the best kernel contains after each step (Triton / `tl.dot` / cuBLAS / fp16 ... by text search) and the source with a diff against the previous best. Nothing is recomputed in the browser - a runtime only exists on the GPU it was timed on.
 Reference data: `data/published_gpu_mode.json`, written by `data/build_published_gpu_mode.py` (live leaderboard 496 from `https://www.gpumode.com/api/leaderboard/496` + Table 4 of arXiv:2601.16175 quoted from the PDF: TTT-Discover 914.2 µs on B200, best human 1038.9 µs; the paper trained on H100 and could not submit B200 to the board). Re-run the script to refresh the leaderboard.
 
 ## Caveats worth knowing
-* For runs with a JEV gate, `config.json` is stale for the threshold: the real value is stored per step (the AC1 run used 0.9 for steps 0-3 and 0.68 from step 4).
 * Wall-clock phases are reconstructed from the HH:MM:SS timestamps of `temirnal.log` (no dates; resumed steps include restart time).
 * The tracker simulation holds the measured policy shift D fixed when you change β.
 * The partially written step shows only the stages that already wrote files.
-* **JEV substitutes.** `jev.json` only stores the candidates GLiDE actually compared (the scan stops after the 8th acceptance), but lowering the threshold would push the scan further down the PUCT ranking. `archive_sim.py` therefore rebuilds the candidate window (top 24 states) of every step by replaying the rules of `search/sampler.py` on the saved rollouts (exact-code dedupe, top-2 per parent×strategy, top-8 per parent, rank prior, visit counts). It is checked against the run: the rebuilt archive size equals the logged `archive_size` at every step and the rebuilt scan reproduces the recorded one (programs with exactly equal reward may swap places, which never changes who is selected). In the JEV tree view the programs that would fill the vacated slots are shown as **substitutes** (blue, marked *): GLiDE never compared them, so they are assumed to pass. If a step's window cannot be validated the view falls back to the record-only replay.
 * A step writes `summary.json` / `best.json` / `result.txt` only after its adapter update, but `temirnal.log` already prints `[step N] best-ever raw …` when its rollouts are scored. Such a step is shown as **"rollouts done"**: its programs, best value and construction count for best-so-far (Overview, Solution, Published SOTA, unified page, cross-checked against the logged value), while training / archive numbers stay "pending" until the step finishes. Steps still generating rollouts are listed as in progress and do not move the best.
 * Baselines, advantages and the Throughput numbers use the logged values until you move a what-if control; a log that ends in a traceback / KeyboardInterrupt is reported as "stopped" and the finish estimate is replaced by "time left if resumed".
 
@@ -118,7 +115,6 @@ make_explorer.sh    shell launcher (run directory in, html out)
 build_explorer.py   CLI: collect -> pack -> inline into the template
 collect.py          read-only reader of the run directory (parallel per step)
 effort_stats.py     tokens per rollout and generation speed per reasoning effort (hub page "Effort & speed"); runs listed in effort_runs.txt
-archive_sim.py      rebuilds the PUCT candidate window of every JEV step (for the substitutes) by replaying search/sampler.py's rules
 data/               published_<problem>.json (reference constructions, tables, history) and the script that rebuilds them
 unified_runs.txt    runs used by --unified when none are given
 template/           index.html, style.css, js/*.js  (vanilla JS, SVG/canvas charts, no dependencies; problems.js = per-problem profiles)

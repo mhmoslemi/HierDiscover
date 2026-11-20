@@ -198,8 +198,7 @@ def write_tree_log(run_dir, max_step=None):
 
     errors = []
     pattern = "step*/step*_group*_rollout*.meta.json"
-    frozen_root = run_dir / "frozen_solver"
-    paths = sorted(frozen_root.glob(pattern)) + sorted(run_dir.glob(pattern))
+    paths = sorted(run_dir.glob(pattern))
     for path in paths:
         try:
             meta = json.loads(path.read_text(encoding="utf-8"))
@@ -212,9 +211,6 @@ def write_tree_log(run_dir, max_step=None):
         if max_step is not None and step > max_step:
             continue
         if meta.get("status") == "evaluation_pending":
-            continue
-        if path.is_relative_to(frozen_root) and not meta.get("node_id"):
-            # Older frozen results were evaluated without entering the tree.
             continue
 
         node_id = str(meta.get("node_id") or
@@ -239,7 +235,6 @@ def write_tree_log(run_dir, max_step=None):
                              str(meta.get("failure_kind") or "unknown")),
             "group": meta.get("group"),
             "rollout": meta.get("rollout"),
-            "solver": meta.get("solver"),
             "response_file": str(path.relative_to(run_dir)).removesuffix(
                 ".meta.json") + ".txt",
         })
@@ -268,7 +263,6 @@ def write_tree_log(run_dir, max_step=None):
             "parent_id": node["parent_id"],
             "child_ids": sorted(node["child_ids"], key=node_order),
             "raw_problem_score": node["raw_problem_score"],
-            **({"solver": node["solver"]} if node.get("solver") else {}),
         }
     roots = [node_id for node_id in ordered_ids
              if nodes[node_id]["parent_id"] is None]

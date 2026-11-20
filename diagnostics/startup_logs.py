@@ -53,7 +53,7 @@ class StartupLog:
     """
 
     def __init__(self, *, console=None,
-                 title="Strategist Bandit"):
+                 title="Single-Model Discovery"):
         self.console = sys.stdout if console is None else console
         self.title = str(title)
         self.path = None
@@ -155,11 +155,9 @@ def dashboard_sections(fields, run_dir, *, resuming=False):
         ("MODELS & SAMPLING", 95, [
             row("Coder model"), row("Coder sampling"),
             row("Coder reasoning"),
-            row("Frozen solver"), row("Frozen sampling"),
         ]),
         ("ROLLOUTS", 93, [
             row("Groups per step", "Group size", "Total rollouts/step"),
-            row("Frozen programs"),
         ]),
         ("TRAINING", 92, [
             row("Advantage mode", "LR", "KL coef", "Reference KL"),
@@ -199,8 +197,7 @@ def render_dashboard(fields, run_dir, *, width=104, color=False, resuming=False)
     def content(text):
         return "│ " + text.ljust(inner) + " │"
 
-    title = ("TWO-SOLVER DISCOVERY" if "Frozen solver" in fields
-             else "SINGLE-MODEL DISCOVERY")
+    title = "SINGLE-MODEL DISCOVERY"
     lines = [paint("╭" + "─" * (width - 2) + "╮", 90),
              content(paint(title.ljust(inner), "1;96"))]
     for title, code, rows in dashboard_sections(fields, run_dir, resuming=resuming):

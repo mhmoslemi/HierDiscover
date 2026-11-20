@@ -5,7 +5,7 @@ const _ssCache = {};
 function stepStats(step) {
   if (_ssCache[step]) return _ssCache[step];
   const rs = RS[step] || [];
-  const o = { n: rs.length, valid: 0, code: 0, constraint: 0, timeout: 0, improved: 0, tokens: 0, fallback: 0 };
+  const o = { n: rs.length, valid: 0, code: 0, constraint: 0, timeout: 0, improved: 0, tokens: 0 };
   const raws = [];
   rs.forEach(r => {
     if (r.valid) { o.valid++; raws.push(r.raw); } else if (r.fail === "timeout") o.timeout++; else if (r.fail === "constraint") o.constraint++; else o.code++;
@@ -35,7 +35,7 @@ registerTab({
 
     root.append(pageHead("Run overview",
       `<b>${esc(D.main.meta.run_name)}</b> — ${PROB.intro}. ` +
-      `A frozen <b>strategist</b> proposes plans, a LoRA-trained <b>coder</b> turns them into programs, a <b>${RUN.selection}</b> search decides which programs to extend, and <b>SPO²</b> updates the coder from the scored programs. ` +
+      `<b>${RUN.selection}</b> chooses parents from the archive. The <b>coder</b> generates programs, and training updates its LoRA adapter from the evaluated rollouts. ` +
       `Use the tabs on the left to follow one step through every stage; the step selector (top right) is shared by all tabs.`));
 
     root.append(h("div", { class: "kpis" },
@@ -110,7 +110,7 @@ registerTab({
 
     // ---- wall clock
     const phases = D.main.phases || {};
-    const PH = [["select", "Parent selection (" + RUN.selection + ")", 0], ["strategist", "Strategist chains", 1], ["coder", "Coder generation + CPU eval", 2], ["strategist+coder", "Strategist + coder (not split in old log format)", 6], ["scoring", "Log-prob scoring", 3], ["training", "LoRA training", 4]];
+    const PH = [["select", "Parent selection (" + RUN.selection + ")", 0], ["coder", "Coder generation and evaluation", 2], ["scoring", "Log-prob scoring", 3], ["training", "LoRA training", 4]];
     const pst = done.filter(s => phases[s]);
     if (pst.length) {
       const c = card("Wall-clock time per step", "approximate, reconstructed from timestamps in terminal log (resumed steps include restart time)", h("div", { class: "chart", id: "chPhase" }));
@@ -160,7 +160,6 @@ registerTab({
       { label: "valid", get: r => fmt.pct(ST[r.s].valid_fraction), num: true },
       { label: "beat parent", get: r => stepStats(r.s).improved, num: true, title: "valid programs with a higher reward than their parent" },
       { label: "archive", get: r => ST[r.s].archive_size != null ? fmt.n(ST[r.s].archive_size) : "–", num: true },
-      ...(RUN.hasJev ? [{ label: "JEV thr.", get: r => ST[r.s].jev ? ST[r.s].jev.threshold : "–", num: true }] : []),
       { label: "train time", get: r => ST[r.s].training_seconds != null ? fmt.dur(ST[r.s].training_seconds) : "pending", num: true },
       { label: "elapsed", get: r => { const e = ((D.main.elapsed || {}).by_step || {})[String(r.s)]; return e != null ? fmt.dh(e) : "–"; }, num: true, title: "wall-clock time since the first log line, at the end of this step" },
       { label: "SPO² v", get: r => ST[r.s].spo ? fmt.f(ST[r.s].spo.value_before, 3) : "–", num: true },
@@ -175,16 +174,12 @@ function recipeNode() {
   const rows = [
     ["Problem", `${c.problem} · ${PROB.recipeProblem} · prompt target ${c.target}`],
     ["Coder (trained)", `${nm(c.model_name || c.coder_model_name)} + LoRA r=${c.lora_rank}, lr ${c.learning_rate}, reasoning "${c.coder_reasoning_effort}"`],
-    ...(c.strategies !== false && c.strategy_model_name ? [["Strategist (frozen)",
-      [nm(c.strategy_model_name), c.strategy_reasoning_effort].filter(Boolean).join(" · ")]] : []),
-    ...(RUN.hasJev ? [["JEV judge", (nm((c.jev_model_path || "").replace(/\/snapshots.*/, "")) || "models--fastino--GLiDE-9B").replace(/^models--/, "").replace(/--/g, "/")]] : []),
-    ["Parent selection", `${c.parent_selection || RUN.sampler} · c=${c.puct_c} · ${c.num_seed_states} seeds${RUN.hasJev ? ` · window ×${c.jev_candidate_multiplier}` : ""}`],
-    ["Per step", `${c.groups_per_step} parents × (${c.strategies_per_parent} strategies × ${c.programs_per_strategy}) = ${c.groups_per_step * c.group_size} programs`],
-    ["Programs per strategy", c.programs_per_strategy],
+    ["Parent selection", `${c.parent_selection || RUN.sampler} · c=${c.puct_c} · ${c.num_seed_states} seeds`],
+    ["Per step", `${c.groups_per_step} parents × ${c.group_size} rollouts = ${c.groups_per_step * c.group_size} programs`],
     ["Advantage", c.advantage_mode === "hybrid"
       ? `hybrid · β=${c.spo_rs_beta} · TTT importance sampling`
       : `${c.advantage_mode} · β=${c.spo_rs_beta} · clip [${c.spo_rs_clip_epsilon_low}, ${c.spo_rs_clip_epsilon_high}]`],
-    ["Archive", `top-${c.strategy_archive_top_r}/strategy · top-${c.topk_children_per_parent}/parent · cap ${c.max_buffer_size}`],
+    ["Archive", `top-${c.topk_children_per_parent}/parent · cap ${c.max_buffer_size}`],
     PROB.kernel ? ["Kernel evaluation", `on ${c.gpu_type || "the GPU"} (GPU ${c.kernel_gpu_id != null ? c.kernel_gpu_id : "?"}), killed after ${c.kernel_timeout_s || c.sandbox_timeout_s}s${c.max_new_tokens ? `, up to ${fmt.n(c.max_new_tokens)} tokens` : ""}`]
       : ["Program budget", `${c.budget_s}s search${c.sandbox_timeout_s ? `, sandbox kill at ${c.sandbox_timeout_s}s` : ""}${c.max_new_tokens ? `, up to ${fmt.n(c.max_new_tokens)} tokens` : ""}`],
     ["Hardware", ((D.main.hardware || {}).label || [c.hardware_profile, c.gpu_ids ? "GPUs " + c.gpu_ids : ""].filter(Boolean).join(" · ")) + (c.generation_backend ? " · vLLM " + c.generation_backend : "")],
@@ -262,7 +257,6 @@ function hardwareCard(root, HW, done) {
     ["Model name basis", `<span class="sub">${esc(HW.basis || "")}</span>`],
     ["GPU ids used", `${(HW.gpu_ids || []).join(", ")} <span class="sub">- all ${HW.n_gpus} train the coder (replicated LoRA) and generate (sequential sharing)</span>`],
     ["Coder generation", HW.coder_engines ? `${HW.coder_engines} vLLM engine${HW.coder_engines > 1 ? "s" : ""}, tensor-parallel ${HW.coder_tp} (${HW.coder_engines * HW.coder_tp} GPUs)` : "vLLM"],
-    ["Strategist generation", HW.strategist_engines ? `${HW.strategist_engines} vLLM engine${HW.strategist_engines > 1 ? "s" : ""}, tensor-parallel ${HW.strategist_tp}` : "–"],
     PROB.kernel ? ["Kernel evaluation", `${CFG.gpu_type || "GPU"} · GPU ${CFG.kernel_gpu_id != null ? CFG.kernel_gpu_id : "?"} runs the correctness tests and the timing, one kernel at a time (kernel_timeout_s = ${CFG.kernel_timeout_s || "?"})`] :
     ["Evaluation (CPU)", HW.eval_processes ? `${HW.eval_processes} sandbox processes on ${HW.eval_cpus_used || "?"} CPUs (config eval_cpus = ${CFG.eval_cpus || "?"})` : `${CFG.eval_cpus || "?"} CPUs configured`],
     HW.host_offload_gib ? ["Host RAM for offload", `${HW.host_offload_gib} GiB budget for activation / weight offload`] : null,

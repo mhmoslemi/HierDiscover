@@ -41,7 +41,6 @@ function effortInfo() {
 }
 const cssVar = n => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
 const S_COL = i => cssVar("--s" + ((i % 8) + 1));
-const STRAT_LABEL = ["S0", "S1", "S2", "S3"];
 
 /* hyperscript */
 function h(tag, attrs, ...kids) {
@@ -63,7 +62,7 @@ function h(tag, attrs, ...kids) {
 }
 
 /* ------------------------------------------------------------------ data loading -- */
-const D = { main: null, heavy: null, strat: null, logs: null };
+const D = { main: null, heavy: null, logs: null };
 const _pending = {};
 async function inflate(id) {
   const tag = document.getElementById("blob-" + id);
@@ -125,21 +124,20 @@ function prepare() {
 }
 
 /* ------------------------------------------------------------------ global state -- */
-const S = { tab: "overview", step: 0, group: 0, sidx: 0, listeners: [] };
+const S = { tab: "overview", step: 0, group: 0, listeners: [] };
 function setState(patch, silent) {
   Object.assign(S, patch);
   syncHash();
   if (!silent) renderTab();
 }
 function syncHash() {
-  try { history.replaceState(null, "", `#${S.tab}/${S.step}/${S.group}/${S.sidx}`); } catch (e) { /* file:// quirks */ }
+  try { history.replaceState(null, "", `#${S.tab}/${S.step}/${S.group}`); } catch (e) { /* file:// quirks */ }
 }
 function readHash() {
   const p = (location.hash || "").replace(/^#/, "").split("/");
   if (p[0]) S.tab = p[0];
   if (p[1] != null && p[1] !== "" && !isNaN(+p[1])) S.step = +p[1];
   if (p[2] != null && p[2] !== "" && !isNaN(+p[2])) S.group = +p[2];
-  if (p[3] != null && p[3] !== "" && !isNaN(+p[3])) S.sidx = +p[3];
 }
 
 /* ------------------------------------------------------------------ tooltip -- */
@@ -295,14 +293,13 @@ function pageHead(title, lede) {
 function rewardToRaw(r) { return r > 0 ? 1 / r : 0; }
 
 /* ------------------------------------------------------------------ rollout / node drawer -- */
-function strategyKey(step, pg, s) { return `${step}:${pg}:${s}`; }
-function rolloutTitle(r) { return `Rollout · step ${r.step} · parent ${r.pg} · S${r.sidx} · #${r.rollout}`; }
+function rolloutTitle(r) { return `Rollout · step ${r.step} · parent ${r.pg} · #${r.rollout}`; }
 
 async function openRollout(rid) {
   const r = R[rid]; if (!r) return;
   const root = h("div", null, h("div", { class: "sub" }, "loading…"));
   openDrawer(rolloutTitle(r), root);
-  const [heavy, strat] = await Promise.all([lazy("heavy"), lazy("strat")]);
+  const heavy = await lazy("heavy");
   root.innerHTML = "";
   const st = ST[r.step] || {};
   const spo = st.spo;
@@ -313,7 +310,6 @@ async function openRollout(rid) {
   const advCalc = v && !hybrid ? (G / v - 1) / beta : null;
   const kv = [
     ["Outcome", r.valid ? `<span class="pill good">valid</span> ${esc(PROB.metric)} <b>${fmt.raw(r.raw)}</b> (reward ${fmt.f(r.reward, 6)})` : `<span class="pill bad">invalid</span> ${esc(r.fail || "failed")} - ${esc(r.msg)}`],
-    ["Rollout", `${r.sidx == null ? "Direct rollout" : "Strategy S" + r.sidx}${r.fallback ? ' · <span class="pill warn">strategist fallback</span>' : ""}`],
     ["Node / parent", `<span class="mono">${esc(fmt.id(r.node))}</span> ← <a href="javascript:void 0" class="mono" id="lnkParent">${esc(fmt.id(r.parent))}</a>`],
     ["Parent score", `raw ${fmt.raw(r.praw)} (reward ${fmt.f(r.pval, 6)}) ${r.valid ? (r.improved ? '<span class="pill good">beats parent</span>' : '<span class="pill">not better than parent</span>') : ""}`],
     ["Response tokens", `${fmt.n(r.ntok)}${r.think_chars != null ? ` · reasoning ${fmt.n(r.think_chars)} chars` : ""}`],
@@ -324,13 +320,6 @@ async function openRollout(rid) {
   root.append(h("div", { class: "kv", html: kv.map(([k, vv]) => `<div class="k">${k}</div><div class="v">${vv}</div>`).join("") }));
   const lp = $("#lnkParent", root);
   if (lp) lp.addEventListener("click", () => openNode(r.parent));
-  // strategy
-  const sk = strat.strategies[`${r.step}:${r.pg}:${r.sidx}`];
-  if (sk) {
-    root.append(h("h3", { style: { marginTop: "16px" } }, "Strategy given to the coder (from the strategist)"));
-    root.append(sk.fallback ? h("div", { class: "warnbox" }, "The slot had no usable plan. The coder received the direct-solve fallback.") : null);
-    root.append(textBlock(sk.block || "(not available)"));
-  }
   // construction
   const cons = heavy.cons[String(rid)];
   if (cons) {
@@ -346,7 +335,7 @@ async function openRollout(rid) {
   const code = heavy.code[String(rid)];
   root.append(h("h3", { style: { marginTop: "16px" } }, "Program written by the coder"));
   root.append(code ? codeBlock(code) : h("div", { class: "hint" }, "Source for this rollout is not embedded (only the best 25 per step plus every selected parent are). Rebuild with ", h("code", null, "--all-code"), " to include everything."));
-  const pr = RN[r.parent], pcode = pr ? heavy.code[String(pr.id)] : heavy.seed_code[r.parent];
+  const pr = RN[r.parent], pcode = pr ? heavy.code[String(pr.id)] : null;
   if (code && pcode) {
     root.append(h("h3", { style: { marginTop: "16px" } }, "What changed relative to its parent program"));
     root.append(diffBlock(pcode, code));
@@ -358,17 +347,15 @@ async function openRollout(rid) {
   }
 }
 
-async function openNode(nodeId) {
+function openNode(nodeId) {
   const r = RN[nodeId];
   if (r) return openRollout(r.id);
-  const heavy = await lazy("heavy");
   const root = h("div", null);
   const idx = TREE.idx[nodeId];
   const n = idx != null ? TREE.nodes[idx] : null;
   root.append(h("div", { class: "kv", html: `<div class="k">Node</div><div class="v mono">${esc(nodeId)}</div><div class="k">Raw score</div><div class="v">${n ? fmt.raw(n[1]) : "–"}</div><div class="k">Kind</div><div class="v">${n && n[0] < 0 ? "seed (root state)" : "unknown"}</div>` }));
-  const code = heavy.seed_code[nodeId];
   root.append(h("h3", { style: { marginTop: "14px" } }, "Source"));
-  root.append(code ? codeBlock(code) : h("div", { class: "hint" }, "Source not embedded."));
+  root.append(h("div", { class: "hint" }, "Source not embedded."));
   openDrawer("Node " + fmt.id(nodeId), root);
 }
 
@@ -389,7 +376,7 @@ function initParams() {
   Object.assign(P, {
     beta: CFG.spo_rs_beta != null ? CFG.spo_rs_beta : 2, dHalf: CFG.spo_rs_d_half != null ? CFG.spo_rs_d_half : 0.06,
     rhoMin: CFG.spo_rs_rho_min != null ? CFG.spo_rs_rho_min : 0.875, rhoMax: CFG.spo_rs_rho_max != null ? CFG.spo_rs_rho_max : 0.96,
-    vOver: {}, c: null, thr: null,
+    vOver: {}, c: null,
     clipLo: CFG.spo_rs_clip_epsilon_low != null ? CFG.spo_rs_clip_epsilon_low : 0.2, clipHi: CFG.spo_rs_clip_epsilon_high != null ? CFG.spo_rs_clip_epsilon_high : 0.38,
   });
   DEFAULT_P = JSON.parse(JSON.stringify(P));
@@ -404,7 +391,7 @@ function setParam(patch, source) {
 }
 function paramsDirty() {
   if (!DEFAULT_P) return false;
-  return ["beta", "dHalf", "rhoMin", "rhoMax", "c", "thr", "clipLo", "clipHi"].some(k => P[k] !== DEFAULT_P[k]) || Object.keys(P.vOver).length > 0;
+  return ["beta", "dHalf", "rhoMin", "rhoMax", "c", "clipLo", "clipHi"].some(k => P[k] !== DEFAULT_P[k]) || Object.keys(P.vOver).length > 0;
 }
 function updateResetBadge() { const b = $("#btnReset"); if (b) b.hidden = !paramsDirty(); }
 function resetParams() {

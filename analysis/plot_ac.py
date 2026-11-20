@@ -54,7 +54,7 @@ def _step_number(meta, path: Path):
 
 
 def load_metas(run_dir: Path, max_step=None):
-    """Load only rollout metadata, excluding strategist sidecars."""
+    """Load rollout metadata."""
     out = []
     pattern = "step*/step*_group*_rollout*.meta.json"
     for path in sorted(run_dir.glob(pattern)):

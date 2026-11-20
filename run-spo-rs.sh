@@ -68,14 +68,12 @@ config_path="${TTT_CONFIG:-configs/ac1.yaml}"
 # Skip adapter training completely while keeping rollout, evaluation, search,
 # search and result/checkpoint persistence:
 #   sh run.sh --no-train
-# Set frozen_programs_per_parent: 0 in the YAML for a coder-only run.
-#   sh run.sh --frozen-programs-per-parent 0
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 export VLLM_USE_FLASHINFER_SAMPLER="${VLLM_USE_FLASHINFER_SAMPLER:-0}"
 
 TTT_LAUNCH_ADVANTAGE_DEFAULT=spo-rs \
 exec python3 runtime/run_supervisor.py -- python3 orchestrator.py --config "$config_path" \
-    --spo-rs-clip-epsilon-low 0.2 --spo-rs-clip-epsilon-high 0.38 --strategies \
+    --spo-rs-clip-epsilon-low 0.2 --spo-rs-clip-epsilon-high 0.38 \
     --isolate-eval --fused-long-attention "$@"
     # 
     # 
@@ -87,7 +85,7 @@ exec python3 runtime/run_supervisor.py -- python3 orchestrator.py --config "$con
 
 # TTT_LAUNCH_ADVANTAGE_DEFAULT=spo-rs \
 # exec python3 runtime/run_supervisor.py -- python3 orchestrator.py --config "$config_path" \
-#     --spo-rs-clip-epsilon-low 0.2 --spo-rs-clip-epsilon-high 0.38 --strategies \
+#     --spo-rs-clip-epsilon-low 0.2 --spo-rs-clip-epsilon-high 0.38 \
 #     --isolate-eval --fused-long-attention "$@"
 #     # 
 #     # 

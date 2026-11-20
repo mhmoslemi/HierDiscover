@@ -2,7 +2,7 @@
 Per-experiment file I/O.
 
 Creates a directory under runs/ named from the main hyperparameters, then
-writes one .txt and one .meta.json per rollout. Frozen solver programs use the same artifact files under frozen_solver/. All rollouts are
+writes one .txt and one .meta.json per rollout. All rollouts are
 saved, including ones that failed extraction or validation.
 
 Filenames:
@@ -35,7 +35,7 @@ _ROLLOUT_IO_RETRY_SECONDS = 5.0
 _ROLLOUT_IO_RETRY_TIMEOUT_SECONDS = 2 * 60 * 60
 
 ROLLOUT_BUDGET_KEYS = (
-    "groups_per_step", "group_size", "frozen_programs_per_parent",
+    "groups_per_step", "group_size",
 )
 ROLLOUT_CONFIG_KEYS = ROLLOUT_BUDGET_KEYS
 
@@ -316,50 +316,27 @@ def make_experiment_dir(cfg, root: str = "runs", resume_dir=None,
 
 
 def restart_changed_rollout_step(cfg, exp_dir, step):
-    """Archive an unfinished step whose prompt, budget, or committed JEV gate changed."""
+    """Archive an unfinished step whose prompt or rollout budget changed."""
     import tempfile
 
     run = Path(exp_dir)
     directory = run / f"step{step:02d}"
-    frozen_step = run / "frozen_solver" / directory.name
-    coder_parents = directory / f"step{step:02d}.parents.json"
-    frozen_parents = frozen_step / coder_parents.name
-    parents_path = coder_parents if coder_parents.is_file() else frozen_parents
-    coder_jev = directory / f"step{step:02d}.jev.json"
-    frozen_jev = frozen_step / coder_jev.name
-    jev_path = coder_jev if coder_jev.is_file() else frozen_jev
+    parents_path = directory / f"step{step:02d}.parents.json"
     if ((directory / f"step{step:02d}.summary.json").is_file()
-            or not (parents_path.is_file() or jev_path.is_file())):
+            or not parents_path.is_file()):
         return None
-    if parents_path.is_file():
-        event = json.loads(parents_path.read_text())
-        saved = event.get("rollout_config")
-    else:
-        saved = None
+    event = json.loads(parents_path.read_text())
+    saved = event.get("rollout_config")
     source = parents_path
     if saved is None:
         source = run / "config.json"
         saved = json.loads(source.read_text())
     reject_retired_coder_cap(saved, source=source)
     values = {key: int(saved[key]) for key in ROLLOUT_BUDGET_KEYS if key in saved}
-    jev = json.loads(jev_path.read_text()) if jev_path.is_file() else None
-    if jev is not None:
-        values["groups_per_step"] = int(jev["requested"])
     budget_changed = any(getattr(cfg, key, None) != value for key, value in values.items())
-    frozen_enabled = bool(getattr(cfg, "frozen_solver", False))
-    mode_changed = bool(saved.get("frozen_solver", False)) != frozen_enabled
-    layout_changed = (
-        frozen_enabled and (coder_parents.is_file() or coder_jev.is_file())
-        and not frozen_parents.is_file()
-    )
-    # Step zero uses ordinary PUCT, so its parents do not depend on this gate.
-    threshold_changed = (
-        step > 0 and getattr(cfg, "parent_selection", None) == "puct-jev"
-        and jev is not None and jev.get("selected") is not None
-        and jev["threshold"] != cfg.jev_same_core_threshold)
     prompt_changed = (saved.get("rollout_prompt_revision")
                       != getattr(cfg, "rollout_prompt_revision", None))
-    if not (budget_changed or mode_changed or layout_changed or threshold_changed or prompt_changed):
+    if not (budget_changed or prompt_changed):
         return None
 
     # Partial gradients belong to the discarded trajectories.
@@ -382,38 +359,14 @@ def restart_changed_rollout_step(cfg, exp_dir, step):
     for path in dict.fromkeys(sidecars):
         if path.is_file():
             path.rename(backup / path.name)
-    if frozen_step.is_dir():
-        frozen_backup = backup / "frozen_solver"
-        frozen_backup.mkdir()
-        frozen_step.rename(frozen_backup / frozen_step.name)
     if directory.is_dir():
         directory.rename(backup / directory.name)
 
-    if threshold_changed and not (frozen_enabled or budget_changed or mode_changed or prompt_changed):
-        # Probabilities do not depend on the gate. Retain only that cache;
-        # never carry old parents, rollouts, evaluations, or gradients forward.
-        # Leave the old threshold/signature intact for the sampler to validate
-        # against the restored archive before applying the current threshold.
-        jev["selected"] = None
-        jev.pop("picks_info", None)
-        jev.pop("decisions", None)
-        directory.mkdir()
-        tmp = jev_path.with_suffix(".json.tmp")
-        tmp.write_text(json.dumps(jev, indent=2, ensure_ascii=False,
-                                  allow_nan=False) + "\n", encoding="utf-8")
-        tmp.replace(jev_path)
     reasons = []
     if budget_changed:
         reasons.append("rollout counts changed")
-    if mode_changed:
-        reasons.append("frozen solver mode changed")
-    if layout_changed:
-        reasons.append("frozen solver now updates the archive before coder selection")
     if prompt_changed:
         reasons.append("task prompt revision changed")
-    if threshold_changed:
-        reasons.append(f"JEV threshold changed {jev['threshold']:g} -> "
-                       f"{cfg.jev_same_core_threshold:g}")
     print(f"[resume] {'; '.join(reasons)}: restarting step {step} with "
           f"{cfg.groups_per_step} parents x {cfg.group_size} rollouts; "
           f"previous step artifacts moved to {backup}", flush=True)
@@ -538,7 +491,6 @@ def save_parent_selections(exp_dir: Path, step: int, sampler_type: str,
                                   if info.get("bonus") is not None else None),
             "selection_score": (float(info["score"])
                                 if info.get("score") is not None else None),
-            **({"jev": info["jev"]} if "jev" in info else {}),
         })
     payload = {
         "version": 1,
@@ -553,8 +505,6 @@ def save_parent_selections(exp_dir: Path, step: int, sampler_type: str,
         }
         payload["rollout_config"]["rollout_prompt_revision"] = getattr(
             rollout_config, "rollout_prompt_revision", None)
-        payload["rollout_config"]["frozen_solver"] = bool(
-            getattr(rollout_config, "frozen_solver", False))
     path = step_dir / f"step{step:02d}.parents.json"
     tmp = path.with_suffix(path.suffix + ".tmp")
     tmp.write_text(json.dumps(payload, indent=2))

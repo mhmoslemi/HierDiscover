@@ -3,29 +3,17 @@
 let _stageSel = "select", _walk = null;
 
 function parentsOf(step) { return (ST[step] && ST[step].parents) || []; }
-function slotsOf(step) { // from the strategist blob: keyed "step:g:s"
-  const out = [];
-  if (!D.strat) return out;
-  for (const k in D.strat.strategies) { const [st, g, s] = k.split(":").map(Number); if (st === step) out.push(D.strat.strategies[k]); }
-  return out;
-}
-
 registerTab({
   id: "pipeline", label: "Pipeline (one step)", ico: "⛓",
   async render(root) {
-    await lazy("strat");
-    const step = S.step, st = ST[step], rs = RS[step] || [];
+    const step = S.step, st = ST[step] || {}, rs = RS[step] || [];
     root.append(pageHead(`How step ${step} was produced`,
       `One training step runs <b>${STAGES.length} stages</b>. The numbers below are the real counts for the selected step; click a stage for the mechanism, the exact formula, the code that does it, and the data it produced. ` +
       (st.completed ? "" : st.provisional ? `<span class="pill warn">step ${step}: all rollouts are scored (its best counts for best-so-far), the adapter update and summary are not written yet - training numbers are missing</span>` : `<span class="pill warn">step ${step} is still in progress on disk - only the stages that already wrote files are filled in</span>`)));
 
     const planned = rs.filter(r => r.planned !== false);
-    const slots = slotsOf(step);
-    const attempts = sum(slots.map(s => s.attempts.length)), fallbacks = slots.filter(s => s.fallback).length;
-    const jev = st.jev, rejected = jev ? (jev.decisions || []).filter(d => !d.accepted).length : 0;
     const nums = {
-      select: [parentsOf(step).length || "–", jev && jev.candidate_limit ? `${jev.comparisons.length} JEV judgments · ${rejected} rejected` : (RUN.hasJev ? "plain PUCT on the seeds" : "PUCT with lineage blocking")],
-      strategist: [slots.length ? `${slots.length}` : "–", `${attempts} attempts · ${fallbacks} fallbacks`],
+      select: [parentsOf(step).length || "–", RUN.selection + " with lineage blocking"],
       coder: [planned.length || "–", "planned programs"],
       eval: [rs.length ? fmt.pct(rs.filter(r => r.valid).length / rs.length, 0) : "–", `valid of ${rs.length}`],
       adv: [st.spo ? "v " + fmt.f(st.spo.value_before, 3) : "–", st.spo ? `→ ${fmt.f(st.spo.value_after, 3)} · η ${fmt.f(st.spo.eta, 2)}` : ""],
@@ -43,7 +31,7 @@ registerTab({
         h("div", { class: "model-chip " + sg.chip[1], title: sg.chip[2] }, sg.chip[0])));
     });
     const walkBtn = h("button", { class: "btn" + (_walk ? " on" : ""), onclick: () => walkToggle() }, _walk ? "■ stop walkthrough" : "▶ walk through the stages");
-    root.append(card(null, null, h("div", null, h("div", { class: "row-flex", style: { marginBottom: "6px", justifyContent: "space-between" } }, h("div", { class: "sub" }, `Step ${step}: ${parentsOf(step).length} parents · ${slots.length} plans · ${planned.length} planned programs`), walkBtn), flow)));
+    root.append(card(null, null, h("div", null, h("div", { class: "row-flex", style: { marginBottom: "6px", justifyContent: "space-between" } }, h("div", { class: "sub" }, `Step ${step}: ${parentsOf(step).length} parents · ${planned.length} planned programs`), walkBtn), flow)));
 
     // ---- flow diagram of where the programs go (animated)
     if (rs.length) {
@@ -84,11 +72,10 @@ const STAGE_VIZ = {
   async select(box, step) {
     const ps = parentsOf(step);
     if (!ps.length) { box.append(h("div", { class: "empty" }, "No parents recorded for this step.")); return; }
-    const jev = ST[step].jev;
-    box.append(h("div", { class: "sub", html: `Sampler <b>${esc(ST[step].sampler_type || "")}</b>${jev && jev.candidate_limit ? ` · looked at the top ${jev.candidate_limit} PUCT states, accepted ${jev.selected.length}` : (RUN.hasJev ? " · step 0: no JEV, plain PUCT over the seeds" : " · picks are lineage-blocked (no JEV gate in this run)")}` }));
-    const c0 = CFG.puct_c || 1;
-    box.append(paramSlider("exploration constant c", 0, 20, 0.5, v => v.toFixed(1), () => P.c != null ? P.c : c0, (v, row) => setParam({ c: v }, row)));
-    const tbl = h("div"), jv = h("div");
+    box.append(h("div", { class: "sub" }, RUN.selection + " with lineage blocking"));
+    const c0 = CFG.puct_c ?? 1;
+    if (c0 !== 0) box.append(paramSlider("exploration constant c", 0, 20, 0.5, v => v.toFixed(1), () => P.c != null ? P.c : c0, (v, row) => setParam({ c: v }, row)));
+    const tbl = h("div");
     const draw = () => {
       tbl.innerHTML = "";
       const { rows, order } = pucRows(step);
@@ -98,69 +85,29 @@ const STAGE_VIZ = {
         { label: "made in", get: p => p.parent_is_seed ? "seed" : "step " + p.parent_timestep, num: true },
         { label: PROB.metric, get: p => fmt.raw(p.parent_raw_score), num: true },
         { label: "Q", get: p => fmt.f(p.q_value, 5), num: true },
-        { label: "explore", get: p => fmt.f(p.bonus2, 4), num: true, title: "c·scale·P·√(1+T)/(1+n)" },
+        { label: "explore", get: p => fmt.f(p.bonus2, 4), num: true, title: "Recorded exploration bonus scaled by c" },
         { label: "score", get: p => fmt.f(p.score2, 5), num: true },
         { label: "order", get: p => String(order.indexOf(p.group) + 1), num: true },
-        ...(RUN.hasJev ? [{ label: "JEV", get: p => { const d = (p.jev || {}).decision; return pill(d === "accepted" ? "accepted" : d === "no_comparison" ? "first pick" : d === "step_zero_puct" ? "PUCT only" : d || "?", d === "accepted" || d === "no_comparison" ? "good" : d === "duplicate_fallback" ? "warn" : ""); } }] : []),
       ], rows, { onRow: p => { setState({ tab: "search", group: p.group }); } })));
     };
     box.append(tbl);
-    if (jev && jev.decisions && jev.decisions.length) {
-      box.append(h("div", { style: { marginTop: "10px" } }, paramSlider("JEV same-core threshold", 0.3, 1, 0.01, v => v.toFixed(2), () => thrNow(step), (v, row) => setParam({ thr: v }, row))));
-      box.append(jv);
-      const drawJ = () => {
-        const r = jevReplay(step, thrNow(step)); jv.innerHTML = "";
-        jv.append(h("div", { class: "row-flex" }, pill(`recorded @ ${r.recorded}: ${r.recAcc} accepted · ${r.recRej} rejected`, "acc"), pill(`replay @ ${r.thr.toFixed(2)}: ${r.nAcc} accepted · ${r.nRej} rejected`, r.thr === r.recorded ? "good" : "warn"),
-          P.thr != null && P.thr !== r.recorded ? h("span", { class: "what-if" }, "what-if") : null));
-      };
-      drawJ(); onParam(p => { if ("thr" in p) drawJ(); });
-    }
     draw(); onParam(p => { if ("c" in p) draw(); });
-    box.append(h("p", { class: "sub", style: { marginTop: "8px" } }, (RUN.hasJev ? "These two controls are shared with the Search tab: moving them here changes the replay there and vice-versa. " : "The exploration constant is shared with the Search tab. ") + "Click a row to open the selection in the Search tab."));
-  },
-
-  async strategist(box, step) {
-    const slots = slotsOf(step);
-    if (!slots.length) { box.append(h("div", { class: "empty" }, "No strategist files for this step.")); return; }
-    const by = {}; slots.forEach(s => (by[s.g + ":" + s.s] = s));
-    const host = h("div", { class: "chart" }); box.append(host);
-    const fallbacks = slots.filter(s => s.fallback).length, tries = sum(slots.map(s => s.attempts.length));
-    box.append(h("div", { class: "kv", style: { marginTop: "10px" }, html:
-      `<div class="k">Slots</div><div class="v">${slots.length} (8 chains × 4)</div>` +
-      `<div class="k">Generation calls</div><div class="v">${tries} (${fmt.f(tries / slots.length, 2)} per slot)</div>` +
-      `<div class="k">Accepted first try</div><div class="v">${slots.filter(s => s.attempts.length && s.attempts[0].ok).length}</div>` +
-      `<div class="k">Fallback (no plan)</div><div class="v">${fallbacks} (${fmt.pct(fallbacks / slots.length, 0)})</div>` }));
-    const col = s => !s ? null : s.fallback ? cssVar("--crit") : s.attempts.length > 1 ? cssVar("--warn") : cssVar("--good");
-    heatmap(host, {
-      rows: range(0, 8).map(g => "parent " + g), cols: ["S0", "S1", "S2", "S3"], rowLabelW: 62, maxCell: 90, cellH: 30,
-      val: (i, j) => by[i + ":" + j] ? by[i + ":" + j].attempts.length || 1 : null,
-      color: (v, i, j) => col(by[i + ":" + j]),
-      text: (v, i, j) => by[i + ":" + j] ? (by[i + ":" + j].fallback ? "✕" : String(by[i + ":" + j].attempts.length)) : null,
-      textColor: () => "#0b0b0b",
-      tip: (i, j) => { const s = by[i + ":" + j]; if (!s) return null; return `<b>parent ${i} · strategy S${j}</b><div>${s.attempts.length} attempt(s): ${s.attempts.map(a => a.ok ? "✓" : "✗").join(" ")}</div><div>${s.fallback ? "fallback: coder got no plan" : "plan length " + fmt.n(s.block.length) + " chars"}</div><div class="mut">reasoning ${fmt.n(s.think_chars)} chars</div>`; },
-      onClick: (i, j) => setState({ tab: "strategist", group: i, sidx: j }),
-    });
-    box.append(legend([{ color: cssVar("--good"), label: "accepted first try" }, { color: cssVar("--warn"), label: "accepted after retries (number = attempts)" }, { color: cssVar("--crit"), label: "fallback ✕" }]));
-    box.append(h("p", { class: "sub" }, "Click a cell to read that strategy, its attempts and the prompt anatomy in the Strategist tab."));
+    box.append(h("p", { class: "sub", style: { marginTop: "8px" } }, "The exploration constant is shared with the Search tab. Click a row to open the selection there."));
   },
 
   async coder(box, step) {
     const rs = (RS[step] || []).filter(r => r.planned !== false);
     if (!rs.length) { box.append(h("div", { class: "empty" }, "No coder rollouts for this step yet.")); return; }
     const parents = [...new Set(rs.map(r => r.pg))].sort((a, b) => a - b);
-    const strategies = [...new Set(rs.map(r => r.sidx))].sort((a, b) => a - b);
-    const label = s => s == null ? "Direct" : "S" + s;
-    const cell = (i, j) => rs.filter(r => r.pg === parents[i] && r.sidx === strategies[j]);
-    const host = h("div", { class: "chart" }); box.append(host);
-    heatmap(host, {
-      rows: parents.map(g => "parent " + g), cols: strategies.map(label), rowLabelW: 62, maxCell: 90, cellH: 30,
-      val: (i, j) => { const c = cell(i, j); return c.length ? c.filter(r => r.valid).length / c.length : null; },
-      color: v => seqRamp(v), text: (v, i, j) => { const c = cell(i, j); return c.length ? c.filter(r => r.valid).length + "/" + c.length : null; },
-      textColor: v => v > 0.55 ? "#fff" : cssVar("--ink"),
-      tip: (i, j) => { const c = cell(i, j); const v = c.filter(r => r.valid); return `<b>parent ${parents[i]} · ${label(strategies[j])}</b><div>${v.length}/${c.length} valid</div><div>beat parent: ${c.filter(r => r.improved).length}</div><div>best bound: ${v.length ? fmt.raw(Math.min(...v.map(r => r.raw))) : "–"}</div><div class="mut">mean reward ${fmt.f(mean(c.map(r => r.reward)), 4)}</div>`; },
-      onClick: (i, j) => setState({ tab: "rollouts", group: parents[i], sidx: strategies[j] ?? 0 }),
+    const rows = parents.map(parent => {
+      const programs = rs.filter(r => r.pg === parent);
+      return { parent, total: programs.length, valid: programs.filter(r => r.valid).length };
     });
-    box.append(h("p", { class: "sub", style: { marginTop: "6px" } }, "Color shows the valid fraction among planned programs for each strategy."));
+    box.append(table([
+      { label: "parent", get: r => String(r.parent) },
+      { label: "programs", num: true, get: r => String(r.total) },
+      { label: "valid", num: true, get: r => String(r.valid) },
+    ], rows));
     const v = rs.filter(r => r.valid);
     box.append(h("div", { class: "kv", style: { marginTop: "8px" }, html:
       `<div class="k">Planned programs</div><div class="v">${rs.length}</div><div class="k">Valid</div><div class="v">${v.length} (${fmt.pct(v.length / rs.length)})</div>` +
@@ -267,7 +214,7 @@ const STAGE_VIZ = {
       `<div class="k">Archive after step</div><div class="v">${fmt.n(st.archive_size)} states (cap ${CFG.max_buffer_size})</div>` +
       `<div class="k">Best of step</div><div class="v">${fmt.raw(st.step_best_raw_score)}${st.best_seen_step === step ? " " + '<span class="pill good">new global best</span>' : ""}</div>` +
       `<div class="k">Best so far</div><div class="v">${fmt.raw(st.best_seen_raw_score)} (found in step ${st.best_seen_step})</div>` }));
-    box.append(h("p", { class: "sub", style: { marginTop: "8px" } }, "Only ≈63 of ~210 valid programs per step survive dedup + top-2 per (parent, strategy) + top-8 per parent. See the Search tab for how these states become tomorrow's parents."));
+    box.append(h("p", { class: "sub", style: { marginTop: "8px" } }, "The archive deduplicates exact source and applies the configured per-parent and global caps."));
   },
 };
 
@@ -282,20 +229,17 @@ function highlightStageByProgress(f) {
 
 /* columns / links of the programs flow for one step (counts from the real rollouts) */
 function flowData(step) {
-  const rs = RS[step] || [], strat = (D.strat && D.strat.strategies) || {};
+  const rs = RS[step] || [];
   const parents = [...new Set(rs.map(r => r.pg))].sort((a, b) => a - b);
   const adv = advIsWhatIf() ? advWhatIf : r => r.adv;
-  const plan = r => { const sl = strat[`${step}:${r.pg}:${r.sidx}`]; if (!sl) return "first"; return sl.fallback ? "fallback" : sl.attempts.length > 1 ? "retry" : "first"; };
   const result = r => !r.valid ? (r.fail === "timeout" ? "timeout" : "fail") : r.improved ? "beat" : "valid";
   const signal = r => { const a = adv(r); return a == null ? null : a < 0 ? "neg" : "pos"; };
   const NODES = {
-    plan: { first: ["Plan accepted 1st try", cssVar("--good")], retry: ["Plan after retries", cssVar("--warn")], fallback: ["No plan (fallback)", cssVar("--crit")] },
     result: { fail: ["Failed: no / broken code", S_COL(1)], timeout: ["Timeout", S_COL(3)], valid: ["Valid, not better", cssVar("--ink-3")], beat: ["Valid, beats parent", cssVar("--good")] },
     signal: { neg: ["A < 0: discouraged", cssVar("--crit")], pos: ["A > 0: reinforced", cssVar("--good")] },
   };
   const cols = [
     { title: "Parent", nodes: parents.map(g => ({ id: "p" + g, label: "parent " + g, color: S_COL(g) })) },
-    { title: "Strategist plan", nodes: Object.entries(NODES.plan).map(([k, [l, c]]) => ({ id: "plan:" + k, label: l, color: c })) },
     { title: "Coder", nodes: [{ id: "coder", label: "Programs", color: S_COL(0) }] },
     { title: "Result", nodes: Object.entries(NODES.result).map(([k, [l, c]]) => ({ id: "res:" + k, label: l, color: c })) },
     { title: "Training signal" + (advIsWhatIf() ? " (what-if)" : ""), nodes: Object.entries(NODES.signal).map(([k, [l, c]]) => ({ id: "sig:" + k, label: l, color: c })) },
@@ -303,9 +247,8 @@ function flowData(step) {
   const agg = {};
   const add = (s, t, v, color) => { const k = s + ">" + t; (agg[k] = agg[k] || { s, t, v: 0, color }).v += v; };
   rs.forEach(r => {
-    const a = "p" + r.pg, b = "plan:" + plan(r), d = "res:" + result(r), sg = signal(r);
-    add(a, b, 1, S_COL(r.pg));
-    add(b, "coder", 1, NODES.plan[plan(r)][1]);
+    const a = "p" + r.pg, d = "res:" + result(r), sg = signal(r);
+    add(a, "coder", 1, S_COL(r.pg));
     add("coder", d, 1, S_COL(0));
     if (sg) add(d, "sig:" + sg, 1, NODES.result[result(r)][1]);
   });

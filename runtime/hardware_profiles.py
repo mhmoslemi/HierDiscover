@@ -7,7 +7,6 @@ from pathlib import Path
 
 B200_MODEL_DIR = Path("/root/nas/Mohammad/models")
 B200_LOCAL_MODELS = {
-    "fastino/GLiDE-9B": "GLiDE-9B",
     "openai/gpt-oss-120b": "gpt-oss-120b",
     "Qwen/Qwen3.8-27B": "Qwen3.8-27B",
     "deepseek-ai/DeepSeek-R1-Distill-Qwen-32B": "DeepSeek-R1-Distill-Qwen-32B",
@@ -69,7 +68,6 @@ def restore_hardware_settings(merged, current_yaml, saved):
     if selected == "B200_full_ram" and previous != selected:
         # Saved low-RAM launch flags must not defeat the requested RTX policy.
         merged["reload_coder_between_phases"] = current_yaml.get("reload_coder_between_phases", False)
-        merged["strategy_vllm_persistent_workers"] = current_yaml.get("strategy_vllm_persistent_workers")
     if saved and previous != selected:
         for key, default in {
             "gen_micro_batch": "auto", "vllm_gpu_memory_utilization": "auto",

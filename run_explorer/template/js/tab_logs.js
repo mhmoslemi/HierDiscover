@@ -22,7 +22,7 @@ registerTab({
     cq.addEventListener("input", drawCfg); drawCfg();
     const setting = D.main.setting || [];
     root.append(h("div", { class: "grid g2" },
-      card("config.json", (RUN.hasJev ? "scalar settings · note: stale w.r.t. the JEV threshold (see Search tab)" : "scalar settings"), h("div", null, h("div", { style: { marginBottom: "8px" } }, cq), cbody)),
+      card("config.json", "scalar settings", h("div", null, h("div", { style: { marginBottom: "8px" } }, cq), cbody)),
       card("Startup banner", "from setting.log", setting.length ? h("pre", { class: "code", style: { maxHeight: "560px" } }, setting.join("\n")) : h("div", { class: "empty" }, "no setting.log"))));
 
     // event log

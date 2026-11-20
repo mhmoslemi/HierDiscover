@@ -1,1 +1,1 @@
-"""Rollout workers, strategist prompts and output recovery."""
+"""Rollout workers and output recovery."""

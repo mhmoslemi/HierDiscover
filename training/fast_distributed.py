@@ -16,7 +16,6 @@ MAX_STANDARD_TRAINING_MEMORY_FRACTION = 0.90
 LONG_ROLLOUT_MEMORY_FRACTION = 0.96
 LONG_ROLLOUT_MEMORY_FRACTIONS = (0.96, 0.98, 0.99)
 MAX_LONG_ROLLOUT_MEMORY_FRACTION = max(LONG_ROLLOUT_MEMORY_FRACTIONS)
-SHARED_PREFIX_WORK_KEY = "__ttt_shared_prefix_examples__"
 _FP32_BUCKET_ELEMENTS = 32 * 1024**2
 
 
@@ -48,35 +47,6 @@ def _shared_prefix_token_count(batch):
     return prompt + sum(max(
         0, int(example["response_ids"].shape[1]) - 1)
         for example in batch)
-
-
-def _take_shared_prefix_chunk(examples, token_budget, example_cap=64,
-                              singleton_predicate=None,
-                              packed_token_limit=None):
-    """Take the largest leading exact-prefix pack within the token budget."""
-    examples = list(examples)
-    if not examples:
-        return [], []
-    if singleton_predicate is not None and singleton_predicate(examples[0]):
-        return examples[:1], examples[1:]
-    prompt = int(examples[0]["prompt_ids"].shape[1])
-    used = prompt
-    count = 0
-    for example in examples:
-        if count and singleton_predicate is not None and singleton_predicate(
-                example):
-            break
-        contribution = max(0, int(example["response_ids"].shape[1]) - 1)
-        next_used = used + contribution
-        if count and (count >= int(example_cap)
-                      or next_used > int(token_budget)
-                      or (packed_token_limit is not None
-                          and next_used >= int(packed_token_limit))):
-            break
-        used = next_used
-        count += 1
-    count = max(1, count)
-    return examples[:count], examples[count:]
 
 
 def trainable_parameters(model):
@@ -498,22 +468,12 @@ def local_spo_rs_update(backend, model, tokenizer, examples, cfg, logical_id,
     else:
         # None is one end marker per rank. A single deferred example lets a rank
         # stop growing the current padded batch without putting work back or
-        # disturbing the global queue's exactly-once behavior. Strategy-mode
-        # work items contain every program sharing one prompt; keep the item on
-        # this rank and consume it in exact shared-prefix packs so no other rank
-        # independently evaluates that prompt.
+        # disturbing the global queue's exactly-once behavior.
         queue_finished = False
         deferred = None
-        prefix_remainder = []
 
         def take_batch():
-            nonlocal queue_finished, deferred, prefix_remainder
-            if prefix_remainder:
-                batch, prefix_remainder = _take_shared_prefix_chunk(
-                    prefix_remainder, packing_budget, max_examples_per_batch,
-                    singleton_predicate=needs_fused_long_singleton,
-                    packed_token_limit=fused_pack_limit())
-                return batch
+            nonlocal queue_finished, deferred
             if queue_finished and deferred is None:
                 return []
             if deferred is not None:
@@ -523,14 +483,6 @@ def local_spo_rs_update(backend, model, tokenizer, examples, cfg, logical_id,
                 if first is None:
                     queue_finished = True
                     return []
-            if (isinstance(first, dict)
-                    and SHARED_PREFIX_WORK_KEY in first):
-                batch, prefix_remainder = _take_shared_prefix_chunk(
-                    first[SHARED_PREFIX_WORK_KEY], packing_budget,
-                    max_examples_per_batch,
-                    singleton_predicate=needs_fused_long_singleton,
-                    packed_token_limit=fused_pack_limit())
-                return batch
             batch = [first]
             maximum = example_length(first)
             if needs_fused_long_singleton(first):
@@ -540,10 +492,6 @@ def local_spo_rs_update(backend, model, tokenizer, examples, cfg, logical_id,
                 candidate = work_queue.get()
                 if candidate is None:
                     queue_finished = True
-                    break
-                if (isinstance(candidate, dict)
-                        and SHARED_PREFIX_WORK_KEY in candidate):
-                    deferred = candidate
                     break
                 if needs_fused_long_singleton(candidate):
                     deferred = candidate
@@ -973,20 +921,11 @@ def local_policy_update(backend, model, tokenizer, examples, cfg, logical_id,
                 maximum = next_maximum
             return batch
     else:
-        # Strategy work items retain the complete shared prompt on one rank so
-        # the exact blockwise scorer evaluates that prompt only once per pack.
         queue_finished = False
         deferred = None
-        prefix_remainder = []
 
         def take_batch():
-            nonlocal queue_finished, deferred, prefix_remainder
-            if prefix_remainder:
-                batch, prefix_remainder = _take_shared_prefix_chunk(
-                    prefix_remainder, budget, max_examples_per_batch,
-                    singleton_predicate=needs_fused_long_singleton,
-                    packed_token_limit=fused_pack_limit())
-                return batch
+            nonlocal queue_finished, deferred
             if queue_finished and deferred is None:
                 return []
             if deferred is not None:
@@ -996,14 +935,6 @@ def local_policy_update(backend, model, tokenizer, examples, cfg, logical_id,
                 if first is None:
                     queue_finished = True
                     return []
-            if (isinstance(first, dict)
-                    and SHARED_PREFIX_WORK_KEY in first):
-                batch, prefix_remainder = _take_shared_prefix_chunk(
-                    first[SHARED_PREFIX_WORK_KEY], budget,
-                    max_examples_per_batch,
-                    singleton_predicate=needs_fused_long_singleton,
-                    packed_token_limit=fused_pack_limit())
-                return batch
             batch = [first]
             maximum = example_length(first)
             if needs_fused_long_singleton(first):
@@ -1013,10 +944,6 @@ def local_policy_update(backend, model, tokenizer, examples, cfg, logical_id,
                 candidate = work_queue.get()
                 if candidate is None:
                     queue_finished = True
-                    break
-                if (isinstance(candidate, dict)
-                        and SHARED_PREFIX_WORK_KEY in candidate):
-                    deferred = candidate
                     break
                 if needs_fused_long_singleton(candidate):
                     deferred = candidate
@@ -1512,8 +1439,6 @@ def worker_main(rank, world_size, cfg_dict, init_method, work_queue,
                 dist.destroy_process_group()
             except Exception:
                 pass
-
-
 
 
 def _move_optimizer_state(optimizer, device, *, hardware_profile="RTX6000") -> None:

@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import concurrent.futures as cf
 import datetime as _dt
-import glob
 import json
 import os
 import re
@@ -19,11 +18,7 @@ from collections import defaultdict
 
 ANSI_RE = re.compile(r"\x1b\[[0-9;]*m|\[(?:\d{1,3};)*\d{1,3}m")
 CODE_RE = re.compile(r"```python\s*\n(.*?)```", re.S)
-STRAT_RE = re.compile(r"<strategy>(.*?)</strategy>", re.S)
-FALLBACK_MARK = "No usable strategy was returned"
 ROLLOUT_META_RE = re.compile(r"step(\d+)_group(\d+)_rollout(\d+)\.meta\.json$")
-ATTEMPT_META_RE = re.compile(r"step(\d+)_group(\d+)_fold(\d+)_strategy(\d+)_attempt(\d+)\.meta\.json$")
-STRAT_FILE_RE = re.compile(r"step(\d+)_group(\d+)_fold(\d+)_strategy(\d+)\.txt$")
 
 
 def _jload(path, default=None):
@@ -40,34 +35,6 @@ def _read(path, default=""):
             return fh.read()
     except Exception:
         return default
-
-
-def _byte_level_map():
-    """Inverse of the GPT-2 byte -> printable-character table (what 'Ġ' and 'Ċ' come from)."""
-    bs = list(range(33, 127)) + list(range(161, 173)) + list(range(174, 256))
-    cs, n = bs[:], 0
-    for b in range(256):
-        if b not in bs:
-            bs.append(b); cs.append(256 + n); n += 1
-    return {chr(c): b for b, c in zip(bs, cs)}
-
-
-_BYTE_LEVEL = _byte_level_map()
-
-
-def debyte(text):
-    """Some strategist outputs were saved as raw byte-level tokens ('ĊĠApproachĠandĠRationale'); turn them back into text.
-    Only touches text that clearly has that form (several 'Ġ'/'Ċ' markers and almost no real spaces)."""
-    if not text or text.count("\u0120") + text.count("\u010a") < 4 or text.count(" ") > text.count("\u0120"):
-        return text
-    raw = bytearray()
-    for ch in text:
-        b = _BYTE_LEVEL.get(ch)
-        if b is None:
-            raw.extend(ch.encode("utf-8"))
-        else:
-            raw.append(b)
-    return raw.decode("utf-8", errors="replace")
 
 
 def _sig(x, digits=6):
@@ -112,7 +79,7 @@ def parse_construction(s, limit=None):
 def _scan_step(args):
     run_dir, step = args
     sd = os.path.join(run_dir, "step%02d" % step)
-    out = {"step": step, "rollouts": [], "strategies": {}, "files": 0}
+    out = {"step": step, "rollouts": [], "files": 0}
     names = os.listdir(sd)
     out["files"] = len(names)
 
@@ -126,7 +93,6 @@ def _scan_step(args):
             continue
         cons = meta.get("construction") or ""
         n_len = (cons.count(",") + 1) if cons.startswith("[") and len(cons) > 2 else 0
-        strat = meta.get("strategy") or ""
         rec = {
             "step": step,
             "file_group": int(m.group(2)),
@@ -134,7 +100,6 @@ def _scan_step(args):
             "group": meta.get("group"),
             "pgroup": meta.get("parent_group"),
             "rollout": meta.get("rollout"),
-            "sidx": meta.get("strategy_index"),
             "node": meta.get("node_id"),
             "parent": meta.get("parent_id"),
             "raw": _sig(meta.get("raw_score"), 9),
@@ -152,93 +117,12 @@ def _scan_step(args):
             "planned": not meta.get("retry_attempt"),
             "pval": _sig(meta.get("parent_value"), 9),
             "praw": _sig(meta.get("parent_raw_score"), 9),
-            "fallback": FALLBACK_MARK in strat,
             "stdout": (meta.get("sandbox_stdout") or "")[:1200],
             "arch": bool(meta.get("archive_eligible")),
         }
         out["rollouts"].append(rec)
 
-    # --- strategist responses and historical attempt records --------------------------
-    attempts = defaultdict(list)
-    for name in names:
-        m = ATTEMPT_META_RE.search(name)
-        if not m:
-            continue
-        g, fo, s, a = (int(x) for x in m.groups()[1:])
-        meta = _jload(os.path.join(sd, name), {})
-        base = name[: -len(".meta.json")]
-        try:
-            resp_chars = os.path.getsize(os.path.join(sd, base + ".txt"))
-            prompt_chars = os.path.getsize(os.path.join(sd, base + ".prompt.txt"))
-        except OSError:
-            resp_chars = prompt_chars = 0
-        attempts[(g, s)].append({
-            "a": a,
-            "ok": bool(meta.get("accepted")),
-            "issue": meta.get("extraction_issue"),
-            "rc": resp_chars,
-            "pc": prompt_chars,
-        })
-    for name in names:
-        m = STRAT_FILE_RE.search(name)
-        if not m:
-            continue
-        g, fo, s = (int(x) for x in m.groups()[1:])
-        path = os.path.join(sd, name)
-        base = path[:-len(".txt")]
-        txt = debyte(_read(path))
-        think, ans = split_think(txt)
-        sm = STRAT_RE.search(txt)
-        block = sm.group(1).strip() if sm else ""
-        fallback = FALLBACK_MARK in block
-        verdict = _jload(base + ".meta.json")
-        if isinstance(verdict, dict):
-            ptxt = _read(base + ".prompt.txt")
-            att = [{
-                "a": 0,
-                "ok": bool(verdict.get("accepted")),
-                "issue": verdict.get("extraction_issue"),
-                "rc": verdict.get("response_chars", len(txt)),
-                "pc": len(ptxt),
-            }]
-        else:
-            att = sorted(attempts.get((g, s), []), key=lambda r: r["a"])
-            ptxt = _read(base + "_attempt%02d.prompt.txt" % att[-1]["a"]) if att else ""
-        anat = prompt_anatomy(ptxt) if ptxt else None
-        out["strategies"]["%d:%d" % (g, s)] = {
-            "g": g, "s": s,
-            "block": block,
-            "think_head": think[:2500],
-            "think_tail": think[-1200:] if len(think) > 3700 else "",
-            "think_chars": len(think),
-            "chars": len(txt),
-            "fallback": fallback,
-            "attempts": att,
-            "anat": anat,
-        }
     return out
-
-
-def prompt_anatomy(p):
-    """Split a strategist prompt into labelled pieces so the UI can show the 'anatomy'."""
-    if not p:
-        return None
-    marks = [
-        ("task", 0),
-        ("sota_hint", p.find("A previous state of the art")),
-        ("parent_program", p.find("Your previous program achieved")),
-        ("rules", p.find("Rules:\n- You must define")),
-        ("prev_strategies", p.find("## Strategy-stage output")),
-        ("contract", p.find("## Mandatory final-output contract")),
-    ]
-    marks = [(k, v) for k, v in marks if v >= 0]
-    marks.sort(key=lambda kv: kv[1])
-    pieces = []
-    for i, (k, start) in enumerate(marks):
-        end = marks[i + 1][1] if i + 1 < len(marks) else len(p)
-        pieces.append([k, end - start])
-    prev = len(re.findall(r"<previous_strategy_\d+>", p))
-    return {"total": len(p), "pieces": pieces, "prev_strategies": prev}
 
 
 # ----------------------------------------------------------------------------------------
@@ -293,11 +177,6 @@ def parse_terminal_log(path, max_lines=4000):
         if "[checkpoint] completed step" in clean:
             kind = "ckpt"
             stn = int(re.search(r"completed step (\d+)", clean).group(1))
-        elif "[puct-jev] step" in clean and "parents;" in clean:
-            kind = "jev"
-            stn = int(re.search(r"\[puct-jev\] step (\d+)", clean).group(1))
-        elif "two-stage coding" in clean:
-            kind = "coding_start"
         elif "vLLM logprobs" in clean:
             kind = "logprobs"
         elif ("SPO-RS evaluation/training overlap started" in clean
@@ -310,7 +189,7 @@ def parse_terminal_log(path, max_lines=4000):
         if kind and stn is not None:
             anchors.append((i, secs, kind, stn))
         # keep human-meaningful events
-        if tag in ("train-memory", "gpu", "pool", "puct-jev", "checkpoint", "resume", "init", "train-fast",
+        if tag in ("train-memory", "gpu", "pool", "checkpoint", "resume", "init", "train-fast",
                    "train-oom", "host-memory", "runtime", "startup", "precision") or st:
             events.append({"i": i, "t": mt.group(0)[1:9], "tag": tag, "s": stn, "txt": clean[11:][:420]})
     if len(events) > max_lines:
@@ -338,28 +217,23 @@ def parse_terminal_log(path, max_lines=4000):
     for stn in sorted(by_step):
         a = by_step[stn]
         start = prev_ckpt if prev_ckpt else first_ts
-        jev = a.get("jev") or a.get("pick")
-        cs = a.get("coding_start")
+        pick = a.get("pick")
         gd = a.get("gen_done")
         lp = a.get("logprobs")
         gen_end = gd or lp
         tr = a.get("train_start")
         ck = a.get("ckpt")
-        if start and jev:
-            # when the run was resumed mid-step, restart the clock at the last resume before the jev line
-            rs = [r for r in resume_idx if start[0] < r[0] < jev[0]]
+        if start and pick:
+            # when the run was resumed mid-step, restart the clock at the last resume before parent selection
+            rs = [r for r in resume_idx if start[0] < r[0] < pick[0]]
             if rs:
                 start = rs[-1]
         ph = {}
         try:
-            if start and jev:
-                ph["select"] = delta(start[1], jev[1])
-            if jev and cs:
-                ph["strategist"] = delta(jev[1], cs[1])
-            if cs and gen_end:
-                ph["coder"] = delta(cs[1], gen_end[1])
-            if jev and gen_end and not cs:
-                ph["strategist+coder"] = delta(jev[1], gen_end[1])
+            if start and pick:
+                ph["select"] = delta(start[1], pick[1])
+            if pick and gen_end:
+                ph["coder"] = delta(pick[1], gen_end[1])
             if lp and tr:
                 ph["scoring"] = delta(lp[1], tr[1])
             elif gd and lp:
@@ -402,12 +276,11 @@ def parse_hardware(run_dir, config, steps):
     n = int(c.get("num_gpus") or len(ids) or 0)
     hw = {"n_gpus": n, "gpu_ids": ids, "profile": c.get("hardware_profile") or "", "profile_defaulted": not c.get("hardware_profile")}
     totals, caps = Counter(), Counter()
-    for fn in ("vllm.log", "strategy_vllm.log"):
-        txt = _read_head(os.path.join(run_dir, fn))
-        for m in re.finditer(r"Free memory on device \(([\d.]+)/([\d.]+) GiB\)", txt):
-            totals[float(m.group(2))] += 1
-        for m in re.finditer(r"Device capability ([\d.]+)", txt):
-            caps[m.group(1)] += 1
+    txt = _read_head(os.path.join(run_dir, "vllm.log"))
+    for m in re.finditer(r"Free memory on device \(([\d.]+)/([\d.]+) GiB\)", txt):
+        totals[float(m.group(2))] += 1
+    for m in re.finditer(r"Device capability ([\d.]+)", txt):
+        caps[m.group(1)] += 1
     hw["mem_gib"] = totals.most_common(1)[0][0] if totals else None
     hw["capability"] = caps.most_common(1)[0][0] if caps else None
     setting = _read_head(os.path.join(run_dir, "setting.log"), 400000)
@@ -421,9 +294,6 @@ def parse_hardware(run_dir, config, steps):
     m = re.search(r"vLLM engines: (\d+) replica\(s\), TP=(\d+), PP=(\d+), (\d+) GPU\(s\)/engine", setting)
     if m:
         hw["coder_engines"], hw["coder_tp"] = int(m.group(1)), int(m.group(2))
-    m = re.search(r"strategy model [^\n]*?: (\d+) vLLM replica\(s\), TP=(\d+)", setting)
-    if m:
-        hw["strategist_engines"], hw["strategist_tp"] = int(m.group(1)), int(m.group(2))
     m = re.search(r"steady-state total=([\d.]+) GiB/GPU", setting)
     if m:
         hw["assumed_mem_gib"] = float(m.group(1))
@@ -462,7 +332,7 @@ def parse_setting_block(path):
     out = []
     started = False
     for ln in txt.splitlines():
-        if "Strategist Bandit" in ln and "=====" not in ln and not started:
+        if "Single-Model Discovery" in ln and "===" not in ln and not started:
             started = True
         if started:
             out.append(ANSI_RE.sub("", ln)[11:] if TS_RE.match(ln) else ANSI_RE.sub("", ln))
@@ -533,19 +403,16 @@ def collect(run_dir, code_per_step=25, all_code=False, think_full=False, progres
     with cf.ProcessPoolExecutor(max_workers=workers) as ex:
         for res in ex.map(_scan_step, [(run_dir, s) for s in steps_idx]):
             scans[res["step"]] = res
-            log("scanned step %02d: %d files, %d rollouts, %d strategies" %
-                (res["step"], res["files"], len(res["rollouts"]), len(res["strategies"])))
+            log("scanned step %02d: %d files, %d rollouts" %
+                (res["step"], res["files"], len(res["rollouts"])))
 
     # ---- assemble step records ----------------------------------------------------------
     steps = []
     rollouts = []
-    strategies = {}
-    jev_sources = {}  # node id -> code, from jev.json
     for s in steps_idx:
         sd = os.path.join(run_dir, "step%02d" % s)
         summ = _jload(os.path.join(sd, "step%02d.summary.json" % s))
         parents = _jload(os.path.join(sd, "step%02d.parents.json" % s))
-        jev = _jload(os.path.join(sd, "step%02d.jev.json" % s))
         best = _jload(os.path.join(sd, "step%02d.best.json" % s))
         rec = {"step": s, "completed": bool(summ and summ.get("completed")), "partial": summ is None}
         if summ:
@@ -576,23 +443,6 @@ def collect(run_dir, code_per_step=25, all_code=False, think_full=False, progres
             if isinstance(rollout_config, dict):
                 rollout_config.pop(legacy_coder_cap, None)
             rec["rollout_config"] = rollout_config
-        if jev:
-            for nid, code in (jev.get("sources") or {}).items():
-                jev_sources.setdefault(nid, code)
-            rec["jev"] = {
-                "threshold": jev.get("threshold"),
-                "requested": jev.get("requested"),
-                "candidate_multiplier": jev.get("candidate_multiplier"),
-                "candidate_limit": jev.get("candidate_limit"),
-                "comparisons": jev.get("comparisons") or [],
-                "decisions": jev.get("decisions") or [],
-                "picks_info": [
-                    {k: v for k, v in p.items() if k != "jev"} for p in (jev.get("picks_info") or [])
-                ],
-                "selected": jev.get("selected") or [],
-                "question": jev.get("question"),
-                "seeds": [x.get("id") for x in (jev.get("seeds") or [])],
-            }
         if best:
             rec["result_metric_name"] = best.get("metric_name")
             rec["result_maximize"] = bool(best.get("maximize"))
@@ -607,9 +457,6 @@ def collect(run_dir, code_per_step=25, all_code=False, think_full=False, progres
             rec["_best_full"] = best
         steps.append(rec)
         rollouts.extend(scans[s]["rollouts"])
-        for k, v in scans[s]["strategies"].items():
-            strategies["%d:%s" % (s, k)] = v
-
     # global rollout ids, stable order
     rollouts.sort(key=lambda r: (r["step"], r["file_group"], r["file_rollout"]))
     for i, r in enumerate(rollouts):
@@ -678,32 +525,6 @@ def collect(run_dir, code_per_step=25, all_code=False, think_full=False, progres
         rec["valid_fraction"] = len(good) / max(1, len(rs))
         rec["best_seen_raw_score"], rec["best_seen_reward"], rec["best_seen_step"] = prev_best
         rec["log_best_ever"] = (lg or {}).get("best_ever")
-    # the PUCT candidate window of every JEV step (the part the gate never compared), rebuilt by replaying the sampler's rules
-    try:
-        from archive_sim import reconstruct_windows
-        eligible = [r for r in rollouts if r.get("arch") and r.get("reward_full") is not None]
-        cache = {}
-
-        def _code_of(r):
-            sd = os.path.join(run_dir, "step%02d" % r["step"])
-            base = "step%02d_group%02d_rollout%03d.txt" % (r["step"], r["file_group"], r["file_rollout"])
-            th, ans = split_think(_read(os.path.join(sd, base)))
-            return extract_code(ans or _read(os.path.join(sd, base))) or ""
-        if any((s.get("jev") or {}).get("decisions") for s in steps):
-            with cf.ThreadPoolExecutor(max_workers=8) as ex:
-                for r, code in zip(eligible, ex.map(_code_of, eligible)):
-                    cache[(r["step"], r["file_group"], r["file_rollout"])] = code
-            wins = reconstruct_windows(run_dir, config, root_ids, steps, rollouts,
-                                       lambda r: cache.get((r["step"], r["file_group"], r["file_rollout"]), ""), log=log)
-            for s in steps:
-                w = wins.get(s["step"])
-                if w and s.get("jev"):
-                    s["jev"]["window"], s["jev"]["window_score"], s["jev"]["window_ok"] = w["window"], w["score"], w["ok"]
-                    for wid in w["window"]:               # make their code / construction available in the explorer
-                        if wid in node_to_rid:
-                            want.add(node_to_rid[wid])
-    except Exception as e:      # the window is a bonus: never break the build for it
-        log("window reconstruction failed: %r" % (e,))
     for st, rs in by_step_rollouts.items():
         good = [r for r in rs if r["valid"] and r["raw"]]
         good.sort(key=lambda r: r["raw"])  # lower is better for AC1; harmless if maximise (we embed both ends)
@@ -735,13 +556,6 @@ def collect(run_dir, code_per_step=25, all_code=False, think_full=False, progres
             if cons:
                 cons_blob[rid] = [_sig(x, 7) for x in cons]
             rollouts[rid]["think_chars"] = tl
-
-    # parents that are not rollouts (seeds): code from jev sources
-    seed_code = {}
-    for nid in selected_nodes:
-        if nid not in node_to_rid and nid in jev_sources:
-            seed_code[nid] = jev_sources[nid]
-    # also seeds' construction not available -> skip
 
     # best-so-far full snapshots (code + construction): from stepNN.best.json when it exists, otherwise
     # reconstructed from the rollouts (some runs only write best.json for a few steps)
@@ -778,9 +592,9 @@ def collect(run_dir, code_per_step=25, all_code=False, think_full=False, progres
                          "reward": best_snaps[-1]["reward"], "n": len(best_snaps[-1]["construction"]), "is_seed": False}
 
     # slim rollouts into columnar form
-    cols = ["id", "step", "group", "pgroup", "rollout", "sidx", "phase", "node", "parent", "raw", "reward",
+    cols = ["id", "step", "group", "pgroup", "rollout", "phase", "node", "parent", "raw", "reward",
             "valid", "parsed", "ran", "fail", "msg", "adv", "ntok", "n", "planned", "counts", "pval", "praw",
-            "fallback", "arch", "think_chars", "effort"]
+            "arch", "think_chars", "effort"]
     rows = []
     for r in rollouts:
         rows.append([r.get(c) for c in cols])
@@ -825,15 +639,13 @@ def collect(run_dir, code_per_step=25, all_code=False, think_full=False, progres
         "code": {str(k): v for k, v in code_blob.items()},
         "cons": {str(k): v for k, v in cons_blob.items()},
         "stdout": {str(k): v for k, v in stdout_map.items()},
-        "seed_code": seed_code,
         "best": best_snaps,
     }
-    strat_blob = {"strategies": strategies}
     log_blob = {"events": events}
     log("done")
-    return main, heavy, strat_blob, log_blob
+    return main, heavy, log_blob
 
 
 if __name__ == "__main__":
-    m, h, s, l = collect(sys.argv[1])
-    print({k: len(json.dumps(v)) for k, v in dict(main=m, heavy=h, strat=s, log=l).items()})
+    m, h, l = collect(sys.argv[1])
+    print({k: len(json.dumps(v)) for k, v in dict(main=m, heavy=h, log=l).items()})

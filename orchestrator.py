@@ -1,6 +1,6 @@
 """TTT-Discover multi-problem runner with entropic and SPO-RS training.
 
-Configuration: saved settings, current YAML rollout/strategy controls, then CLI.
+Configuration: saved settings, current YAML rollout controls, then CLI.
 Entropic training uses adaptive-beta, leave-one-out group advantages.
 SPO-RS uses a historical run-wide baseline and clipped policy updates.
 """
@@ -475,92 +475,6 @@ def _load_training_checkpoint(exp_dir, *, mmap=False):
     return payload
 
 
-def _migrate_parent_selection(sampler, cfg, exp_dir, next_step, adapter_path,
-                              optimizer, spo_rs_tracker, *, recovery_pending,
-                              problem=None):
-    """Switch only before fresh selection, preserving the complete training state."""
-    if sampler.selection_mode == cfg.parent_selection:
-        return sampler
-    from search.sampler import can_migrate_parent_selection, make_sampler
-    if not can_migrate_parent_selection(sampler.selection_mode, cfg.parent_selection):
-        raise ValueError("unsupported resume parent-selection change")
-    parents_path = Path(exp_dir) / f"step{next_step:02d}" / f"step{next_step:02d}.parents.json"
-    frozen_parents_path = Path(exp_dir) / "frozen_solver" / parents_path.parent.name / parents_path.name
-    if recovery_pending or parents_path.exists() or frozen_parents_path.exists():
-        print(f"[resume] finishing interrupted step {next_step} with "
-              f"{sampler.selection_mode.upper()}; "
-              f"{cfg.parent_selection.upper()} starts at the next fresh step",
-              flush=True)
-        return sampler
-    migrated = make_sampler(
-        parent_selection=cfg.parent_selection, num_seeds=0,
-        exp_dir=exp_dir, problem=problem, puct_c=sampler.puct_c,
-        max_buffer_size=sampler.max_buffer_size, topk_children=sampler.topk_children,
-        jev_model_path=getattr(cfg, "jev_model_path", None),
-        jev_candidate_multiplier=getattr(cfg, "jev_candidate_multiplier", 3),
-        jev_same_core_threshold=getattr(cfg, "jev_same_core_threshold", 0.68),
-    )
-    migrated.load_state_dict(dict(sampler.state_dict(), selection_mode=cfg.parent_selection))
-    # Persist intent first: a crash before checkpoint replacement repeats the
-    # migration, never recovers new-picker decisions with the legacy picker.
-    path = Path(exp_dir) / "config.json"
-    saved = json.loads(path.read_text())
-    saved.update(parent_selection=cfg.parent_selection, uct=False)
-    tmp = path.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(saved, indent=2) + "\n")
-    tmp.replace(path)
-    _save_training_checkpoint(exp_dir, next_step, adapter_path, migrated, optimizer, spo_rs_tracker)
-    print(f"[resume] {sampler.selection_mode.upper()} -> "
-          f"{cfg.parent_selection.upper()} at step {next_step}; "
-          "archive, adapter, optimizer and SPO tracker preserved", flush=True)
-    return migrated
-
-
-def _configure_jev_sampler(sampler, cfg, backend, optimizer, parallel_trainer,
-                           gen_pool, strategy_pool, prepare_trainer):
-    """Give the transient judge the same GPU handoff as generation."""
-    if sampler.selection_mode != "puct-jev":
-        return
-    sampler.gpu_id = _parse_gpu_ids(cfg.gpu_ids)[0]
-    sampler.host_memory_admission = (
-        getattr(parallel_trainer, "host_memory_admission", None)
-        or getattr(gen_pool, "host_memory_admission", None))
-
-    def before():
-        if cfg.generation_backend == "vllm":
-            from generation.gen_workers import PhasedVLLMGenerationPool
-            # Full-RAM B200 can retain backups while the small judge runs.
-            for pool in (strategy_pool, gen_pool):
-                if isinstance(pool, PhasedVLLMGenerationPool):
-                    if getattr(cfg, "hardware_profile", "RTX6000") == "B200_full_ram":
-                        pool.release()
-                    else:
-                        pool.shutdown()
-            if prepare_trainer is None:
-                raise RuntimeError("puct-jev has no configured trainer/GPU handoff")
-            prepare_trainer("jev")
-        elif parallel_trainer is not None:
-            parallel_trainer.offload_for_generation(
-                disk_directory=getattr(cfg, "trainer_offload_dir", None))
-        else:
-            _move_optimizer_state(optimizer, "cpu", hardware_profile=getattr(cfg, "hardware_profile", "RTX6000"))
-            backend.offload_for_generation(
-                disk_directory=getattr(cfg, "trainer_offload_dir", None))
-        print(f"[puct-jev] loading GLiDE-9B on GPU {sampler.gpu_id}", flush=True)
-
-    def after():
-        if cfg.generation_backend != "vllm":
-            if parallel_trainer is not None:
-                parallel_trainer.restore_after_generation()
-            else:
-                backend.restore_after_generation()
-                _restore_optimizer_state_to_parameters(optimizer)
-                backend.set_training_mode()
-        print("[puct-jev] GLiDE worker exited; GPU released", flush=True)
-
-    sampler.before_judge, sampler.after_judge = before, after
-
-
 def _legacy_resume_info(exp_dir):
     """Locate the safe restart point for a pre-checkpoint run directory."""
     matches = []
@@ -679,21 +593,6 @@ def _complete_unfinished_rollout_paths(exp_dir, step_idx, cfg):
         return None
     paths = sorted(step_dir.glob(f"step{step_idx:02d}_group*_rollout*.meta.json"))
     parent_count = int(cfg.groups_per_step)
-    if getattr(cfg, "frozen_solver", False):
-        if not _frozen_archive_path(exp_dir, step_idx).is_file():
-            return None
-        frozen_dir = Path(exp_dir) / "frozen_solver" / step_dir.name
-        parents_name = f"step{step_idx:02d}.parents.json"
-        try:
-            parent_count = len(json.loads((step_dir / parents_name).read_text())["parents"])
-            frozen_parent_count = len(json.loads((frozen_dir / parents_name).read_text())["parents"])
-            frozen_paths = list(frozen_dir.glob(f"step{step_idx:02d}_group*_rollout*.meta.json"))
-            if len(frozen_paths) != frozen_parent_count * int(cfg.frozen_programs_per_parent):
-                return None
-            if any(json.loads(path.read_text()).get("status") != "evaluated" for path in frozen_paths):
-                return None
-        except (OSError, KeyError, TypeError, ValueError, AttributeError):
-            return None
     expected = parent_count * int(cfg.group_size)
     if len(paths) > expected:
         raise RuntimeError(
@@ -1064,7 +963,7 @@ def _finalize_pending_spo_rs_artifacts(
     if token_summary["exact_sidecars"] != len(artifacts):
         raise RuntimeError("generated-step recovery refuses non-exact response token IDs")
 
-    parents = sampler.sample_states(int(cfg.groups_per_step), selection_step=step_idx)
+    parents = sampler.sample_states(int(cfg.groups_per_step))
     parents_path = (Path(exp_dir) / f"step{int(step_idx):02d}" / f"step{int(step_idx):02d}.parents.json")
     try:
         saved_parent_rows = json.loads(parents_path.read_text(encoding="utf-8"))["parents"]
@@ -1381,7 +1280,7 @@ def _rebind_saved_step_zero_parents(sampler, by_group, count):
 
 
 def _rebind_interrupted_step_zero_selection(sampler, exp_dir, parents):
-    """Restore seed UUIDs saved after planning but before any coder rollout."""
+    """Restore seed UUIDs saved after parent selection and before coder rollout."""
     path = Path(exp_dir) / "step00" / "step00.parents.json"
     if not path.exists():
         return
@@ -1412,7 +1311,7 @@ def _rebind_interrupted_step_zero_selection(sampler, exp_dir, parents):
 def _resume_spo_rs_step_from_artifacts(
         model, tokenizer, sampler, step_idx, cfg, exp_dir,
         problem, parallel_trainer, spo_rs_tracker, sampling_adapter_path,
-        artifacts, evaluation_complete=None, frozen_pass=None):
+        artifacts, evaluation_complete=None):
     """Finish one interrupted SPO-RS step from its durable evaluations."""
     import torch
     from experiment_io import load_rollout_logprobs, save_best_state_snapshot, save_rollout
@@ -1433,10 +1332,10 @@ def _resume_spo_rs_step_from_artifacts(
         by_group.setdefault(int(item["meta"]["group"]), []).append(item)
     parents = _rebind_saved_step_zero_parents(
         sampler, by_group, int(cfg.groups_per_step)
-    ) if step_idx == 0 and frozen_pass is None else None
+    ) if step_idx == 0 else None
     if parents is None:
         parents = sampler.sample_states(
-            int(cfg.groups_per_step), selection_step=step_idx)
+            int(cfg.groups_per_step))
     else:
         print(
             f"[resume] restored {len(parents)} saved step-zero seed parents; "
@@ -1736,8 +1635,6 @@ def _resume_spo_rs_step_from_artifacts(
         )
 
     step_states = [child for child, _parent in all_children]
-    if frozen_pass is not None and frozen_pass["best"] is not None:
-        step_states.append(SimpleNamespace(**frozen_pass["best"]))
     step_best = _step_best_candidate(step_states, problem.maximize)
     best_seen = (sampler.best_raw_state(maximize=bool(problem.maximize)) or sampler.best_state())
     best_snapshot_path = save_best_state_snapshot(
@@ -1779,8 +1676,6 @@ def _resume_spo_rs_step_from_artifacts(
         "recovered_evaluated_step": True,
         "recovered_rollouts": len(artifacts),
     }
-    if frozen_pass is not None:
-        stats.update(frozen_pass["stats"])
     if hybrid_mode:
         stats["hybrid_reference_kl_mean"] = hybrid_reference_mean
         stats["hybrid_spo_weight"] = cfg.hybrid_spo_weight
@@ -1839,7 +1734,7 @@ def _automatic_sandbox_memory_limit_bytes(concurrent_sandboxes: int) -> int:
 
 
 def _open_reward_pool(cfg, problem, rollout_count, step_idx, gen_pool,
-                      parallel_trainer, *, label=""):
+                      parallel_trainer):
     from concurrent.futures import Future, ThreadPoolExecutor
     from queue import Queue
     from problems.base import RewardResult
@@ -1870,7 +1765,7 @@ def _open_reward_pool(cfg, problem, rollout_count, step_idx, gen_pool,
         n_reward_workers = max(1, min(rollout_count, isolated_capacity))
         isolated_memory_limit_bytes = (_automatic_sandbox_memory_limit_bytes(n_reward_workers))
         setting_log_only(
-            f"[step {step_idx}] {label}isolated evaluation pool: "
+            f"[step {step_idx}] isolated evaluation pool: "
             f"{n_reward_workers} sandbox process(es) across "
             f"{isolated_cpu_count} CPU(s), up to "
             f"{isolated_processes_per_cpu}/CPU from reward_workers; each "
@@ -1883,7 +1778,7 @@ def _open_reward_pool(cfg, problem, rollout_count, step_idx, gen_pool,
             "stdout+stderr capture is bounded")
     else:
         n_reward_workers = _resolve_reward_workers(cfg, problem)
-        print(f"[step {step_idx}] {label}evaluation pool: {n_reward_workers} worker(s), "
+        print(f"[step {step_idx}] evaluation pool: {n_reward_workers} worker(s), "
               f"{getattr(problem, 'eval_cpus', 1)} CPU(s) per candidate")
     reward_pool = ThreadPoolExecutor(max_workers=n_reward_workers)
 
@@ -1986,238 +1881,8 @@ def _step_best_candidate(states, maximize):
                default=None)
 
 
-def _frozen_archive_path(exp_dir, step_idx):
-    return Path(exp_dir) / "frozen_solver" / f"step{step_idx:02d}" / "archive.pt"
-
-
-def _restore_frozen_archive(sampler, exp_dir, step_idx):
-    import torch
-
-    path = _frozen_archive_path(exp_dir, step_idx)
-    if not path.is_file():
-        return None
-    payload = torch.load(path, map_location="cpu", weights_only=False)
-    if (not isinstance(payload, dict) or payload.get("version") != 1
-            or payload.get("step") != step_idx):
-        raise ValueError(f"invalid frozen solver archive checkpoint: {path}")
-    sampler.load_state_dict(payload["sampler"])
-    print(f"[step {step_idx}] restored archive after frozen solver evaluation", flush=True)
-    return payload
-
-
-def _run_frozen_search_pass(backend, model, tokenizer, sampler, optimizer,
-                            step_idx, cfg, exp_dir, problem, gen_pool,
-                            strategy_pool, parallel_trainer):
-    """Evaluate and archive the frozen solver's complete batch before sampling coder parents."""
-    import torch
-    from concurrent.futures import ThreadPoolExecutor
-    from experiment_io import save_parent_selections, save_rollout, save_rollout_artifacts
-    from generation.gen_workers import native_final_answer_scope
-    from search.sampler import State
-
-    restored = _restore_frozen_archive(sampler, exp_dir, step_idx)
-    if restored is not None:
-        return restored
-
-    frozen_dir = Path(exp_dir) / "frozen_solver"
-    is_trimul = getattr(problem, "problem_type", "") == "trimul"
-    isolated_batch = trimul_evaluation.completed_batch(frozen_dir, step_idx) if is_trimul else None
-    parents = sampler.sample_states(int(cfg.groups_per_step), selection_step=step_idx,
-                                    selection_root=frozen_dir)
-    if step_idx == 0:
-        _rebind_interrupted_step_zero_selection(sampler, frozen_dir, parents)
-    if isolated_batch is not None:
-        trimul_evaluation.check_parents(frozen_dir, step_idx, parents)
-    count = int(cfg.frozen_programs_per_parent)
-    sampler_type = ("UCTSampler" if sampler.use_uct else type(sampler).__name__)
-    save_parent_selections(
-        frozen_dir, step_idx, sampler_type, parents, sampler.last_picks_info, rollout_config=cfg)
-    print(f"[step {step_idx}] frozen solver picked {len(parents)} parents, "
-          f"{count} programs each", flush=True)
-
-    parent_ctxs = [_parent_context(parent) for parent in parents]
-    try:
-        prompts = [
-            tokenizer.apply_chat_template(
-                problem.build_prompt(context), tokenize=False, add_generation_prompt=True,
-                enable_thinking=cfg.strategy_thinking, reasoning_effort=cfg.strategy_reasoning_effort)
-            for context in parent_ctxs
-        ]
-    except TypeError as exc:
-        raise RuntimeError(
-            f"The frozen {cfg.strategy_model_name} solver needs a chat template "
-            f"that supports reasoning_effort={cfg.strategy_reasoning_effort} "
-            "with thinking enabled.") from exc
-
-    before = sampler.best_raw_state(maximize=bool(problem.maximize))
-    for parent in parents:
-        sampler.record_expansion(parent, count=count)
-
-    rollout_count = len(parents) * count
-    gpu_shared = bool(getattr(cfg, "evaluation_shares_generation", False))
-    pool = strategy_pool or gen_pool
-    reward_pool, submit_reward, _ = _open_reward_pool(
-        cfg, problem, rollout_count, step_idx, pool, parallel_trainer, label="frozen solver ")
-    rows_by_group = [[] for _ in parents]
-    writes = []
-    children = []
-    offloaded = False
-
-    options = dict(
-        max_new_tokens=int(cfg.strategy_max_new_tokens),
-        temperature=float(cfg.strategy_temperature),
-        top_p=float(cfg.strategy_top_p),
-        top_k=getattr(cfg, "strategy_sampling_top_k", None),
-        min_p=getattr(cfg, "strategy_sampling_min_p", None),
-    )
-
-    def collect(batches):
-        for group, responses in batches:
-            group = int(group)
-            if not 0 <= group < len(parents) or len(rows_by_group[group]) + len(responses) > count:
-                raise RuntimeError("unexpected frozen solver rollout count")
-            for text, token_ids in responses:
-                index = len(rows_by_group[group])
-                ids = list(token_ids)
-                final = native_final_answer_scope(
-                    tokenizer, ids, prompt_text=prompts[group],
-                    require_final_marker=bool(cfg.strategy_thinking))
-                issue = coder_output_issue(text, final_answer_text=final)
-                parent = parents[group]
-                meta = {
-                    "solver": "frozen", "model_name": cfg.strategy_model_name,
-                    "status": "evaluation_pending", "step": step_idx,
-                    "group": group, "parent_group": group, "rollout": index,
-                    "parent_id": parent.id, "parent_timestep": parent.timestep,
-                    "parent_value": parent.value, "parent_raw_score": parent.raw_score,
-                    "parent_is_seed": parent.is_seed,
-                    "n_response_tokens": len(ids), "output_format_issue": issue,
-                }
-                writes.append(writer.submit(
-                    save_rollout_artifacts, frozen_dir, step_idx, group, index, text,
-                    prompt_text=prompts[group], response_token_ids=ids, pending_meta=meta))
-                future = (None if gpu_shared or is_trimul else
-                          submit_reward(text, parent_ctxs[group], final, issue))
-                rows_by_group[group].append((text, final, meta, future))
-        if any(len(rows) != count for rows in rows_by_group):
-            raise RuntimeError("frozen solver omitted rollouts")
-
-    try:
-        with ThreadPoolExecutor(max_workers=1, thread_name_prefix="frozen-rollout-save") as writer, reward_pool:
-            frozen_seed_step = step_idx + 2_000_000
-            if isolated_batch is not None:
-                for row in isolated_batch["candidates"]:
-                    group = row["group"]
-                    path, text, prompt = trimul_evaluation.read_rollout(frozen_dir, step_idx, row)
-                    if prompt != prompts[group]:
-                        raise RuntimeError(f"Saved frozen-solver prompt differs from {path}")
-                    meta = json.loads(path.with_suffix(".meta.json").read_text(encoding="utf-8"))
-                    rows_by_group[group].append((text, row["final_answer"], meta, None))
-                if any(len(rows) != count for rows in rows_by_group):
-                    raise RuntimeError("saved TriMul batch has an unexpected frozen solver rollout count")
-            elif pool is not None:
-                try:
-                    collect(pool.iter_group_jobs(
-                        prompts_by_group=prompts, group_size=count,
-                        counts_by_group=[count] * len(parents), adapter_path=None,
-                        step_idx=frozen_seed_step, progress_desc="frozen solver", **options))
-                finally:
-                    if pool is not gen_pool or (gpu_shared and getattr(pool, "sequential", False)):
-                        pool.release()
-            else:
-                backend.set_inference_mode()
-                frozen_cfg = SimpleNamespace(**vars(cfg))
-                frozen_cfg.advantage_mode = "entropic"
-                frozen_cfg.max_seq_length = int(cfg.strategy_max_seq_length)
-                if cfg.deterministic:
-                    torch.manual_seed((int(cfg.seed) * 1_000_003 + frozen_seed_step * 1009 + 13) % (2**31 - 1))
-                with backend.disable_adapter():
-                    collect(generate_prompt_jobs(
-                        model, tokenizer, prompts, [count] * len(parents), frozen_cfg, **options))
-
-            if is_trimul and isolated_batch is None:
-                for write in writes:
-                    write.result()
-                trimul_evaluation.request_batch(
-                    frozen_dir, step_idx, problem, cfg.sandbox_timeout_s,
-                    [{"group": group, "rollout": meta["rollout"], "final_answer": final,
-                      "format_issue": meta["output_format_issue"]}
-                     for group, rows in enumerate(rows_by_group)
-                     for _text, final, meta, _future in rows],
-                    previous_best_raw=float(before.raw_score) if before is not None else None)
-            if gpu_shared and rollout_count and isolated_batch is None:
-                # vLLM already parked the trainer and released generation GPUs.
-                # Keep it parked for the second parent pick and coder pool.
-                offloaded = _prepare_gpu_evaluation(
-                    backend, optimizer, cfg, problem, step_idx, rollout_count,
-                    trainer_parked=(cfg.generation_backend == "vllm"
-                                    and getattr(pool, "sequential", False)))
-                for group, rows in enumerate(rows_by_group):
-                    rows_by_group[group] = [
-                        (text, final, meta,
-                         submit_reward(text, parent_ctxs[group], final, meta["output_format_issue"]))
-                        for text, final, meta, _ in rows
-                    ]
-
-            print(f"[step {step_idx}] waiting for frozen solver evaluations before coder selection", flush=True)
-            for group, rows in enumerate(rows_by_group):
-                parent = parents[group]
-                for text, final, meta, future in rows:
-                    if isolated_batch is not None:
-                        path = trimul_evaluation.rollout_path(frozen_dir, step_idx, meta)
-                        result = trimul_evaluation.load_result(path, text, final)
-                    else:
-                        result = future.result()
-                    child = State.make(
-                        timestep=step_idx, value=float(result.reward),
-                        code=result.code or "", raw_score=result.raw_score,
-                        construction=result.construction, observation=result.stdout, poisson=result.poisson)
-                    eligible = bool(result.valid and result.code)
-                    if eligible:
-                        children.append((child, parent))
-                    evaluated = _evaluated_rollout_meta(meta, result)
-                    evaluated.update(node_id=child.id, archive_eligible=eligible)
-                    if getattr(problem, "saves_construction", False):
-                        evaluated["construction"] = _as_float_list(
-                            result.construction, cfg.max_saved_construction)
-                        evaluated["parent_construction"] = _as_float_list(
-                            parent.construction, cfg.max_saved_construction)
-                    writes.append(writer.submit(
-                        save_rollout, frozen_dir, step_idx, group, meta["rollout"], text,
-                        evaluated, artifacts_already_saved=True))
-            for write in writes:
-                write.result()
-    finally:
-        if offloaded:
-            _restore_after_gpu_evaluation(backend, optimizer, step_idx)
-
-    archive = sampler.update(children)
-    stats = {
-        "frozen_rollouts": rollout_count,
-        "valid_frozen_rollouts": len(children),
-        "frozen_retained_children": archive["retained_new"],
-    }
-    best = _step_best_candidate([child for child, _parent in children], problem.maximize)
-    payload = {
-        "version": 1,
-        "step": step_idx,
-        "sampler": sampler.state_dict(),
-        "stats": stats,
-        "previous_best_raw": float(before.raw_score) if before is not None else None,
-        "best": {"raw_score": best.raw_score, "value": best.value} if best is not None else None,
-    }
-    target = _frozen_archive_path(exp_dir, step_idx)
-    temporary = target.with_suffix(".pt.tmp")
-    torch.save(payload, temporary)
-    temporary.replace(target)
-    print(f"[step {step_idx}] frozen solver evaluated {rollout_count} programs, "
-          f"{len(children)} valid; kept {archive['retained_new']} in the archive", flush=True)
-    return payload
-
-
 def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                cfg, exp_dir, problem, gen_pool=None,
-               strategy_pool=None, strategy_tokenizer=None,
                parallel_trainer=None,
                spo_rs_tracker=None, sampling_adapter_path=None,
                evaluation_complete=None, pending_artifacts=None):
@@ -2256,15 +1921,10 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
     elif gen_pool is not None:
         adapter_path = _save_adapter(model, exp_dir, step_idx)
 
-    frozen_pass = None
-    if getattr(cfg, "frozen_solver", False):
-        frozen_pass = _run_frozen_search_pass(
-            backend, model, strategy_tokenizer or tokenizer, sampler, optimizer,
-            step_idx, cfg, exp_dir, problem, gen_pool, strategy_pool, parallel_trainer)
     is_trimul = getattr(problem, "problem_type", "") == "trimul"
     isolated_batch = trimul_evaluation.completed_batch(exp_dir, step_idx) if is_trimul else None
-    parents = sampler.sample_states(int(cfg.groups_per_step), selection_step=step_idx)
-    if step_idx == 0 and frozen_pass is None:
+    parents = sampler.sample_states(int(cfg.groups_per_step))
+    if step_idx == 0:
         _rebind_interrupted_step_zero_selection(sampler, exp_dir, parents)
     if isolated_batch is not None or pending_artifacts is not None:
         trimul_evaluation.check_parents(exp_dir, step_idx, parents)
@@ -3372,7 +3032,6 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
     # run best from a step that merely repeats the best-ever value.
     previous_best_raw = sampler.best_raw_state(maximize=bool(problem.maximize))
     previous_best_value = (
-        frozen_pass["previous_best_raw"] if frozen_pass is not None else
         float(previous_best_raw.raw_score) if previous_best_raw is not None else None)
 
     # Update archive
@@ -3383,8 +3042,6 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
     # later by deduplication or archive caps, so the per-step result reflects
     # what was actually evaluated rather than only what survived the archive.
     step_states = [child for child, _parent in all_children]
-    if frozen_pass is not None and frozen_pass["best"] is not None:
-        step_states.append(SimpleNamespace(**frozen_pass["best"]))
     step_best_result = _step_best_candidate(step_states, problem.maximize)
     step_best_raw_score = (
         float(step_best_result.raw_score)
@@ -3527,8 +3184,6 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
         step_stats["hybrid_reference_kl_mean"] = hybrid_reference_mean
         step_stats["hybrid_spo_weight"] = cfg.hybrid_spo_weight
 
-    if frozen_pass is not None:
-        step_stats.update(frozen_pass["stats"])
 
     if not training_enabled:
         step_stats["training_disabled"] = True
@@ -3631,7 +3286,6 @@ def _main(trainer_startup):
             run_file_tmp.write_text(str(Path(exp_dir).resolve()), encoding="utf-8")
             run_file_tmp.replace(run_file)
         setting_log_path = Path(exp_dir).resolve() / "setting.log"
-        startup_log.title = ("Two-Solver Discovery" if cfg.frozen_solver else "Single-Model Discovery")
         startup_log.bind(setting_log_path)
         if not resume_dir:
             bind_setting_log(setting_log_path)
@@ -3643,8 +3297,6 @@ def _main(trainer_startup):
     if is_trimul and resume_dir and restart_step < cfg.num_steps:
         from runtime.run_supervisor import request_evaluation
         try:
-            if cfg.frozen_solver:
-                trimul_evaluation.completed_batch(Path(exp_dir) / "frozen_solver", restart_step)
             trimul_evaluation.completed_batch(exp_dir, restart_step)
         except trimul_evaluation.EvaluationHandoff as handoff:
             request_evaluation(handoff.path)
@@ -3661,22 +3313,12 @@ def _main(trainer_startup):
     result_log_path.touch(exist_ok=True)
     print(f"[logs] step results: {result_log_path}", flush=True)
     vllm_log_path = None
-    strategy_vllm_log_path = None
     dependency_log_path = None
-    separate_strategy_pool = (cfg.generation_backend == "vllm" and cfg.frozen_solver
-                              and cfg.separate_strategy_inference_pool)
     if cfg.generation_backend == "vllm":
         vllm_log_path = str((Path(exp_dir).resolve() / "vllm.log"))
         with open(vllm_log_path, "a", encoding="utf-8") as log_handle:
             log_handle.write(f'\n=== TTT vLLM log parent_pid={os.getpid()} run_dir={Path(exp_dir).resolve()} ===\n')
         print(f"[logs] vLLM output: {vllm_log_path}", flush=True)
-        if separate_strategy_pool:
-            strategy_vllm_log_path = str(Path(exp_dir).resolve() / "strategy_vllm.log")
-            with open(strategy_vllm_log_path, "a", encoding="utf-8") as log_handle:
-                log_handle.write(
-                    f"\n=== TTT strategy vLLM log parent_pid={os.getpid()} "
-                    f"run_dir={Path(exp_dir).resolve()} ===\n")
-            print(f'[logs] strategy vLLM output: {strategy_vllm_log_path}', flush=True)
         dependency_log_path = vllm_log_path
     else:
         dependency_log_path = str(Path(exp_dir).resolve() / "dependency_warnings.log")
@@ -3714,7 +3356,7 @@ def _main(trainer_startup):
 
     startup_log.begin_summary()
     print("=" * 70)
-    print("Two-Solver Discovery" if cfg.frozen_solver else "Single-Model Discovery")
+    print("Single-Model Discovery")
     print("=" * 70)
     problem_type = getattr(cfg, "problem_type", "")
     print(f"Problem:            {cfg.problem}" + (f" ({problem_type})" if problem_type else ""))
@@ -3722,8 +3364,6 @@ def _main(trainer_startup):
     print(f"Metric:             {getattr(problem, 'metric_name', '?')} "
           f"({'maximize' if getattr(problem, 'maximize', True) else 'minimize'})")
     print(f"Coder model:        {cfg.coder_model_name}")
-    if cfg.frozen_solver:
-        print(f'Frozen solver:      {cfg.strategy_model_name} (frozen local checkpoint)')
     print(f"Training backend:   {cfg.backend}")
     print(f"Generation backend: {cfg.generation_backend}")
     print(f"Hardware profile:   {cfg.hardware_profile}")
@@ -3747,10 +3387,6 @@ def _main(trainer_startup):
     print(f"Steps:              {cfg.num_steps}")
     selection = cfg.parent_selection
     selection_detail = f"c={cfg.puct_c}"
-    if selection == "puct-jev":
-        selection_detail += (f"; GLiDE-9B={cfg.jev_model_path}; "
-                             f"same-core threshold={cfg.jev_same_core_threshold:g}; "
-                             f"candidate window={cfg.jev_candidate_multiplier}x parents; step 0=PUCT")
     print(f"Search selection:   {selection.upper()} ({selection_detail})")
     configured_advantage_mode = getattr(cfg, "advantage_mode", "entropic")
     hybrid_mode = configured_advantage_mode == "hybrid"
@@ -3794,16 +3430,6 @@ def _main(trainer_startup):
         f"top_k={getattr(cfg, 'sampling_top_k', None)}, "
         f"min_p={getattr(cfg, 'sampling_min_p', None)}, "
         f"thinking={'on' if cfg.thinking else 'off'}")
-    if cfg.frozen_solver:
-        print(f"Frozen programs:    {cfg.frozen_programs_per_parent}/parent")
-        print(f"Frozen sampling:    max_new={cfg.strategy_max_new_tokens}, "
-              f"max_seq={cfg.strategy_max_seq_length}, "
-              f"temperature={cfg.strategy_temperature}, "
-              f"top_p={cfg.strategy_top_p}, "
-              f"top_k={getattr(cfg, 'strategy_sampling_top_k', None)}, "
-              f"min_p={getattr(cfg, 'strategy_sampling_min_p', None)}, "
-              f"thinking={'on' if cfg.strategy_thinking else 'off'}, "
-              f"reasoning_effort={cfg.strategy_reasoning_effort}")
     print(f"Max seq length:     {cfg.max_seq_length}")
     if getattr(cfg, "coder_model_profile", "") == "gpt-oss-120b":
         fused_attention_label = ('GPT-OSS sink-aware Unsloth path (generic Flash-SDPA prohibited)')
@@ -3846,14 +3472,6 @@ def _main(trainer_startup):
         from models.model_backend import load_backend
         backend = load_backend(cfg.backend, cfg)
         model, tokenizer = backend.load()
-    strategy_tokenizer = tokenizer
-    if (cfg.frozen_solver
-            and cfg.strategy_model_name != cfg.coder_model_name):
-        from transformers import AutoTokenizer
-        with _route_dependency_notices(dependency_log_path):
-            strategy_tokenizer = AutoTokenizer.from_pretrained(cfg.strategy_model_name, trust_remote_code=True)
-        if strategy_tokenizer.pad_token_id is None:
-            strategy_tokenizer.pad_token = strategy_tokenizer.eos_token
     effective_4bit = bool(getattr(cfg, "effective_load_in_4bit", cfg.load_in_4bit))
     if getattr(cfg, "coder_model_profile", "") == "gpt-oss-120b":
         training_precision = "original packed MXFP4 (no NF4 re-quantization)"
@@ -3977,19 +3595,13 @@ def _main(trainer_startup):
     print(f'[init] trainable params: {trainable:,} / total {total:,} ({100 * trainable / total:.2f}%)')
 
     # ---- sampler ----
-    from search.sampler import can_migrate_parent_selection, make_sampler
+    from search.sampler import make_sampler
     restored_selection = (resume_payload["sampler"].get("selection_mode", cfg.parent_selection)
                           if resume_payload is not None else cfg.parent_selection)
-    if (restored_selection != cfg.parent_selection
-            and not can_migrate_parent_selection(restored_selection, cfg.parent_selection)):
+    if restored_selection != cfg.parent_selection:
         raise ValueError("saved sampler differs from the requested parent picker")
     sampler = make_sampler(
         parent_selection=restored_selection,
-        group_size=int(cfg.group_size), seed=int(cfg.seed),
-        exp_dir=exp_dir, problem=problem,
-        jev_model_path=getattr(cfg, "jev_model_path", None),
-        jev_candidate_multiplier=getattr(cfg, "jev_candidate_multiplier", 3),
-        jev_same_core_threshold=getattr(cfg, "jev_same_core_threshold", 0.68),
         num_seeds=len(seeds) if seeds else cfg.num_seed_states,
         puct_c=cfg.puct_c,
         max_buffer_size=cfg.max_buffer_size,
@@ -4109,8 +3721,6 @@ def _main(trainer_startup):
 
     # ---- generation pool ----
     gen_pool = None
-    strategy_pool = None
-    prepare_jev_trainer = None
     # vLLM forms exact TP/PP engines over every rollout card. Because those
     # cards also hold either training replicas or model shards, the two runtimes
     # alternate residency.
@@ -4147,9 +3757,6 @@ def _main(trainer_startup):
             # Shared benchmark GPUs must be released by generation.
             vllm_persistent_workers=(0 if cfg.evaluation_shares_generation
                                      else _coder_vllm_persistent_workers(cfg)),
-            # Distinct strategist/coder pools share the same cards. Account
-            # for a sleeping pool's residual CUDA/NCCL state.
-            vllm_co_resident_sleep=separate_strategy_pool,
             # Training modes consume exact chosen-token prompt logprobs after
             # generation. Give that vocabulary projection explicit memory
             # headroom; this changes scheduling only, never the scores.
@@ -4173,7 +3780,7 @@ def _main(trainer_startup):
                 or HostMemoryAdmission(multiprocessing.get_context("spawn"), hardware_profile=cfg.hardware_profile))
             trainer_offloaded = False
 
-            def _offload_trainer_for_generation(phase="coder"):
+            def _offload_trainer_for_generation():
                 nonlocal trainer_offloaded
                 disk_directory = getattr(cfg, "trainer_offload_dir", None)
                 frozen_to_disk = bool(disk_directory)
@@ -4224,11 +3831,8 @@ def _main(trainer_startup):
                         flush=True,
                     )
 
-                # Normally the cache purge above is sufficient and both vLLM
-                # pools remain RAM-resident.  Under genuine pressure, discard
-                # only sleeping level-1 backups, largest/unused peer first.
-                # This trades one later checkpoint reload for survival instead
-                # of permanently choosing a slower level-2/transient policy.
+                # Under host pressure, discard the sleeping coder backup so
+                # the trainer can park safely. The coder reloads on next use.
                 reserve_bytes = None
                 if memory is not None:
                     if frozen_to_disk or cfg.hardware_profile in ("B200", "B200_full_ram"):
@@ -4237,27 +3841,12 @@ def _main(trainer_startup):
                     else:
                         reserve_bytes = 5 * GIB
                     target_available = required_bytes + reserve_bytes
-                    if phase == "strategy":
-                        pressure_candidates = (
-                            ("coder", gen_pool),
-                            ("strategist", strategy_pool),
-                        )
-                    else:
-                        pressure_candidates = (
-                            ("strategist", strategy_pool),
-                            ("coder", gen_pool),
-                        )
-                    for pool_label, pool in pressure_candidates:
-                        if memory["available"] >= target_available:
-                            break
-                        discard = getattr(pool, "discard_sleeping_host_residency", None)
-                        if pool is None or not callable(discard) or not discard():
-                            continue
+                    discard = getattr(gen_pool, "discard_sleeping_host_residency", None)
+                    if memory["available"] < target_available and callable(discard) and discard():
                         memory = host_memory_info() or memory
                         print(
-                            f"[host-memory] low-RAM guard discarded the "
-                            f"sleeping {pool_label} vLLM weight backup; it "
-                            "will reload on its next use",
+                            "[host-memory] low-RAM guard discarded the sleeping "
+                            "coder vLLM weight backup; it will reload on its next use",
                             flush=True,
                         )
                     # Incremental anonymous mappings remain resident after
@@ -4368,64 +3957,14 @@ def _main(trainer_startup):
                 else:
                     trainer_offloaded = False
 
-            prepare_jev_trainer = _offload_trainer_for_generation
-
             gen_pool = PhasedVLLMGenerationPool(
-                before_start=lambda: _offload_trainer_for_generation("coder"),
+                before_start=_offload_trainer_for_generation,
                 after_stop=_restore_trainer_after_generation,
                 **pool_options,
             )
             setting_log_only(
                 f"[init] phase-shared vLLM pool configured across all "
                 f"rollout GPUs {gpu_ids}", flush=True)
-            if separate_strategy_pool:
-                strategy_pool_options = dict(pool_options)
-                # A sleeping local strategist still owns a CUDA context on
-                # every rollout GPU.  That residue is small beside ordinary
-                # coders, but it prevents a full-context GPT-OSS-120B coder
-                # from restoring its level-1 allocation after training.  Keep
-                # the coder resident and stop the strategist processes before
-                # the coder wakes.
-                strategy_persistent_workers = getattr(cfg, "strategy_vllm_persistent_workers", None)
-                if cfg.evaluation_shares_generation:
-                    strategy_persistent_workers = 0
-                elif str(getattr(cfg, "coder_model_profile", "")).lower() == "gpt-oss-120b":
-                    strategy_persistent_workers = 0
-                    setting_log_only(
-                        "[memory] GPT-OSS-120B coder: local strategist "
-                        "engines use transient residency so coder wake-up "
-                        "retains the full 131k-context memory budget",
-                        flush=True,
-                    )
-                strategy_pool_options.update({
-                    "model_name": cfg.strategy_model_name,
-                    # Avoid checkpoint defaults that impose a server-wide output cap.
-                    "vllm_engine_options": {"generation_config": "vllm", "enable_lora": False},
-                    "max_seq_length": cfg.strategy_max_seq_length,
-                    "load_in_4bit": False,
-                    "gen_micro_batch": getattr(cfg, "strategy_gen_micro_batch", cfg.gen_micro_batch),
-                    "vllm_quantization": (cfg.strategy_vllm_quantization),
-                    "vllm_enable_expert_parallel": False,
-                    "vllm_tensor_parallel_size": (cfg.strategy_vllm_tensor_parallel_size),
-                    "vllm_pipeline_parallel_size": (cfg.strategy_vllm_pipeline_parallel_size),
-                    "vllm_max_num_batched_tokens": getattr(
-                        cfg, "strategy_vllm_max_num_batched_tokens",
-                        cfg.vllm_max_num_batched_tokens),
-                    "vllm_sleep_level": cfg.strategy_vllm_sleep_level,
-                    "vllm_token_scoring": False,
-                    "vllm_runtime_reserve_gib": float(getattr(cfg, "strategy_vllm_runtime_reserve_gib", 16.0)),
-                    "vllm_persistent_workers": strategy_persistent_workers,
-                    "vllm_staged_loading": (cfg.strategy_vllm_staged_loading),
-                    "vllm_log_path": strategy_vllm_log_path,
-                })
-                strategy_pool = PhasedVLLMGenerationPool(
-                    before_start=lambda: _offload_trainer_for_generation("strategy"),
-                    after_stop=_restore_trainer_after_generation,
-                    **strategy_pool_options,
-                )
-                setting_log_only(
-                    f"[init] separate no-LoRA strategy vLLM pool "
-                    f"configured for {cfg.strategy_model_name}", flush=True)
         else:
             # Do not load a duplicate base model beside the trainer. Rank zero
             # is the live HF/Unsloth training model; only the remaining cards
@@ -4462,8 +4001,6 @@ def _main(trainer_startup):
             print(f"[init] hybrid HF rollout pool: live trainer on "
                   f"physical GPU {gpu_ids[0]} plus persistent workers "
                   f"{gpu_ids[1:]}")
-        if (cfg.frozen_solver and strategy_pool is None):
-            strategy_pool = gen_pool
         if cfg.gen_micro_batch and cfg.gen_micro_batch > 0:
             limit_name = ("max_num_seqs" if cfg.generation_backend == "vllm" else "micro-batch")
             limit_scope = ("/engine" if cfg.generation_backend == "vllm" else "/GPU")
@@ -4482,7 +4019,7 @@ def _main(trainer_startup):
 
     if parallel_trainer is not None:
         # Exact overflow may need the same sleeping-backup reclamation as generation.
-        parallel_trainer._generation_pools = (strategy_pool, gen_pool)
+        parallel_trainer._generation_pools = (gen_pool,)
 
     # ---- main loop ----
     from experiment_io import StepPlotter
@@ -4523,28 +4060,14 @@ def _main(trainer_startup):
                 interrupted_spo_rs_artifacts = None
                 pending_spo_rs_artifacts = None
 
-            sampler = _migrate_parent_selection(
-                sampler, cfg, exp_dir, step, current_policy_adapter_path,
-                optimizer, spo_rs_tracker,
-                recovery_pending=(interrupted_spo_rs_artifacts is not None or pending_spo_rs_artifacts is not None),
-                problem=problem)
-            _configure_jev_sampler(sampler, step_cfg, backend, optimizer,
-                                   parallel_trainer, gen_pool, strategy_pool,
-                                   prepare_jev_trainer)
-
-            frozen_pass = None
             finalize_pending_spo_rs = pending_spo_rs_artifacts is not None and not (is_trimul or hybrid_mode)
-            if cfg.frozen_solver and (interrupted_spo_rs_artifacts or finalize_pending_spo_rs):
-                frozen_pass = _restore_frozen_archive(sampler, exp_dir, step)
-                if frozen_pass is None:
-                    raise RuntimeError("coder rollout recovery requires the saved post-frozen archive")
             if interrupted_spo_rs_artifacts is not None:
                 stats = _resume_spo_rs_step_from_artifacts(
                     model, tokenizer, sampler, step,
                     step_cfg, exp_dir, problem, parallel_trainer,
                     spo_rs_tracker, current_policy_adapter_path,
                     interrupted_spo_rs_artifacts,
-                    evaluation_complete=step_plotter.submit, frozen_pass=frozen_pass)
+                    evaluation_complete=step_plotter.submit)
             elif finalize_pending_spo_rs:
                 print(
                     f"[resume] found {len(pending_spo_rs_artifacts)} exact "
@@ -4563,13 +4086,11 @@ def _main(trainer_startup):
                     step_cfg, exp_dir, problem, parallel_trainer,
                     spo_rs_tracker, current_policy_adapter_path,
                     completed_spo_rs_artifacts,
-                    evaluation_complete=step_plotter.submit, frozen_pass=frozen_pass)
+                    evaluation_complete=step_plotter.submit)
             else:
                 stats = train_step(
                     backend, model, tokenizer, sampler, optimizer, step,
                     step_cfg, exp_dir, problem, gen_pool,
-                    strategy_pool=strategy_pool,
-                    strategy_tokenizer=strategy_tokenizer,
                     parallel_trainer=parallel_trainer,
                     spo_rs_tracker=spo_rs_tracker,
                     sampling_adapter_path=(
@@ -4617,13 +4138,9 @@ def _main(trainer_startup):
             if is_trimul:
                 batch_path = trimul_evaluation.batch_path(exp_dir, step)
                 batch_path.unlink(missing_ok=True)
-                if cfg.frozen_solver:
-                    trimul_evaluation.batch_path(Path(exp_dir) / "frozen_solver", step).unlink(missing_ok=True)
             if is_trimul or hybrid_mode:
                 for sidecar in (Path(exp_dir) / f"step{step:02d}").glob("*.reference_logprobs.zlib"):
                     sidecar.unlink(missing_ok=True)
-            if cfg.frozen_solver:
-                _frozen_archive_path(exp_dir, step).unlink(missing_ok=True)
             append_step_result(exp_dir, step, step_summary)
             current_policy_adapter_path = Path(adapter_path)
             removed_adapters = _prune_adapter_snapshots(
@@ -4710,9 +4227,6 @@ def _main(trainer_startup):
         # Finish queued figures on normal completion; cancel pending work when
         # the training loop exits with an exception or interruption.
         step_plotter.close(wait=sys.exc_info()[0] is None)
-        if strategy_pool is not None and strategy_pool is not gen_pool:
-            print("[shutdown] stopping strategy generation pool ...")
-            strategy_pool.shutdown()
         if gen_pool is not None:
             print("[shutdown] stopping generation pool ...")
             gen_pool.shutdown()

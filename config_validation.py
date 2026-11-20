@@ -9,7 +9,7 @@ from pathlib import Path
 
 
 ADVANTAGE_MODES = ("entropic", "spo-rs", "hybrid")
-PARENT_SELECTION_MODES = ("puct", "uct", "puct-jev")
+PARENT_SELECTION_MODES = ("puct", "uct")
 LEGACY_CODER_CAP_KEY = "coder_thinking_budget"
 
 
@@ -29,15 +29,13 @@ generation_backend gen_micro_batch vllm_gpu_memory_utilization
 vllm_enforce_eager vllm_enable_prefix_caching vllm_tensor_parallel_size
 vllm_pipeline_parallel_size vllm_quantization
 vllm_max_num_batched_tokens vllm_enable_expert_parallel vllm_sleep_level
-vllm_staged_loading strategy_vllm_sleep_level strategy_vllm_staged_loading
-num_steps groups_per_step group_size frozen_programs_per_parent
+vllm_staged_loading
+num_steps groups_per_step group_size
 num_seed_states learning_rate adam_beta1 adam_beta2 adam_epsilon weight_decay
 kl_penalty_coef grad_clip
 spo_rs_beta logprob_chunk
 puct_c max_buffer_size topk_children_per_parent
-temperature top_p top_k thinking strategy_max_new_tokens
-strategy_max_seq_length strategy_temperature strategy_top_p strategy_top_k
-strategy_vllm_quantization
+temperature top_p top_k thinking
 deterministic seed
 sandbox_timeout_s reward_workers print_responses max_saved_construction
 """.split())
@@ -48,10 +46,7 @@ COMMON_OPTIONAL_KEYS = frozenset({
     "max_seq_length", "max_new_tokens",  # Otherwise derived from the coder.
     "advantage_mode", "isolate_eval",
     "fused_long_attention",
-    "min_p", "strategy_min_p",
-    "strategy_vllm_persistent_workers",
-    "uct", "parent_selection", "jev_model_path", "jev_candidate_multiplier",
-    "jev_same_core_threshold",
+    "min_p", "uct", "parent_selection",
     "spo_rs_d_half", "spo_rs_rho_min", "spo_rs_rho_max",
     "spo_rs_clip_epsilon", "spo_rs_clip_epsilon_low",
     "spo_rs_clip_epsilon_high",
@@ -148,6 +143,14 @@ def reject_retired_coder_cap(data: Mapping, *, source) -> None:
             "config or rollout cannot be used with this version.")
 
 
+def retired_search_keys(data):
+    """Recognize retired input fields for validation and old single-coder saves."""
+    return {key for key in data if str(key).startswith(("strategy_", "jev_"))
+            or key in {"strategies", "strategies_per_parent", "programs_per_strategy",
+                       "strict_strategy_validation", "frozen_solver",
+                       "frozen_programs_per_parent", "separate_strategy_inference_pool"}}
+
+
 def _positive_number(data: Mapping, key: str, source) -> None:
     value = data.get(key)
     if isinstance(value, bool) or not isinstance(value, Real) or value <= 0:
@@ -190,13 +193,9 @@ def validate_problem_config(
         raise ValueError(
             f"{_label(source)}: remove retired trainer settings {sorted(retired_trainer_keys)}")
 
-    fixed_strategy_keys = data.keys() & {
-        "strategy_model_name", "strategy_reasoning_effort", "strategy_thinking",
-    }
-    if fixed_strategy_keys:
-        raise ValueError(
-            f"{_label(source)}: the strategist model and reasoning are fixed. "
-            f"Remove {sorted(fixed_strategy_keys)} from the YAML.")
+    retired_search = retired_search_keys(data)
+    if retired_search:
+        raise ValueError(f"{_label(source)}: removed search options: {sorted(retired_search)}")
 
     problem = str(data.get("problem", "")).strip().lower()
     if problem not in PROBLEM_REQUIRED_KEYS:
@@ -256,39 +255,20 @@ def validate_problem_config(
             and data.get("seed_min_points", 40) > data.get("seed_max_points", 99)):
         raise ValueError(
             f"{_label(source)}: seed_min_points must be <= seed_max_points")
-    for key in ("strategy_max_new_tokens", "strategy_max_seq_length"):
-        if key in data and data[key] != "auto":
-            _positive_int(data, key, source)
     if "parent_selection" in data:
         mode = data["parent_selection"]
         if not isinstance(mode, str) or mode.lower() not in PARENT_SELECTION_MODES:
             raise ValueError(
                 f"{_label(source)}: parent_selection must be one of {PARENT_SELECTION_MODES}")
-    if "jev_model_path" in data and (not isinstance(data["jev_model_path"], str)
-                                    or not data["jev_model_path"].strip()):
-        raise ValueError(f"{_label(source)}: jev_model_path must be a nonempty path")
-    if "jev_candidate_multiplier" in data:
-        _positive_int(data, "jev_candidate_multiplier", source)
-    if "jev_same_core_threshold" in data:
-        threshold = data["jev_same_core_threshold"]
-        if (isinstance(threshold, bool) or not isinstance(threshold, Real)
-                or not 0 <= threshold <= 1):
-            raise ValueError(f"{_label(source)}: jev_same_core_threshold must be a number in [0, 1]")
-    for key in ("top_k", "strategy_top_k"):
-        if key in data:
-            value = data[key]
-            if (isinstance(value, bool) or not isinstance(value, int)
-                    or value != 0):
-                raise ValueError(
-                    f"{_label(source)}: {key} must be 0 because top-k "
-                    "filtering is disabled project-wide")
-    for key in ("min_p", "strategy_min_p"):
-        if key in data:
-            value = data[key]
-            if (isinstance(value, bool) or not isinstance(value, Real)
-                    or not 0.0 <= float(value) <= 1.0):
-                raise ValueError(
-                    f"{_label(source)}: {key} must be in [0, 1]")
+    if "top_k" in data:
+        value = data["top_k"]
+        if isinstance(value, bool) or not isinstance(value, int) or value != 0:
+            raise ValueError(f"{_label(source)}: top_k must be 0 because top-k filtering is disabled project-wide")
+    if "min_p" in data:
+        value = data["min_p"]
+        if (isinstance(value, bool) or not isinstance(value, Real)
+                or not 0.0 <= float(value) <= 1.0):
+            raise ValueError(f"{_label(source)}: min_p must be in [0, 1]")
     if ("advantage_mode" in data
             and data["advantage_mode"] not in ADVANTAGE_MODES):
         raise ValueError(
@@ -315,32 +295,16 @@ def validate_problem_config(
 
     if "top_p" in data and not 0 < float(data["top_p"]) <= 1:
         raise ValueError(f"{_label(source)}: top_p must be in (0, 1]")
-    if ("strategy_top_p" in data
-            and not 0 < float(data["strategy_top_p"]) <= 1):
-        raise ValueError(
-            f"{_label(source)}: strategy_top_p must be in (0, 1]")
-    if ("strategy_temperature" in data
-            and float(data["strategy_temperature"]) <= 0):
-        raise ValueError(
-            f"{_label(source)}: strategy_temperature must be positive")
     if ("coder_reasoning_effort" in data
             and str(data["coder_reasoning_effort"]).lower()
             not in {"low", "medium", "high", "xhigh"}):
         raise ValueError(
             f"{_label(source)}: coder_reasoning_effort must be low, medium, "
             "high, or xhigh")
-    for key in ("vllm_sleep_level", "strategy_vllm_sleep_level"):
-        if key in data and int(data[key]) not in (1, 2):
-            raise ValueError(f"{_label(source)}: {key} must be 1 or 2")
-    for key in ("frozen_programs_per_parent", "strategy_vllm_persistent_workers"):
-        if key in data:
-            value = data[key]
-            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
-                raise ValueError(f"{_label(source)}: {key} must be a nonnegative integer")
-    for key in ("vllm_staged_loading", "strategy_vllm_staged_loading"):
-        if key in data and not isinstance(data[key], bool):
-            raise ValueError(
-                f"{_label(source)}: {key} must be true or false")
+    if "vllm_sleep_level" in data and int(data["vllm_sleep_level"]) not in (1, 2):
+        raise ValueError(f"{_label(source)}: vllm_sleep_level must be 1 or 2")
+    if "vllm_staged_loading" in data and not isinstance(data["vllm_staged_loading"], bool):
+        raise ValueError(f"{_label(source)}: vllm_staged_loading must be true or false")
     for key in ("adam_beta1", "adam_beta2"):
         if key in data and not 0 <= float(data[key]) < 1:
             raise ValueError(f"{_label(source)}: {key} must be in [0, 1)")

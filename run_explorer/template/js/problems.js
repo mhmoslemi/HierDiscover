@@ -5,7 +5,7 @@
    which words to use, and at which scale gaps are measured. Add a profile here to support another problem.
    ===================================================================================== */
 let PROB = null;           // active profile (set by setupProblem)
-let RUN = {};              // facts about the run itself (does it use JEV, sampler, seeds, reward range ...)
+let RUN = {};              // facts about the run itself (sampler, seeds, reward range)
 
 /* full linear convolution of two sequences: direct for short inputs, FFT for long ones */
 function convolve(a, b) {
@@ -191,10 +191,9 @@ function setupProblem() {
   PROB.rewardMax = niceCeil(Math.max(rmax, PROB.seedReward) * 1.08);
   PROB.validReward = rew.length ? median(rew) : rmax;
   RUN = {
-    hasJev: ALL_STEPS.some(s => ST[s].jev && ST[s].jev.decisions && ST[s].jev.decisions.length),
     sampler: (ALL_STEPS.map(s => ST[s].sampler_type).find(Boolean) || "PUCTSampler"),
   };
-  RUN.selection = RUN.hasJev ? "PUCT + JEV" : "PUCT";
+  RUN.selection = String(CFG.parent_selection || (CFG.uct ? "uct" : "puct")).toUpperCase();
 }
 function niceCeil(x) { const p = Math.pow(10, Math.floor(Math.log10(x))), f = x / p; return (f <= 1 ? 1 : f <= 1.5 ? 1.5 : f <= 2 ? 2 : f <= 3 ? 3 : f <= 5 ? 5 : f <= 7.5 ? 7.5 : 10) * p; }
 /* tiny helper: fill {{TASK}} / {{ARR}} / {{METRIC}} placeholders of the explanatory texts */

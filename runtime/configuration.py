@@ -12,14 +12,11 @@ import yaml
 from config_validation import (
     ADVANTAGE_MODES, COMMON_OPTIONAL_KEYS, COMMON_REQUIRED_KEYS, LEGACY_CODER_CAP_KEY,
     PARENT_SELECTION_MODES, RETIRED_BATCH_GROWTH_KEYS, RETIRED_TRAINER_KEYS, reject_retired_coder_cap,
-    validate_hybrid_spo_weight, validate_problem_config,
+    retired_search_keys, validate_hybrid_spo_weight, validate_problem_config,
 )
 from runtime.hardware_profiles import generation_cpu_ids, local_checkpoint, restore_hardware_settings
 
 from prompts.base import UPSTREAM_COMMIT
-from models.strategist_models import (
-    STRATEGY_MODEL_NAME, STRATEGY_REASONING_EFFORT, resolve_strategy_token_limits,
-)
 from models.coder_profiles import (
     _apply_coder_model_profile, _is_exact_qwen3_30b_a3b, _resolve_coder_token_limits,
 )
@@ -38,7 +35,6 @@ SPO_RS_RHO_MAX_DEFAULT = 0.96
 SPO_RS_CLIP_EPSILON_DEFAULT = 0.2
 SPO_RS_CLIP_EPSILON_LOW_DEFAULT = 0.2
 SPO_RS_CLIP_EPSILON_HIGH_DEFAULT = 0.35
-_RETIRED_STRATEGY_RETRY_KEY = "strategy_format_max_retries"
 
 
 def _is_spo_rs_mode(mode):
@@ -184,10 +180,6 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         help="Training backend. 'vllm' is shorthand for HF+PEFT training plus "
              "vLLM rollout generation (vLLM itself does not backpropagate).")
     p.add_argument(
-        "--strategies", dest="frozen_solver", action="store_true",
-        help=f"Also evaluate programs sampled from frozen {STRATEGY_MODEL_NAME} "
-             f"at {STRATEGY_REASONING_EFFORT} using the same task prompts as the coder.")
-    p.add_argument(
         "--fused-long-attention", action="store_const", const=True,
         default=None,
         help="Use exact fused causal SDPA for eligible unpadded long training "
@@ -221,25 +213,13 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--num-steps", type=int, default=None, help="Number of TTT-Discover steps (paper: 50)")
     p.add_argument("--groups-per-step", type=int, default=None, help='Parent states per step.')
     p.add_argument("--group-size", type=int, default=None, help='Rollouts per parent group.')
-    p.add_argument("--frozen-programs-per-parent", "--strategies-per-parent", type=int, default=None,
-                   help="Independent programs per parent with the frozen solver. Zero disables it.")
     p.add_argument("--num-seed-states", type=int, default=None)
     p.add_argument("--parent-selection", choices=PARENT_SELECTION_MODES, default=None,
-                   help="Override the YAML picker. On resume, PUCT can switch "
-                        "to PUCT-JEV at the next fresh step. PUCT-JEV uses local "
-                        "GLiDE-9B to filter same-idea parents after step 0.")
-    p.add_argument("--jev-model-path", default=None,
-                   help="Complete local GLiDE-9B repository. Defaults to "
-                   "GLiDE-9B beside the coder checkpoint (B200 models directory).")
+                   help="Choose PUCT or UCT for a new run.")
     p.add_argument("--uct", dest="parent_selection", action="store_const",
                    const="uct", default=None,
                    help="Compatibility alias for --parent-selection uct.")
     p.add_argument("--max-new-tokens", type=int, default=None)
-    p.add_argument("--strategy-max-new-tokens", type=int, default=None)
-    p.add_argument("--strategy-max-seq-length", type=int, default=None)
-    p.add_argument("--strategy-temperature", type=float, default=None)
-    p.add_argument("--strategy-top-p", type=float, default=None)
-    p.add_argument("--strategy-vllm-quantization", type=str, default=None)
     p.add_argument("--lr", type=float, default=None)
     p.add_argument("--adam-beta1", type=float, default=None)
     p.add_argument("--adam-beta2", type=float, default=None)
@@ -348,12 +328,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
                         "sets max_num_seqs. 0 lets the backend choose.")
     p.add_argument("--reload-coder-between-phases", action="store_const", const=True, default=None,
                    help="Release coder vLLM engines instead of keeping host-RAM weight backups; "
-                        "reload the base model and current LoRA adapter for the next generation phase. "
-                        "Does not change strategist residency or training.")
-    p.add_argument("--strategy-vllm-persistent-workers", type=int, default=None,
-                   help="Number of local strategist engines to retain between phases; "
-                        "0 shuts down all engines after planning and reloads them next step "
-                        "without keeping host-RAM weight backups.")
+                        "reload the base model and current LoRA adapter for the next generation phase.")
     p.add_argument("--trainer-offload-dir", type=str, default=None,
                    help="Park ordinary frozen trainer weights on disk during generation; "
                         "only adapters/optimizer stay in RAM. Use a disk filesystem, not tmpfs.")
@@ -492,10 +467,11 @@ def load_config():
         saved = _normalize_saved_advantage_config(json.loads(saved_config_path.read_text()))
         reject_retired_coder_cap(saved, source=saved_config_path)
         saved.pop(LEGACY_CODER_CAP_KEY, None)
-        saved.pop(_RETIRED_STRATEGY_RETRY_KEY, None)
-        for key in ("strategies", "strategies_per_parent", "programs_per_strategy",
-                    "strategy_archive_top_r", "strict_strategy_validation"):
-            saved.pop(key, None)
+        if (saved.get("strategies") or saved.get("frozen_solver")
+                or (resume_dir / "frozen_solver").is_dir()):
+            raise ValueError(f"{saved_config_path}: retired search mode; resume on the original revision")
+        for key in retired_search_keys(saved):
+            saved.pop(key)
 
     # The launcher defaults to erdos. Direct Python calls use the same selection
     # when neither --config nor --problem is provided.
@@ -524,7 +500,6 @@ def load_config():
         raise ValueError(f"problem config must be a non-empty mapping: {cfg_path}")
     reject_retired_coder_cap(ydict, source=cfg_path)
     ydict.pop(LEGACY_CODER_CAP_KEY, None)
-    ydict.pop(_RETIRED_STRATEGY_RETRY_KEY, None)
     for key in RETIRED_BATCH_GROWTH_KEYS:
         ydict.pop(key, None)
     # Old external configs may retain the retired repair-feature settings.
@@ -587,23 +562,12 @@ def load_config():
         for key in ("budget_s", "sandbox_timeout_s", "eval_cpus", "kernel_python"):
             if key in ydict:
                 merged[key] = ydict[key]
-        # Current YAML sets the JEV gate; unfinished selections retain only their saved window.
-        for key in ("jev_candidate_multiplier", "jev_same_core_threshold"):
-            if key in ydict:
-                merged[key] = ydict[key]
-        # Current strategist controls must not inherit stale resolved limits
-        # or sampling defaults from a previous checkpoint's config.json.
-        for key in ("strategy_max_seq_length", "strategy_max_new_tokens",
-                    "strategy_temperature", "strategy_top_p",
-                    "strategy_top_k", "strategy_min_p"):
-            if key in ydict:
-                merged[key] = ydict[key]
         # A new YAML selector must not switch an old resumed run's search.
         from search.sampler import parent_selection_mode
         merged["parent_selection"] = parent_selection_mode(saved)
         print(f"[config] resuming saved configuration from "
               f"{resume_dir / 'config.json'}; launch YAML rollout counts, "
-              "evaluation resources, and strategy limits/sampling override saved values")
+              "and evaluation resources override saved values")
 
     restore_hardware_settings(merged, ydict, saved)
 
@@ -622,26 +586,20 @@ def load_config():
             merged.pop(key)
     # Disk parking is launch-local; do not inherit another machine's directory.
     merged["trainer_offload_dir"] = args.trainer_offload_dir
-    from search.sampler import can_migrate_parent_selection, parent_selection_mode
+    from search.sampler import parent_selection_mode
     merged["parent_selection"] = parent_selection_mode(merged)
     merged["uct"] = merged["parent_selection"] == "uct"
     if saved and merged["parent_selection"] != parent_selection_mode(saved):
-        if not can_migrate_parent_selection(parent_selection_mode(saved), merged["parent_selection"]):
-            raise ValueError("PUCT to PUCT-JEV is the only supported parent_selection change on resume")
-        if not (resume_dir / "training_state.pt").is_file():
-            raise ValueError('parent-picker migration requires training_state.pt; refusing to reset the trained run')
+        raise ValueError("parent_selection must match the saved run on resume")
     if args.spo_rs_clip_epsilon is not None:
         if args.spo_rs_clip_epsilon_low is None:
             merged["spo_rs_clip_epsilon_low"] = args.spo_rs_clip_epsilon
         if args.spo_rs_clip_epsilon_high is None:
             merged["spo_rs_clip_epsilon_high"] = args.spo_rs_clip_epsilon
     # Trainer/evaluator modes are launch-scoped.
-    frozen_programs_per_parent = int(merged.get("frozen_programs_per_parent", 0))
-    if frozen_programs_per_parent < 0:
-        raise ValueError("frozen_programs_per_parent must be a nonnegative integer")
-    merged["frozen_programs_per_parent"] = frozen_programs_per_parent
-    merged["frozen_solver"] = bool(args.frozen_solver and frozen_programs_per_parent > 0)
-    merged["rollout_prompt_revision"] = UPSTREAM_COMMIT
+    merged["rollout_prompt_revision"] = (
+        f"{UPSTREAM_COMMIT}-direct-coder"
+        if merged["problem"] == "circle_packing" else UPSTREAM_COMMIT)
     merged["fused_long_attention"] = bool(args.fused_long_attention)
     merged.pop("measure_entropy", None)
     merged["no_train"] = bool(args.no_train)
@@ -652,15 +610,6 @@ def load_config():
         raise ValueError("coder_model_name must be a non-empty checkpoint name or path")
     coder_name = local_checkpoint(coder_name.strip(), merged["hardware_profile"])
     merged["coder_model_name"] = coder_name
-    if merged["parent_selection"] == "puct-jev":
-        merged.setdefault("jev_candidate_multiplier", 3)
-        merged.setdefault("jev_same_core_threshold", 0.68)
-        jev_path = merged.get("jev_model_path")
-        if not jev_path:
-            sibling = Path(coder_name).expanduser().parent / "GLiDE-9B"
-            jev_path = (str(sibling.resolve()) if sibling.is_dir() else
-                        local_checkpoint("fastino/GLiDE-9B", merged["hardware_profile"]))
-        merged["jev_model_path"] = str(Path(jev_path).expanduser())
     _apply_coder_model_profile(merged, profile_explicit_keys)
     if merged.get("coder_model_profile") == "gpt-oss-120b":
         # Saved attention-only runs keep their original parameter/optimizer layout.
@@ -708,36 +657,12 @@ def load_config():
             merged["kl_penalty_coef"] = 0.1
         if saved and float(merged["kl_penalty_coef"]) != float(saved["kl_penalty_coef"]):
             raise ValueError("Hybrid resume requires the saved reference KL coefficient")
-    merged["uct"] = bool(merged.get("uct", False))
-    if merged["frozen_solver"]:
-        merged.setdefault("strategy_temperature", 1.0)
-        merged.setdefault("strategy_top_p", 1.0)
-        strategy_model_name = local_checkpoint(STRATEGY_MODEL_NAME, merged["hardware_profile"])
-        strategy_max_seq_length, strategy_max_new_tokens = resolve_strategy_token_limits(
-            merged.get("strategy_max_seq_length", "auto"),
-            merged.get("strategy_max_new_tokens", "auto"))
-        strategy_temperature = float(merged["strategy_temperature"])
-        strategy_top_p = float(merged["strategy_top_p"])
-        if strategy_temperature <= 0.0:
-            raise ValueError("strategy_temperature must be positive")
-        if not 0.0 < strategy_top_p <= 1.0:
-            raise ValueError("strategy_top_p must be in (0, 1]")
-        merged["strategy_model_name"] = strategy_model_name
-        merged["strategy_max_new_tokens"] = strategy_max_new_tokens
-        merged["strategy_max_seq_length"] = strategy_max_seq_length
-        merged["strategy_temperature"] = strategy_temperature
-        merged["strategy_top_p"] = strategy_top_p
-        merged["strategy_thinking"] = True
-        merged["strategy_reasoning_effort"] = STRATEGY_REASONING_EFFORT
-        merged["strategy_vllm_quantization"] = str(merged.get('strategy_vllm_quantization') or '').strip()
     # Use zero in config to disable top-k filtering in both backends.
     merged["sampling_top_k"] = 0
     if "min_p" in merged:
         merged["sampling_min_p"] = float(merged["min_p"])
     else:
         merged.setdefault("sampling_min_p", None)
-    merged["strategy_sampling_top_k"] = 0
-    merged["strategy_sampling_min_p"] = float(merged.get("strategy_min_p", 0.0))
     _resolve_policy_options(merged)
     _resolve_spo_rs_options(merged)
     raw_tp = merged["vllm_tensor_parallel_size"]
@@ -745,26 +670,17 @@ def load_config():
     pp = int(merged["vllm_pipeline_parallel_size"] or 1)
     if tp < 0 or pp < 1:
         raise ValueError("vLLM TP must be >= 0 and PP must be >= 1")
-    for key in ("vllm_sleep_level", "strategy_vllm_sleep_level"):
-        value = int(merged.get(key, 2))
-        if value not in (1, 2):
-            raise ValueError(f"{key} must be 1 or 2")
-        merged[key] = value
+    sleep_level = int(merged.get("vllm_sleep_level", 2))
+    if sleep_level not in (1, 2):
+        raise ValueError("vllm_sleep_level must be 1 or 2")
+    merged["vllm_sleep_level"] = sleep_level
     merged["vllm_staged_loading"] = bool(merged.get("vllm_staged_loading", True))
-    merged["strategy_vllm_staged_loading"] = bool(merged.get("strategy_vllm_staged_loading", True))
-    strategy_persistent_workers = merged.get("strategy_vllm_persistent_workers")
-    if strategy_persistent_workers is not None:
-        strategy_persistent_workers = int(strategy_persistent_workers)
-        if strategy_persistent_workers < 0:
-            raise ValueError("strategy_vllm_persistent_workers must be nonnegative")
-    merged["strategy_vllm_persistent_workers"] = (strategy_persistent_workers)
 
     # Resolve every physical role from one ordered inventory. run.sh exports
     # AVAILABLE_GPUS and that environment value is authoritative over old YAML
     # and resumed role fields. Direct Python invocations fall back to the legacy
     # inventory key, CUDA visibility, then one training device.
-    from runtime.gpu_runtime import (align_vllm_layout_to_concurrency,
-                             allocate_gpu_roles,
+    from runtime.gpu_runtime import (allocate_gpu_roles,
                              derive_vllm_parallel_layout,
                              detect_attention_heads, parse_gpu_ids,
                              query_gpu_memory, resolve_memory_settings,
@@ -934,19 +850,7 @@ def load_config():
     # replica, turn the replica factor into PP so the weights and KV cache are
     # sharded across the exact same GPU inventory.
     if generation_backend == "vllm":
-        separate_local_strategy_pool = bool(
-            merged["frozen_solver"]
-            and (merged["strategy_model_name"] != coder_name
-                 or merged["hardware_profile"] == "B200"
-                 or merged["strategy_max_seq_length"] != merged["max_seq_length"]
-                 or merged["strategy_vllm_quantization"] != str(merged.get("vllm_quantization") or "").strip()
-                 or merged["load_in_4bit"]))
-        # This must match GenerationPool's two runtime flags.  The old layout
-        # used the uncapped 90% allocator budget, then process startup lowered
-        # it for scoring/sleep residency; Qwen3-32B consequently selected
-        # TP=1 even though its 32K KV cache could not fit after that cap.
         automatic_runtime_reserve = vllm_runtime_reserve_gib(
-            co_resident_sleep=separate_local_strategy_pool,
             token_scoring=not bool(merged["no_train"]),
         )
         profile_runtime_reserve = merged.get("vllm_runtime_reserve_override_gib")
@@ -977,62 +881,6 @@ def load_config():
                   f"TP={layout.tensor_parallel_size}; selected layout needs "
                   f"about {layout.unsharded_stage_required_gib:.1f} GiB/GPU "
                   f"within the {layout.budget_gib:.1f} GiB budget")
-
-        if merged["frozen_solver"]:
-            strategy_name = merged["strategy_model_name"]
-            strategy_layout_cfg = dict(merged)
-            strategy_layout_cfg.update({
-                "max_seq_length": int(merged["strategy_max_seq_length"]),
-                "load_in_4bit": False,
-                "vllm_quantization": merged.get("strategy_vllm_quantization", ""),
-                "vllm_runtime_reserve_gib": vllm_runtime_reserve_gib(co_resident_sleep=True, token_scoring=False),
-            })
-            strategy_heads = detect_attention_heads(strategy_name)
-            memory_strategy_layout = derive_vllm_parallel_layout(
-                strategy_layout_cfg, roles, memory, strategy_heads, model_name=strategy_name)
-            strategy_frontier = int(merged["groups_per_step"]) * int(merged["frozen_programs_per_parent"])
-            strategy_layout = align_vllm_layout_to_concurrency(
-                strategy_layout_cfg,
-                memory_strategy_layout,
-                len(gpu_ids),
-                strategy_heads,
-                strategy_frontier,
-                model_name=strategy_name,
-            )
-            strategy_layout_cfg["vllm_tensor_parallel_size"] = (strategy_layout.tensor_parallel_size)
-            strategy_layout_cfg["vllm_pipeline_parallel_size"] = (strategy_layout.pipeline_parallel_size)
-            for note in resolve_memory_settings(
-                    strategy_layout_cfg, roles, memory, model_name=strategy_name):
-                print(f"[memory] auto strategy: {note}")
-            merged["strategy_vllm_tensor_parallel_size"] = (strategy_layout.tensor_parallel_size)
-            merged["strategy_vllm_pipeline_parallel_size"] = (strategy_layout.pipeline_parallel_size)
-            merged["strategy_gen_micro_batch"] = int(strategy_layout_cfg["gen_micro_batch"])
-            merged["strategy_vllm_max_num_batched_tokens"] = int(strategy_layout_cfg["vllm_max_num_batched_tokens"])
-            merged["strategy_vllm_runtime_reserve_gib"] = float(strategy_layout_cfg["vllm_runtime_reserve_gib"])
-            merged["strategy_generation_frontier"] = strategy_frontier
-            merged["separate_strategy_inference_pool"] = bool(
-                separate_local_strategy_pool
-                or strategy_layout.tensor_parallel_size
-                != layout.tensor_parallel_size
-                or strategy_layout.pipeline_parallel_size
-                != layout.pipeline_parallel_size
-            )
-            validate_attention_heads(strategy_heads, strategy_layout.tensor_parallel_size, strategy_name)
-            frontier_note = ""
-            if strategy_layout != memory_strategy_layout:
-                frontier_note = (
-                    f"; live frontier={strategy_frontier}, reshaped from "
-                    f"{memory_strategy_layout.replicas}xTP"
-                    f"{memory_strategy_layout.tensor_parallel_size} so every "
-                    "rollout GPU participates")
-            print(f"[config] strategy model {strategy_name}: "
-                  f"{strategy_layout.replicas} vLLM replica(s), "
-                  f"TP={strategy_layout.tensor_parallel_size}, "
-                  f"PP={strategy_layout.pipeline_parallel_size}"
-                  f"{frontier_note}")
-    elif merged["frozen_solver"] and merged["strategy_model_name"] != coder_name:
-        raise ValueError(f"Using the frozen {STRATEGY_MODEL_NAME} solver with a different coder "
-                         "requires generation_backend=vllm")
 
     for note in resolve_memory_settings(merged, roles, memory, model_name=coder_name):
         print(f"[memory] auto: {note}")

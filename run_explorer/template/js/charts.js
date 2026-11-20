@@ -294,31 +294,6 @@ function textOn(col) {
   return L > 0.62 ? "#0b0b0b" : "#ffffff";
 }
 
-/* ---------------------------------------------------------------- heat map ---------- */
-function heatmap(el, o) {
-  registerChart(el, () => {
-    const nr = o.rows.length, nc = o.cols.length;
-    const lw = o.rowLabelW || 56, topH = o.colLabelH || 26;
-    const W = Math.max(280, el.clientWidth || 600);
-    const cw = Math.max(o.minCell || 6, Math.min(o.maxCell || 44, (W - lw - 8) / nc)), ch = o.cellH || Math.max(14, Math.min(34, 420 / nr));
-    const H = topH + nr * ch + 8;
-    el.innerHTML = "";
-    const svg = sv("svg", { viewBox: `0 0 ${lw + nc * cw + 8} ${H}`, width: lw + nc * cw + 8, height: H, style: `max-width:${lw + nc * cw + 8}px` }, el);
-    const every = Math.ceil(nc / Math.max(1, Math.floor(nc * cw / 26)));
-    o.cols.forEach((c, j) => { if (j % every) return; const t = sv("text", { x: lw + cw * (j + 0.5), y: 15, "text-anchor": "middle" }, svg); t.textContent = c; });
-    o.rows.forEach((r, i) => { const t = sv("text", { x: lw - 8, y: topH + ch * (i + 0.5) + 4, "text-anchor": "end" }, svg); t.textContent = r; });
-    for (let i = 0; i < nr; i++) for (let j = 0; j < nc; j++) {
-      const v = o.val(i, j);
-      const col = v == null ? cssVar("--surface-2") : o.color(v, i, j);
-      const rc = sv("rect", { x: lw + cw * j + 1, y: topH + ch * i + 1, width: cw - 2, height: ch - 2, rx: 3, fill: col, style: o.onClick ? "cursor:pointer" : "" }, svg);
-      if (o.text) { const tx = o.text(v, i, j); if (tx != null && cw > 22) { const t = sv("text", { x: lw + cw * (j + 0.5), y: topH + ch * (i + 0.5) + 3.5, "text-anchor": "middle", style: "fill:" + (o.textColor ? o.textColor(v, i, j) : "#fff") + ";font-size:10px;pointer-events:none" }, svg); t.textContent = tx; } }
-      rc.addEventListener("mousemove", ev => { const html = o.tip ? o.tip(i, j, v) : null; if (html) tipShow(html, ev); });
-      rc.addEventListener("mouseleave", tipHide);
-      if (o.onClick) rc.addEventListener("click", () => o.onClick(i, j, v));
-    }
-  });
-}
-
 /* ---------------------------------------------------------------- AC1 solution plot - */
 function fftInPlace(re, im, inv) {
   const N = re.length;

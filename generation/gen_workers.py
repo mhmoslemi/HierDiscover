@@ -79,15 +79,6 @@ import diagnostics.terminal_output as _terminal_output
 setting_log_only = getattr(
     _terminal_output, "setting_log_only", _terminal_output.terminal_log_only)
 
-# Level-1 vLLM sleep releases tagged weights and KV blocks, but the sleeping
-# process still owns CUDA contexts, NCCL state, compiled graphs, and allocator
-# metadata. Two alternating, RAM-resident pools therefore cannot each claim
-# 90% of the same card. Keep enough unclaimed memory for the inactive pool.
-# Long prompt-logprob scoring briefly materializes a vocabulary projection for
-# an entire chunk.  Qwen3-Coder's 150k-token vocabulary needs several GiB on
-# top of the steady model/KV allocation, while the sleeping strategy engine
-# and offloaded trainer still retain CUDA context state.  Twelve GiB left less
-# than one projection's headroom in real 96-GiB runs; keep sixteen unclaimed.
 # Prompt-logprob scoring materializes a vocabulary projection for every prefill
 # chunk.  On 150k-vocabulary coder models that transient is substantially
 # larger than ordinary generation activations, and CUDA-graph memory can make
@@ -1049,8 +1040,7 @@ def _redirect_vllm_output(log_path, rank, gpu_group):
     return handle
 
 
-async def _serve_generation_requests(task_queue, generate, *, done_marker="__strategies_done__",
-                                     log_stats=None):
+async def _serve_generation_requests(task_queue, generate, *, log_stats=None):
     """Accept ready requests while other requests are still decoding."""
     pending = set()
     next_stats_log = time.monotonic() + 10.0
@@ -1063,7 +1053,7 @@ async def _serve_generation_requests(task_queue, generate, *, done_marker="__str
                     break
                 if task is None:
                     return True
-                if task == (done_marker,):
+                if task == ("__rollouts_done__",):
                     if any(not future.done() for future in pending):
                         raise RuntimeError("generation session ended with requests in flight")
                     for future in pending:
@@ -1133,7 +1123,7 @@ def _vllm_worker_loop(rank, gpu_id, model_name, max_seq_length, load_in_4bit,
                       enable_expert_parallel=False, enable_sleep_mode=False,
                       sleep_level=1, control_queue=None, vllm_log_path=None,
                       disable_custom_all_reduce=False, engine_options=None,
-                      enable_log_stats=False, frozen_strategy=False,
+                      enable_log_stats=False,
                       hardware_profile="RTX6000"):
     """Persistent vLLM engine spanning one physical GPU group."""
     # vLLM creates EngineCore grandchildren. If a wrapper exits after an
@@ -1304,11 +1294,7 @@ def _vllm_worker_loop(rank, gpu_id, model_name, max_seq_length, load_in_4bit,
             raise RuntimeError("continuous generation requests must contain exactly one sample")
         chain, prompt, _count = jobs[0]
         tokenizer = llm.get_tokenizer()
-        if frozen_strategy:
-            prompt_ids = tokenizer.encode(prompt, add_special_tokens=False)
-            prompt = {"prompt_token_ids": prompt_ids}
-        else:
-            prompt_ids = tokenizer.encode(prompt)
+        prompt_ids = tokenizer.encode(prompt)
         max_tokens = min(int(options["max_new_tokens"]),
                          int(max_seq_length) - len(prompt_ids))
         if max_tokens < 1:
@@ -1332,7 +1318,7 @@ def _vllm_worker_loop(rank, gpu_id, model_name, max_seq_length, load_in_4bit,
             sampling["logprobs"] = 0
         output = await _async_final_output(
             prompt, SamplingParams(**sampling), _lora_request(adapter_path),
-            _next_request_id("strategy" if frozen_strategy else "rollout"))
+            _next_request_id("rollout"))
         candidates = getattr(output, "outputs", None) or []
         if candidates:
             candidate = candidates[0]
@@ -1380,14 +1366,12 @@ def _vllm_worker_loop(rank, gpu_id, model_name, max_seq_length, load_in_4bit,
         task = task_queue.get()
         if task is None:
             break
-        if task in (("__strategies__",), ("__rollouts__",)):
+        if task == ("__rollouts__",):
             try:
                 if not async_engine:
                     raise RuntimeError("continuous generation requires AsyncLLM")
                 stopping = _run_async(_serve_generation_requests(
                     task_queue, _generate_single_request,
-                    done_marker=("__strategies_done__" if task == ("__strategies__",)
-                                 else "__rollouts_done__"),
                     log_stats=log_stats))
             except Exception:
                 detail = traceback.format_exc()
@@ -1584,15 +1568,7 @@ def _vllm_worker_loop(rank, gpu_id, model_name, max_seq_length, load_in_4bit,
             runnable_jobs = []
             max_tokens_by_job = []
             for group_idx, prompt, count in jobs:
-                if frozen_strategy:
-                    # Native strategy templates already include BOS. Pass
-                    # exact ids so the serving tokenizer cannot add it twice.
-                    prompt_ids = tokenizer.encode(prompt, add_special_tokens=False)
-                    prompt_len = len(prompt_ids)
-                    prompt = {"prompt_token_ids": prompt_ids}
-                else:
-                    prompt_ids = tokenizer.encode(prompt)
-                    prompt_len = len(prompt_ids)
+                prompt_len = len(tokenizer.encode(prompt))
                 max_tokens = min(
                     int(gen_kwargs["max_new_tokens"]),
                     int(max_seq_length) - int(prompt_len),
@@ -1850,7 +1826,6 @@ class GenerationPool:
                  vllm_enable_sleep_mode=False,
                  vllm_sleep_level=1,
                  vllm_persistent_workers=None,
-                 vllm_co_resident_sleep=False,
                  vllm_token_scoring=False,
                  vllm_runtime_reserve_gib=None,
                  vllm_staged_loading=False,
@@ -1867,7 +1842,6 @@ class GenerationPool:
         self.gen_micro_batch = int(gen_micro_batch or 0)
         self.backend = str(backend).lower()
         requested_vllm_utilization = float(vllm_gpu_memory_utilization)
-        self.vllm_co_resident_sleep = bool(vllm_co_resident_sleep)
         self.vllm_token_scoring = bool(vllm_token_scoring)
         self.vllm_gpu_memory_utilization = requested_vllm_utilization
         self.sleep_requested = bool(vllm_enable_sleep_mode)
@@ -1876,7 +1850,6 @@ class GenerationPool:
             raise ValueError("vllm_sleep_level must be 1 or 2")
         self.vllm_staged_loading = bool(vllm_staged_loading)
         vllm_engine_options = dict(vllm_engine_options or {})
-        self._frozen_strategy = not vllm_engine_options.get("enable_lora", True)
         if vllm_base_policy_only:
             # Match the LoRA engine's native GPT-OSS kernels for exact
             # consecutive-policy scoring after the first adapter update.
@@ -1912,18 +1885,12 @@ class GenerationPool:
 
         reserve_gib = (
             _default_vllm_runtime_reserve_gib(
-                co_resident_sleep=self.vllm_co_resident_sleep,
                 token_scoring=self.vllm_token_scoring,
             )
             if vllm_runtime_reserve_gib is None else
             max(0.0, float(vllm_runtime_reserve_gib))
         )
         self.vllm_runtime_reserve_gib = float(reserve_gib)
-        reserve_reasons = []
-        if self.vllm_co_resident_sleep:
-            reserve_reasons.append("shared sleep residency")
-        if self.vllm_token_scoring:
-            reserve_reasons.append("exact token scoring")
         if self.backend == "vllm" and reserve_gib > 0.0:
             self.vllm_gpu_memory_utilization = (
                 _cap_vllm_utilization_for_gpus(
@@ -1933,8 +1900,9 @@ class GenerationPool:
                 ))
             if (self.vllm_gpu_memory_utilization
                     < requested_vllm_utilization - 1e-9):
+                reserve_reason = "exact token scoring" if self.vllm_token_scoring else "runtime headroom"
                 setting_log_only(
-                    f"[pool] {' + '.join(reserve_reasons)}: reserving at "
+                    f"[pool] {reserve_reason}: reserving at "
                     f"least {reserve_gib:.1f} GiB/GPU; "
                     "vLLM utilization "
                     f"{requested_vllm_utilization:.3f} -> "
@@ -2084,7 +2052,6 @@ class GenerationPool:
         }
         if self.backend == "vllm":
             self._worker_options["hardware_profile"] = hardware_profile
-            self._worker_options["frozen_strategy"] = self._frozen_strategy
         if self.backend == "vllm" and hardware_profile in {"B200", "B200_full_ram"}:
             # Evaluation avoids reserved cores; inference can use the full allowed cpuset.
             self._worker_options["enable_log_stats"] = True
@@ -2468,15 +2435,8 @@ class GenerationPool:
             pending = [rank for rank in pending if rank not in wave]
 
     def wake_up(self):
-        if not self.vllm_co_resident_sleep:
-            _assert_vllm_memory_available(
-                self.gpu_ids, self.vllm_gpu_memory_utilization,
-                self.model_name)
-        # For co-resident pools, a full-budget preflight is mathematically
-        # wrong: this pool's untagged CUDA/NCCL allocations are already part
-        # of the used-memory reading, and wake_up only restores its released
-        # tagged allocations. The fixed outside-vLLM reserve above protects
-        # that delta while the other pool remains asleep.
+        _assert_vllm_memory_available(
+            self.gpu_ids, self.vllm_gpu_memory_utilization, self.model_name)
         # Wake the RAM-resident engine before loading transient checkpoints so
         # its offloaded weights leave host memory as early as vLLM permits.
         self._vllm_control("wake_up", self._persistent_worker_ids)
@@ -2488,148 +2448,6 @@ class GenerationPool:
             if rank not in self._persistent_worker_ids)
         self.persistent_workers = len(self._persistent_worker_ids)
         self._start_workers(reload_ids)
-
-    def run_sequential_chains(
-            self, *, num_chains, num_stages, prompt_builder, result_handler,
-            adapter_path, max_new_tokens, temperature, top_p, step_idx=0,
-            top_k=None, min_p=None, progress_desc="strategies"):
-        """Run dependent generation chains without a barrier between stages.
-
-        Call ``result_handler(chain, stage, text)`` once for each response. After
-        it records a plan or fallback, ``prompt_builder(chain, stage)`` can build
-        the next prompt.
-
-        Async vLLM engines continuously batch ready requests from different
-        chains. Each chain has at most one request in flight.
-        HF and older synchronous vLLM engines keep one request per worker.
-        """
-        num_chains = int(num_chains)
-        num_stages = int(num_stages)
-        if num_chains < 0 or num_stages < 0:
-            raise ValueError("chain and stage counts must be non-negative")
-        if not num_chains or not num_stages:
-            return {"completed": 0}
-        assigned_ranks = (
-            self.num_workers * self.tensor_parallel_size
-            * self.pipeline_parallel_size)
-        continuous = getattr(self, "_async_worker_ids", set()) == set(range(self.num_workers))
-        worker_capacity = ((num_chains + self.num_workers - 1) // self.num_workers
-                           if continuous else 1)
-        setting_log_only(
-            f"[pool] dependency-pipelined strategy scheduler: "
-            f"{num_chains} chain(s) x {num_stages} stage(s) across "
-            f"{self.num_workers} engine(s), "
-            f"TP={self.tensor_parallel_size}, "
-            f"PP={self.pipeline_parallel_size} "
-            f"({assigned_ranks} GPU rank(s) assigned); no per-stage "
-            f"barriers; continuous batching={'on' if continuous else 'off'}",
-            flush=True)
-
-        base_gen_kwargs = {
-            "max_new_tokens": int(max_new_tokens),
-            "temperature": float(temperature),
-            "top_p": float(top_p),
-            "micro_batch": self.gen_micro_batch,
-            "return_logprobs": False,
-            "full_policy_sampling": False,
-        }
-        if top_k is not None:
-            base_gen_kwargs["top_k"] = int(top_k)
-        if min_p is not None:
-            base_gen_kwargs["min_p"] = float(min_p)
-
-        pending = deque((chain_index, 0) for chain_index in range(num_chains))
-        worker_loads = [0] * self.num_workers
-        inflight = {}
-        completed = 0
-        total = num_chains * num_stages
-        bar = make_progress_bar(total, desc=progress_desc)
-
-        def _dispatch(rank, item):
-            chain_index, stage_index = item
-            prompt = prompt_builder(chain_index, stage_index)
-            task_step = int(step_idx) + stage_index * 10_000
-            gen_kwargs = dict(base_gen_kwargs)
-            # Preserve the old stable chain seed even when a continuation is
-            # picked up by a different physical worker.
-            gen_kwargs["seed_rank"] = int(chain_index) % self.num_workers
-            self.task_queues[rank].put((
-                task_step,
-                adapter_path,
-                [(int(chain_index), prompt, 1)],
-                gen_kwargs,
-            ))
-            inflight[chain_index] = (rank, stage_index)
-            worker_loads[rank] += 1
-
-        try:
-            if continuous:
-                for tasks in self.task_queues:
-                    tasks.put(("__strategies__",))
-            while pending or inflight:
-                while pending and min(worker_loads) < worker_capacity:
-                    preferred = int(pending[0][0]) % self.num_workers
-                    rank = min(range(self.num_workers), key=lambda rank:
-                               (worker_loads[rank], rank != preferred, rank))
-                    _dispatch(rank, pending.popleft())
-
-                if not inflight:
-                    raise RuntimeError(
-                        "sequential generation has pending work but no "
-                        "available worker")
-                try:
-                    rank, group_idx, job_results = self._get_worker_message(self.result_queue,
-                        timeout=1.0)
-                except queue.Empty:
-                    dead = [
-                        (rank, None if self.procs[rank] is None
-                         else self.procs[rank].exitcode)
-                        for rank in {item[0] for item in inflight.values()}
-                        if (self.procs[rank] is None
-                            or self.procs[rank].exitcode is not None)
-                    ]
-                    if dead:
-                        raise RuntimeError(
-                            "generation worker(s) exited during sequential "
-                            f"strategy generation: {dead}")
-                    continue
-
-                rank = int(rank)
-                if rank not in {item[0] for item in inflight.values()}:
-                    raise RuntimeError(
-                        "unexpected or duplicate generation result from "
-                        f"worker {rank} during sequential strategy generation")
-                if group_idx is None and isinstance(job_results, dict):
-                    detail = job_results.get(
-                        "error", "unknown worker failure")
-                    raise RuntimeError(
-                        f"generation worker {rank} failed during sequential "
-                        f"strategy generation:\n{detail}")
-                chain_index = int(group_idx)
-                if (chain_index not in inflight or inflight[chain_index][0] != rank
-                        or len(job_results) != 1):
-                    raise RuntimeError(
-                        "sequential strategy generation returned a result "
-                        "for the wrong chain or with the wrong sample count")
-                _, stage_index = inflight.pop(chain_index)
-                worker_loads[rank] -= 1
-
-                result_handler(chain_index, stage_index, job_results[0][0])
-                completed += 1
-                bar.update(1)
-                if stage_index + 1 < num_stages:
-                    pending.append((chain_index, stage_index + 1))
-        finally:
-            bar.close()
-
-        if completed != total:
-            raise RuntimeError(
-                f"sequential strategy generation completed {completed}/"
-                f"{total} dependent stages")
-        if continuous:
-            for tasks in self.task_queues:
-                tasks.put(("__strategies_done__",))
-        return {"completed": completed}
 
     def iter_group_jobs(self, prompts_by_group, group_size, adapter_path,
                         max_new_tokens, temperature, top_p, step_idx=0,
@@ -2658,8 +2476,7 @@ class GenerationPool:
         worker_jobs = distribute_jobs(
             prompts_by_group, group_size, self.num_workers,
             counts_by_group=counts_by_group)
-        if (getattr(self, "_async_worker_ids", set()) == set(range(self.num_workers))
-                and not self._frozen_strategy):
+        if getattr(self, "_async_worker_ids", set()) == set(range(self.num_workers)):
             # Let idle engines pick up unstarted coder requests.
             counts = ([int(group_size)] * len(prompts_by_group) if counts_by_group is None
                       else [int(count) for count in counts_by_group])
@@ -3463,23 +3280,6 @@ class PhasedVLLMGenerationPool:
         pool, adapter_path = self._pool_for_adapter(adapter_path)
         yield from pool.iter_group_jobs(prompts_by_group, group_size, adapter_path, *args, **kwargs)
 
-    def run_sequential_chains(self, *, adapter_path, **kwargs):
-        pool, adapter_path = self._pool_for_adapter(adapter_path)
-        try:
-            return pool.run_sequential_chains(adapter_path=adapter_path, **kwargs)
-        except BaseException:
-            # A failed chain can leave other requests in flight.
-            # Stop those workers directly; sending sleep commands into their
-            # unfinished generation stream can block or consume stale replies.
-            self._pool = None
-            self._awake = False
-            self._persistent = False
-            try:
-                pool.shutdown()
-            finally:
-                self._after_stop()
-            raise
-
     def generate_groups(self, prompts_by_group, group_size, adapter_path, *args, **kwargs):
         pool, adapter_path = self._pool_for_adapter(adapter_path)
         return pool.generate_groups(prompts_by_group, group_size, adapter_path, *args, **kwargs)
@@ -3586,14 +3386,6 @@ class OnDemandGenerationPool:
     def iter_group_jobs(self, *args, **kwargs):
         pool = self._ensure_started()
         yield from pool.iter_group_jobs(*args, **kwargs)
-
-    def run_sequential_chains(self, *args, **kwargs):
-        pool = self._ensure_started()
-        try:
-            return pool.run_sequential_chains(*args, **kwargs)
-        except BaseException:
-            self.release()
-            raise
 
     def generate_groups(self, *args, **kwargs):
         return self._ensure_started().generate_groups(*args, **kwargs)

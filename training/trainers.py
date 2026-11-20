@@ -1598,7 +1598,6 @@ class ProcessDistributedTrainer:
 
     def _queue_examples(self, examples, *, seal=True, announce=True, weighted_offload=False):
         """Queue expensive examples first; idle ranks steal the next work."""
-        import torch
 
         maximum_length = max(1, int(self.cfg.max_seq_length))
 
@@ -1627,101 +1626,60 @@ class ProcessDistributedTrainer:
         for example in copied:
             example["_shared_prefix_packing_allowed"] = shared_prefix_packing
 
-        if (bool(getattr(self.cfg, "strategies", False)) and shared_prefix_packing):
-            from training.fast_distributed import SHARED_PREFIX_WORK_KEY
-
-            grouped = {}
-            for example in copied:
-                prompt_job_id = example.get("prompt_job_id")
-                if prompt_job_id is None:
-                    raise RuntimeError("strategy training example has no prompt_job_id")
-                grouped.setdefault(int(prompt_job_id), []).append(example)
-
-            def group_cost(group):
-                prompt = int(group[0]["prompt_ids"].shape[1])
-                responses = [int(example["response_ids"].shape[1]) for example in group]
-                # The prompt is evaluated once. Each isolated response branch
-                # attends to that prompt and its own causal prefix.
-                return prompt * prompt + sum(response * (prompt + response) for response in responses)
-
-            groups = []
-            for prompt_job_id, group in grouped.items():
-                prompt = group[0]["prompt_ids"]
-                if any(
-                        example["prompt_ids"].shape != prompt.shape
-                        or not torch.equal(example["prompt_ids"], prompt)
-                        for example in group[1:]):
-                    raise RuntimeError(f'one strategy prompt_job_id contains different prompts: {prompt_job_id}')
-                # Longest branches first makes any budget-driven split stable
-                # and avoids leaving one pathological response until last.
-                group.sort(key=lambda example: int(example["response_ids"].shape[1]), reverse=True)
-                groups.append(group)
-            groups.sort(key=group_cost, reverse=True)
-            for group in groups:
-                self._work_queue.put({SHARED_PREFIX_WORK_KEY: group})
-            ordered = copied
-            if announce:
+        ordered = sorted(copied, key=estimated_cost, reverse=True)
+        offload_waves = None
+        if weighted_offload:
+            # First-fit decreasing packs recovery trajectories into
+            # RAM-safe concurrent waves. Unlike the former fixed rank
+            # count, a wave can use every GPU when its shorter activation
+            # graphs fit the same node-wide budget. Flattening the waves
+            # retains asynchronous work stealing; the shared weighted
+            # gate remains the authoritative safety mechanism.
+            gate = self._activation_offload_semaphore
+            waves = []
+            for example in ordered:
+                work = int(example["prompt_ids"].shape[1]) + int(example["response_ids"].shape[1])
+                units = gate.request_units(work)
+                if units is None:
+                    waves.append({
+                        "units": gate.capacity_units + 1,
+                        "items": [example],
+                    })
+                    continue
+                placed = False
+                for wave in waves:
+                    if (len(wave["items"]) < self._world_size
+                            and int(wave["units"]) + int(units)
+                            <= int(gate.capacity_units)):
+                        wave["items"].append(example)
+                        wave["units"] += int(units)
+                        placed = True
+                        break
+                if not placed:
+                    waves.append({
+                        "units": int(units),
+                        "items": [example],
+                    })
+            ordered = [example for wave in waves for example in wave["items"]]
+            offload_waves = [len(wave["items"]) for wave in waves]
+        for example in ordered:
+            self._work_queue.put(example)
+        if announce:
+            if offload_waves is None:
+                print(f"[{self._process_label}] queued {len(ordered)} "
+                      "examples longest-first; each free GPU claims the "
+                      "next adaptive batch", flush=True)
+            else:
+                preview = ",".join(str(value) for value in offload_waves[:8])
+                suffix = "..." if len(offload_waves) > 8 else ""
                 print(
-                    f"[{self._process_label}] queued {len(groups)} shared strategy prompts / "
-                    f"{len(ordered)} examples by packed cost; each free GPU "
-                    "claims one complete prompt group",
+                    f"[{self._process_label}] queued {len(ordered)} "
+                    "oversized examples longest-first; conservative "
+                    f"startup ranks/wave={preview}{suffix}, then measured "
+                    "token-weighted admission expands concurrency; idle "
+                    "ranks steal work as RAM capacity is freed",
                     flush=True,
                 )
-        else:
-            ordered = sorted(copied, key=estimated_cost, reverse=True)
-            offload_waves = None
-            if weighted_offload:
-                # First-fit decreasing packs recovery trajectories into
-                # RAM-safe concurrent waves. Unlike the former fixed rank
-                # count, a wave can use every GPU when its shorter activation
-                # graphs fit the same node-wide budget. Flattening the waves
-                # retains asynchronous work stealing; the shared weighted
-                # gate remains the authoritative safety mechanism.
-                gate = self._activation_offload_semaphore
-                waves = []
-                for example in ordered:
-                    work = int(example["prompt_ids"].shape[1]) + int(example["response_ids"].shape[1])
-                    units = gate.request_units(work)
-                    if units is None:
-                        waves.append({
-                            "units": gate.capacity_units + 1,
-                            "items": [example],
-                        })
-                        continue
-                    placed = False
-                    for wave in waves:
-                        if (len(wave["items"]) < self._world_size
-                                and int(wave["units"]) + int(units)
-                                <= int(gate.capacity_units)):
-                            wave["items"].append(example)
-                            wave["units"] += int(units)
-                            placed = True
-                            break
-                    if not placed:
-                        waves.append({
-                            "units": int(units),
-                            "items": [example],
-                        })
-                ordered = [example for wave in waves for example in wave["items"]]
-                offload_waves = [len(wave["items"]) for wave in waves]
-            for example in ordered:
-                self._work_queue.put(example)
-            if announce:
-                if offload_waves is None:
-                    print(f"[{self._process_label}] queued {len(ordered)} "
-                          "examples longest-first; each free GPU claims the "
-                          "next adaptive batch", flush=True)
-                else:
-                    preview = ",".join(str(value) for value in offload_waves[:8])
-                    suffix = "..." if len(offload_waves) > 8 else ""
-                    print(
-                        f"[{self._process_label}] queued {len(ordered)} "
-                        "oversized examples longest-first; conservative "
-                        f"startup ranks/wave={preview}{suffix}, then measured "
-                        "token-weighted admission expands concurrency; idle "
-                        "ranks steal work as RAM capacity is freed",
-                        flush=True,
-                    )
         if seal:
             for _ in range(self._world_size):
                 self._work_queue.put(None)

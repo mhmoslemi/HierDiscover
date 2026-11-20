@@ -2,7 +2,7 @@
 /* ---- main.js: boot, navigation, theme ---------------------------------------------------- */
 const TAB_GROUPS = [
   ["Understand", ["overview", "pipeline"]],
-  ["Search & strategy", ["search", "strategist"]],
+  ["Search", ["search"]],
   ["Learning", ["train"]],
   ["Data", ["rollouts", "solution"]],
   ["Reference", ["published", "concepts", "logs"]],
@@ -105,7 +105,7 @@ async function boot() {
     try { D.pub = await inflate("pub"); } catch (e) { D.pub = {}; }
     prepare();
     { const st = TABS.find(t => t.id === "search"), so = TABS.find(t => t.id === "solution"), pb = TABS.find(t => t.id === "published");
-      if (st) st.label = RUN.hasJev ? "Search: PUCT + JEV" : "Search: PUCT";
+      if (st) st.label = "Search: " + RUN.selection;
       if (so) so.label = (PROB.kernel ? "Kernel (" : "Solution (") + PROB.short + ")";
       if (pb) pb.label = "Published SOTA"; }
     { const ef = effortInfo(), chip = $("#effortChip");
