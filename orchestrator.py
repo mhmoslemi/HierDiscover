@@ -1389,6 +1389,7 @@ def _resume_spo_rs_step_from_artifacts(
             siblings = slice(start, start + group_size)
             recovered_advantages[siblings], _ = hybrid_advantages(
                 rewards[siblings], recovered_advantages[siblings],
+                ttt_weight=cfg.hybrid_ttt_weight,
                 spo_weight=cfg.hybrid_spo_weight)
     spo_info = spo_infos[0]
     saved_value_before = spo_info.get("value_before")
@@ -1678,6 +1679,7 @@ def _resume_spo_rs_step_from_artifacts(
     }
     if hybrid_mode:
         stats["hybrid_reference_kl_mean"] = hybrid_reference_mean
+        stats["hybrid_ttt_weight"] = cfg.hybrid_ttt_weight
         stats["hybrid_spo_weight"] = cfg.hybrid_spo_weight
     if overflow_state is not None:
         stats.update(parallel_trainer.recover_spo_rs_overflow(recovery_examples, cfg, step_idx, overflow_state))
@@ -2520,6 +2522,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                                     _complete_spo_rs_overlap_examples(
                                         ready_examples, spo_rs_tracker,
                                         sibling_futures=reward_futures[group_id],
+                                        ttt_weight=cfg.hybrid_ttt_weight,
                                         spo_weight=cfg.hybrid_spo_weight)
                                     parallel_trainer.queue_spo_rs_overlap(ready_examples)
                                 if not ready_groups:
@@ -2810,7 +2813,8 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
             adv_scale_label = "beta"
             if hybrid_mode:
                 advantages, sibling_beta = hybrid_advantages(
-                    rewards_np, advantages, spo_weight=cfg.hybrid_spo_weight)
+                    rewards_np, advantages, ttt_weight=cfg.hybrid_ttt_weight,
+                    spo_weight=cfg.hybrid_spo_weight)
         else:
             advantages, adv_scale = compute_group_advantages(rewards_np)
             adv_scale_label = "beta"
@@ -3182,6 +3186,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
         step_stats["spo_rs_policy_updated"] = False
     if hybrid_mode:
         step_stats["hybrid_reference_kl_mean"] = hybrid_reference_mean
+        step_stats["hybrid_ttt_weight"] = cfg.hybrid_ttt_weight
         step_stats["hybrid_spo_weight"] = cfg.hybrid_spo_weight
 
 
@@ -3408,6 +3413,7 @@ def _main(trainer_startup):
         print(f"SPO-RS D_half:      {cfg.spo_rs_d_half}")
         print(f"SPO-RS rho min/max: {cfg.spo_rs_rho_min} / {cfg.spo_rs_rho_max}")
         if hybrid_mode:
+            print(f"Hybrid TTT weight:  {cfg.hybrid_ttt_weight:g}")
             print(f"Hybrid SPO-RS weight: {cfg.hybrid_spo_weight:g}")
             print("Policy loss:        TTT token-summed importance sampling")
         else:

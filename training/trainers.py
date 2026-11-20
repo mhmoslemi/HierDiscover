@@ -24,7 +24,7 @@ from training.exact_overflow import (
     _write_exact_spo_rs_overflow_state, _validate_precomputed_exact_gradients,
 )
 from training.fast_distributed import _move_optimizer_state, _restore_optimizer_state_to_parameters
-from training.hybrid import DEFAULT_SPO_WEIGHT, hybrid_advantages
+from training.hybrid import DEFAULT_SPO_WEIGHT, DEFAULT_TTT_WEIGHT, hybrid_advantages
 
 
 _FUSED_LONG_SINGLETON_MIN_TOKENS = 8192
@@ -1214,6 +1214,7 @@ def _prepare_spo_rs_overlap_inputs(tokenizer, group_responses, reward_futures, p
 
 
 def _complete_spo_rs_overlap_examples(examples, spo_rs_tracker=None, *, sibling_futures=None,
+                                      ttt_weight=DEFAULT_TTT_WEIGHT,
                                       spo_weight=DEFAULT_SPO_WEIGHT):
     """Attach advantages to reward-complete trajectories."""
     if not examples:
@@ -1229,7 +1230,8 @@ def _complete_spo_rs_overlap_examples(examples, spo_rs_tracker=None, *, sibling_
     if advantages is None:
         raise RuntimeError("SPO-RS overlap lost its frozen pre-step tracker baseline")
     if sibling_futures is not None:
-        advantages, _ = hybrid_advantages(rewards, advantages, spo_weight=spo_weight)
+        advantages, _ = hybrid_advantages(
+            rewards, advantages, ttt_weight=ttt_weight, spo_weight=spo_weight)
         advantages = [advantages[example["rollout_index"]] for example in examples]
     for example, advantage in zip(examples, advantages):
         example["advantage"] = float(advantage)

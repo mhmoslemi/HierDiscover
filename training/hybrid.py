@@ -5,17 +5,19 @@ import numpy as np
 from training.advantage import entropic_adaptive_advantages
 
 
+DEFAULT_TTT_WEIGHT = 1.0
 DEFAULT_SPO_WEIGHT = 1.0
 
 
-def hybrid_advantages(rewards, historical_advantages, *, spo_weight=DEFAULT_SPO_WEIGHT):
-    """Add weighted historical advantages to the full entropic sibling advantages."""
+def hybrid_advantages(rewards, historical_advantages, *,
+                      ttt_weight=DEFAULT_TTT_WEIGHT, spo_weight=DEFAULT_SPO_WEIGHT):
+    """Combine independently weighted TTT and historical SPO-RS advantages."""
     rewards = np.asarray(rewards, dtype=np.float64)
     historical_advantages = np.asarray(historical_advantages, dtype=np.float64)
     if rewards.ndim != 1 or rewards.size == 0 or historical_advantages.shape != rewards.shape:
         raise ValueError("hybrid rewards and historical advantages must align in one nonempty group")
     ttt_advantages, sibling_beta = entropic_adaptive_advantages(rewards)
-    return ttt_advantages + spo_weight * historical_advantages, sibling_beta
+    return ttt_weight * ttt_advantages + spo_weight * historical_advantages, sibling_beta
 
 
 def reference_logprob_mean(scored_responses):

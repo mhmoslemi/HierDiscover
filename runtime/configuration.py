@@ -12,7 +12,7 @@ import yaml
 from config_validation import (
     ADVANTAGE_MODES, COMMON_OPTIONAL_KEYS, COMMON_REQUIRED_KEYS, LEGACY_CODER_CAP_KEY,
     PARENT_SELECTION_MODES, RETIRED_BATCH_GROWTH_KEYS, RETIRED_TRAINER_KEYS, reject_retired_coder_cap,
-    retired_search_keys, validate_hybrid_spo_weight, validate_problem_config,
+    retired_search_keys, validate_hybrid_weight, validate_problem_config,
 )
 from runtime.hardware_profiles import generation_cpu_ids, local_checkpoint, restore_hardware_settings
 
@@ -24,7 +24,7 @@ from training.exact_overflow import (
     _clear_exact_sharded_recovery, _infer_exact_sharded_recovery, _read_exact_sharded_recovery,
     _write_exact_sharded_recovery, supports_warm_overflow,
 )
-from training.hybrid import DEFAULT_SPO_WEIGHT
+from training.hybrid import DEFAULT_SPO_WEIGHT, DEFAULT_TTT_WEIGHT
 
 
 SEQUENCE_CLIP_EPSILON_DEFAULT = 0.2
@@ -649,9 +649,12 @@ def load_config():
     if advantage_mode == "hybrid":
         if saved and "hybrid_spo_weight" not in saved:
             raise ValueError("Start a fresh hybrid run to use the new advantage formula")
-        spo_weight = (saved or merged).get("hybrid_spo_weight", DEFAULT_SPO_WEIGHT)
-        validate_hybrid_spo_weight(spo_weight, source=saved_config_path if saved else cfg_path)
-        merged["hybrid_spo_weight"] = float(spo_weight)
+        weight_source = saved_config_path if saved else cfg_path
+        for key, default in (("hybrid_ttt_weight", DEFAULT_TTT_WEIGHT),
+                             ("hybrid_spo_weight", DEFAULT_SPO_WEIGHT)):
+            weight = (saved or merged).get(key, default)
+            validate_hybrid_weight(key, weight, source=weight_source)
+            merged[key] = float(weight)
         merged["grad_clip"] = 0.0
         if not saved and args.kl_penalty_coef is None:
             merged["kl_penalty_coef"] = 0.1

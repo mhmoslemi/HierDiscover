@@ -424,7 +424,8 @@ def collect(run_dir, code_per_step=25, all_code=False, think_full=False, progres
                     "cumulative_training_seconds", "oom_quarantined_examples", "fast_trained_examples_per_gpu",
                     "fast_padded_token_budgets", "fast_peak_memory_fraction", "training_parallel_gpus",
                     "spo_rs_policy_updated", "spo_rs_sampling_adapter", "result_metric_name", "result_maximize",
-                    "hybrid_reference_kl_mean", "hybrid_sibling_weight", "hybrid_spo_weight"]
+                    "hybrid_reference_kl_mean", "hybrid_sibling_weight",
+                    "hybrid_ttt_weight", "hybrid_spo_weight"]
             for k in keep:
                 if k in summ:
                     rec[k] = summ[k]
