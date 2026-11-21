@@ -84,6 +84,25 @@ def load_tree(root, batch):
     return tree
 
 
+def save_rollout_report(directory, batch, tree):
+    scores = {row["id"]: row["score"] for row in tree}
+    parents = {}
+    for row in batch["rollouts"]:
+        parent_id = row["parent_id"]
+        parent = parents.setdefault(parent_id, {"raw_score": scores.get(parent_id), "children": {}})
+        parent["children"][row["id"]] = {
+            "raw_score": row["score"],
+            "advantage": batch["advantages"][row["id"]],
+        }
+    selected = None
+    if "selected_batch" in batch and "selected_rollout" in batch:
+        selected = f"batch{batch['selected_batch']:03d}/rollout{batch['selected_rollout']:03d}.txt"
+    path = Path(directory) / "rollouts.json"
+    report = {"step": batch["step"], "selected_reply": selected, "parents": parents}
+    _atomic_write_text(path, json.dumps(report, indent=2, allow_nan=False) + "\n")
+    return path
+
+
 def score_batch(root, step, cfg, host_admission=None):
     """Score an evaluated batch on two ordinary rollout workers."""
     from generation.gen_workers import (

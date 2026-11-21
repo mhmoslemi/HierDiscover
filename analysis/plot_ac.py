@@ -187,16 +187,12 @@ def plot_sequence(sequence, score, kind, label, save_path, title=None):
     )
     fig.tight_layout()
 
-    png_path = Path(save_path)
-    if png_path.suffix.lower() != ".png":
-        png_path = png_path.with_suffix(".png")
-    png_path.parent.mkdir(parents=True, exist_ok=True)
-    pdf_path = png_path.with_suffix(".pdf")
-    fig.savefig(png_path, bbox_inches="tight", dpi=300, transparent=True)
+    pdf_path = Path(save_path).with_suffix(".pdf")
+    pdf_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(pdf_path, bbox_inches="tight", transparent=True)
     plt.close(fig)
-    print(f"wrote {png_path} and {pdf_path}")
-    return png_path, pdf_path
+    print(f"wrote {pdf_path}")
+    return pdf_path
 
 
 def main():
@@ -208,7 +204,7 @@ def main():
                         help="select only rollouts at or before this step")
     parser.add_argument("--group", type=int, default=None)
     parser.add_argument("--rollout", type=int, default=None)
-    parser.add_argument("--out", default=None)
+    parser.add_argument("--out", default=None, help="output PDF path")
     parser.add_argument("--title", default=None)
     args = parser.parse_args()
 
@@ -257,7 +253,7 @@ def main():
                  f"group {selected.get('group')} · "
                  f"rollout {selected.get('rollout')}")
     print(f"selected {label}; verified {kind.upper()} score={computed:.12g}")
-    output = args.out or str(run_dir / f"{kind}_solution.png")
+    output = args.out or run_dir / f"{kind}_solution.pdf"
     plot_sequence(evaluated, computed, kind, label, output, title=args.title)
 
 

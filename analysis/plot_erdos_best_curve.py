@@ -3,7 +3,7 @@
 
 Usage:
     python -m analysis.plot_erdos_best_curve runs/tmo123
-    python3 -m analysis.plot_erdos_best_curve runs/tmo123 --out figures/progress.png
+    python3 -m analysis.plot_erdos_best_curve runs/tmo123 --out figures/progress.pdf
 """
 
 from __future__ import annotations
@@ -373,7 +373,7 @@ def config_caption(run_dir, valid_count, metric_name, maximize):
 
 def plot_best_curve(run_dir, output=None, title=None, min_label_delta=1e-5,
                     max_step=None):
-    """Load a run, draw its best-so-far curve, and save PNG and PDF files."""
+    """Load a run and save its best-so-far curve as a PDF."""
     # Load the problem settings and score history.
     run_dir = Path(run_dir)
     config, problem, metric_name, maximize = _run_info(run_dir)
@@ -505,25 +505,18 @@ def plot_best_curve(run_dir, output=None, title=None, min_label_delta=1e-5,
     # Reposition annotations after every label has been created.
     place_labels(fig, ax, annotations)
 
-    # Resolve output paths and create the destination directory if needed.
-    png_path = Path(output) if output else run_dir / "best_so_far.png"
-    if png_path.suffix.lower() != ".png":
-        png_path = png_path.with_suffix(".png")
-    png_path.parent.mkdir(parents=True, exist_ok=True)
-    pdf_path = png_path.with_suffix(".pdf")
+    pdf_path = Path(output).with_suffix(".pdf") if output else run_dir / "best_so_far.pdf"
+    pdf_path.parent.mkdir(parents=True, exist_ok=True)
 
-    # Save both image formats, then release the Matplotlib figure.
-    fig.savefig(png_path, bbox_inches="tight", dpi=300, transparent=True)
     fig.savefig(pdf_path, bbox_inches="tight", transparent=True)
     plt.close(fig)
 
-    # Report the final result and return both generated paths to the caller.
     final_step = steps[final_index]
     final_best = cumulative[final_index]
     print(f"read {valid_count} valid rollouts across steps 0-{steps[-1]}")
     print(f"best {metric_name} = {final_best:.9f} by step {final_step}")
-    print(f"wrote {png_path} and {pdf_path}")
-    return png_path, pdf_path
+    print(f"wrote {pdf_path}")
+    return pdf_path
 
 
 def main():
@@ -533,7 +526,7 @@ def main():
         description="Plot the cumulative best valid score for any problem."
     )
     parser.add_argument("run_dir", help="run directory containing stepXX folders")
-    parser.add_argument("--out", default=None, help="output PNG path")
+    parser.add_argument("--out", default=None, help="output PDF path")
     parser.add_argument("--title", default=None, help="custom plot title")
     parser.add_argument("--min-label-delta", type=float, default=1e-5,
                         help="minimum score change to mark as an improvement")

@@ -412,7 +412,7 @@ def _load_adapter(model, adapter_dir, *, announce=True):
         from models.gpt_oss_lora import load_shared_adapter
         load_shared_adapter(model, adapter_dir)
         if announce:
-            print(f"[resume] loaded shared GPT-OSS LoRA adapter from {adapter_dir}")
+            setting_log_only(f"[resume] loaded shared GPT-OSS LoRA adapter from {adapter_dir}")
         return
 
     import torch
@@ -441,7 +441,7 @@ def _load_adapter(model, adapter_dir, *, announce=True):
 
     set_peft_model_state_dict(model, weights)
     if announce:
-        print(f"[resume] loaded LoRA adapter from {adapter_dir}")
+        setting_log_only(f"[resume] loaded LoRA adapter from {adapter_dir}")
 
 
 def _save_training_checkpoint(exp_dir, next_step, adapter_path, sampler, optimizer, spo_rs_tracker=None):
@@ -1655,6 +1655,8 @@ def _resume_spo_rs_step_from_artifacts(
             overflow_state = None
             recovery_examples = all_examples
 
+    previous_best_raw = sampler.best_raw_state(maximize=bool(problem.maximize))
+    previous_best_value = float(previous_best_raw.raw_score) if previous_best_raw is not None else None
     archive_stats = sampler.update(all_children)
     print(
         f"[resume] step {step_idx}: reusing {len(artifacts)} saved rollout "
@@ -1692,9 +1694,25 @@ def _resume_spo_rs_step_from_artifacts(
             flush=True,
         )
 
+    for group, records in sorted(by_group.items()):
+        metas = [item["meta"] for item in records]
+        _print_group_rollout_stats(
+            group, [float(meta["reward"]) for meta in metas], [bool(meta["valid"]) for meta in metas],
+            [int(meta["n_response_tokens"]) for meta in metas], beta=metas[0].get("beta"),
+        )
+    valid_count = sum(bool(item["meta"]["valid"]) for item in artifacts)
+    setting_log_only(f"[step {step_idx}] reused {len(artifacts)} saved rollout .txt/.meta.json pairs", flush=True)
+    elapsed = None
+    if getattr(problem, "problem_type", "") == "trimul":
+        evaluated_batch = trimul_evaluation.completed_batch(exp_dir, step_idx)
+        if evaluated_batch is not None:
+            elapsed = evaluated_batch["scoring"]["rollout_seconds"] + evaluated_batch["evaluation_seconds"]
+    _print_rollout_totals(step_idx, valid_count, len(artifacts),
+                          len(all_examples) if training_enabled else "disabled", len(all_children), elapsed)
+
     step_states = [child for child, _parent in all_children]
     step_best = _step_best_candidate(step_states, problem.maximize)
-    best_seen = (sampler.best_raw_state(maximize=bool(problem.maximize)) or sampler.best_state())
+    best_seen = _print_best_ever_raw(sampler, step_idx, cfg, problem, previous_best_value)
     best_snapshot_path = save_best_state_snapshot(
         exp_dir, step_idx, best_seen,
         metric_name=str(problem.metric_name), maximize=bool(problem.maximize),
@@ -1721,7 +1739,7 @@ def _resume_spo_rs_step_from_artifacts(
             else None),
         "best_seen_reward": (float(best_seen.value) if best_seen is not None and best_seen.value is not None else None),
         "best_seen_step": (int(best_seen.timestep) if best_seen is not None else None),
-        "valid_fraction": (sum(bool(item["meta"]["valid"]) for item in artifacts) / len(artifacts)),
+        "valid_fraction": valid_count / len(artifacts),
         "code_valid_fraction": (
             1.0 - sum(_metadata_is_code_failure(item["meta"]) for item in artifacts) / len(artifacts)),
         "recovered_evaluated_step": True,
@@ -1961,6 +1979,67 @@ def _step_best_candidate(states, maximize):
         return choose(raw_states, key=lambda state: float(state.raw_score))
     return max(states, key=lambda state: float(state.value) if state.value is not None else -math.inf,
                default=None)
+
+
+def _print_group_rollout_stats(group, rewards, valids, response_tokens, beta=None):
+    beta_label = f"  beta={beta:.9f}" if beta is not None else ""
+    print(f"  group {group}: rewards min={min(rewards):.9f} "
+          f"mean={np.mean(rewards):.9f} max={max(rewards):.9f}  "
+          f"valid={sum(valids)}/{len(valids)}{beta_label}  "
+          f"response tokens min={min(response_tokens)} "
+          f"mean={np.mean(response_tokens):.1f} max={max(response_tokens)}")
+
+
+def _print_rollout_totals(step, valid, total, training_examples, children, elapsed, *, overlapped=False):
+    phase = ("rollout+eval+overlapped-backward wall time" if overlapped else "rollout+eval time")
+    timing = f"{elapsed:.1f}s" if elapsed is not None else "unavailable"
+    print(f"[step {step}] {phase}: {timing}  "
+          f"training examples: {training_examples}  new children: {children}  valid={valid}/{total}",
+          flush=True)
+
+
+def _print_best_ever_raw(sampler, step_idx, cfg, problem, previous_best_value):
+    best_raw = sampler.best_raw_state(maximize=bool(problem.maximize))
+    best_seen_result = best_raw if best_raw is not None else sampler.best_state()
+    if best_raw is not None:
+        direction = "higher is better" if problem.maximize else "lower is better"
+        best_value = float(best_raw.raw_score)
+        improved = (
+            previous_best_value is None
+            or (best_value > previous_best_value if problem.maximize else best_value < previous_best_value)
+        )
+        # ``target`` is part of the problem context shown to the model.
+        # ``target_print`` is deliberately display-only, so changing the SOTA
+        # comparison printed here cannot leak a new target into the prompt.
+        target = getattr(cfg, "target_print", getattr(problem, "target", None))
+        try:
+            target = float(target) if target is not None else None
+        except (TypeError, ValueError):
+            target = None
+        beats_sota = bool(
+            improved and target is not None and math.isfinite(target)
+            and (best_value > target if problem.maximize else best_value < target)
+        )
+        message = (
+            f"[step {step_idx}] best-ever raw {problem.metric_name}: "
+            f"{best_value:.9f} ({direction}; "
+            f"reward={float(best_raw.value):.9f}, found step={best_raw.timestep})"
+        )
+        if beats_sota:
+            margin = (best_value - target if problem.maximize else target - best_value)
+            message += (f'  🏆 CONGRATULATIONS — NEW SOTA! target={target:.12f}, beaten by {margin:.12f} 🏆')
+            color = "\033[32m"       # dark green
+        elif improved:
+            message += "  ★ NEW RUN BEST"
+            color = "\033[92m"       # light green
+        else:
+            message += "  no improvement this step"
+            color = "\033[93m"       # yellow
+        print(f"{color}{message}\033[0m", flush=True)
+    else:
+        message = (f'[step {step_idx}] best-ever raw {problem.metric_name}: unavailable')
+        print(f"\033[93m{message}\033[0m", flush=True)
+    return best_seen_result
 
 
 def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
@@ -2905,10 +2984,8 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
         step_rollout_count += len(valids)
         step_code_failure_count += sum(is_code_failure(res) for res in outs)
 
-        beta_label = f"  beta={adv_scale:.9f}" if adv_scale is not None else ""
-        print(f"  group {g}: rewards min={rewards_np.min():.9f} "
-              f"mean={rewards_np.mean():.9f} max={ttt_sibling_max:.9f}  "
-              f"valid={sum(valids)}/{len(valids)}{beta_label}")
+        _print_group_rollout_stats(g, rewards_np, valids,
+                                   [len(record["token_ids"]) for record in responses], beta=adv_scale)
 
         # Save every rollout (response + meta) to disk for debugging
         for r_idx, record in enumerate(responses):
@@ -3066,7 +3143,8 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
     # stepXX.summary.json remains the completion marker and is written only
     # after the adapter/checkpoint.
     save_suffix = ("with training disabled" if not training_enabled else "before adapter update")
-    print(f'[step {step_idx}] saved {saved_rollouts} rollout .txt/.meta.json pairs {save_suffix}', flush=True)
+    setting_log_only(
+        f'[step {step_idx}] saved {saved_rollouts} rollout .txt/.meta.json pairs {save_suffix}', flush=True)
 
     valid_fraction = (step_valid_count / step_rollout_count if step_rollout_count else 0.0)
     code_valid_fraction = (1.0 - step_code_failure_count / step_rollout_count if step_rollout_count else 1.0)
@@ -3100,14 +3178,11 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
     rollout_time = time.time() - rollout_t0
     if isolated_batch is not None:
         rollout_time += isolated_batch["scoring"]["rollout_seconds"] + isolated_batch["evaluation_seconds"]
-    training_label = (str(len(all_examples)) if training_enabled else "disabled")
-    rollout_phase_label = (
-        "rollout+eval+overlapped-backward wall time"
-        if (entropic_overlap_state is not None or spo_rs_overlap_state is not None)
-        else "rollout+eval time")
-    print(f"[step {step_idx}] {rollout_phase_label}: {rollout_time:.1f}s  "
-          f"training examples: {training_label}  "
-          f"new children: {len(all_children)}")
+    _print_rollout_totals(
+        step_idx, step_valid_count, step_rollout_count,
+        len(all_examples) if training_enabled else "disabled", len(all_children), rollout_time,
+        overlapped=(entropic_overlap_state is not None or spo_rs_overlap_state is not None),
+    )
 
     # Keep the previous raw optimum so the status line can distinguish a new
     # run best from a step that merely repeats the best-ever value.
@@ -3128,49 +3203,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
         float(step_best_result.raw_score)
         if step_best_result is not None and step_best_result.raw_score is not None else None)
 
-    # Report the problem-native metric before waiting for streamed backward. This
-    # is deliberately separate from reward: some problems maximize the raw
-    # quantity, while others (Erdos bounds, runtime, MSE) minimize it.
-    best_raw = sampler.best_raw_state(maximize=bool(problem.maximize))
-    best_seen_result = best_raw if best_raw is not None else sampler.best_state()
-    if best_raw is not None:
-        direction = "higher is better" if problem.maximize else "lower is better"
-        best_value = float(best_raw.raw_score)
-        improved = (
-            previous_best_value is None
-            or (best_value > previous_best_value if problem.maximize else best_value < previous_best_value)
-        )
-        # ``target`` is part of the problem context shown to the model.
-        # ``target_print`` is deliberately display-only, so changing the SOTA
-        # comparison printed here cannot leak a new target into the prompt.
-        target = getattr(cfg, "target_print", getattr(problem, "target", None))
-        try:
-            target = float(target) if target is not None else None
-        except (TypeError, ValueError):
-            target = None
-        beats_sota = bool(
-            improved and target is not None and math.isfinite(target)
-            and (best_value > target if problem.maximize else best_value < target)
-        )
-        message = (
-            f"[step {step_idx}] best-ever raw {problem.metric_name}: "
-            f"{best_value:.9f} ({direction}; "
-            f"reward={float(best_raw.value):.9f}, found step={best_raw.timestep})"
-        )
-        if beats_sota:
-            margin = (best_value - target if problem.maximize else target - best_value)
-            message += (f'  🏆 CONGRATULATIONS — NEW SOTA! target={target:.12f}, beaten by {margin:.12f} 🏆')
-            color = "\033[32m"       # dark green
-        elif improved:
-            message += "  ★ NEW RUN BEST"
-            color = "\033[92m"       # light green
-        else:
-            message += "  no improvement this step"
-            color = "\033[93m"       # yellow
-        print(f"{color}{message}\033[0m", flush=True)
-    else:
-        message = (f'[step {step_idx}] best-ever raw {problem.metric_name}: unavailable')
-        print(f"\033[93m{message}\033[0m", flush=True)
+    best_seen_result = _print_best_ever_raw(sampler, step_idx, cfg, problem, previous_best_value)
 
     best_snapshot_path = save_best_state_snapshot(
         exp_dir, step_idx, best_seen_result,
@@ -3591,7 +3624,7 @@ def _main(trainer_startup):
             adapter_path = Path(exp_dir) / resume_payload["adapter_dir"]
             _load_adapter(model, adapter_path)
             current_policy_adapter_path = adapter_path
-            print(f"[resume] training checkpoint found; next step is {start_step}")
+            setting_log_only(f"[resume] training checkpoint found; next step is {start_step}")
             if resume_payload["version"] == 1:
                 print('[resume] legacy batch-growth state ignored; using fixed configured batch sizes')
             if recover_update:
@@ -3602,7 +3635,7 @@ def _main(trainer_startup):
                 if interrupted_spo_rs_artifacts is not None:
                     token_recovery = (
                         _prepare_recoverable_response_tokens(model, tokenizer, interrupted_spo_rs_artifacts))
-                    print(
+                    setting_log_only(
                         "[resume] preflight prepared the interrupted "
                         f"step-{start_step} responses: "
                         f"{token_recovery['exact_sidecars']} exact token "
@@ -3636,7 +3669,7 @@ def _main(trainer_startup):
                     "generation/evaluation",
                     flush=True,
                 )
-                print(
+                setting_log_only(
                     "[resume] preflight prepared all saved responses: "
                     f"{token_recovery['exact_sidecars']} exact token "
                     "sidecar(s), "
@@ -3676,10 +3709,10 @@ def _main(trainer_startup):
     )
     if resume_payload is not None:
         optimizer.load_state_dict(resume_payload["optimizer"])
-        print("[resume] restored optimizer state")
+        setting_log_only("[resume] restored optimizer state")
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     total = sum(p.numel() for p in model.parameters())
-    print(f'[init] trainable params: {trainable:,} / total {total:,} ({100 * trainable / total:.2f}%)')
+    setting_log_only(f'[init] trainable params: {trainable:,} / total {total:,} ({100 * trainable / total:.2f}%)')
 
     # ---- sampler ----
     from search.sampler import make_sampler
@@ -3698,7 +3731,7 @@ def _main(trainer_startup):
     )
     if resume_payload is not None:
         sampler.load_state_dict(resume_payload["sampler"])
-        print(f'[resume] restored exact {sampler.selection_mode.upper()} archive and search statistics')
+        setting_log_only(f'[resume] restored exact {sampler.selection_mode.upper()} archive and search statistics')
     elif legacy_resume is not None:
         n_states, n_rollouts = _restore_legacy_archive(sampler, exp_dir, before_step=start_step)
         print(f'[resume] reconstructed {n_states} valid archived candidates from {n_rollouts} earlier rollouts')
@@ -3722,7 +3755,7 @@ def _main(trainer_startup):
         tracker_version = tracker_state.get("version") if tracker_state is not None else None
         if tracker_version == SPORSTracker.VERSION:
             spo_rs_tracker.load_state_dict(tracker_state)
-            print("[resume] restored the run-wide SPO-RS tracker")
+            setting_log_only("[resume] restored the run-wide SPO-RS tracker")
         elif tracker_version not in (None, 1):
             raise ValueError("unsupported SPO-RS tracker state")
         elif start_step:
@@ -3798,9 +3831,8 @@ def _main(trainer_startup):
         _live_adapter_snapshots(exp_dir, current_policy_adapter_path, spo_rs_tracker),
     )
     if removed_adapters:
-        print(f"[checkpoint] removed {len(removed_adapters)} superseded "
-              "adapter snapshot(s) while restoring the rolling checkpoint",
-              flush=True)
+        setting_log_only(f"[checkpoint] removed {len(removed_adapters)} superseded "
+                         "adapter snapshot(s) while restoring the rolling checkpoint", flush=True)
 
     if parallel_trainer is not None:
         parallel_trainer.finish_startup(backend, model, tokenizer, optimizer)
@@ -4237,9 +4269,8 @@ def _main(trainer_startup):
                         and len(_live_adapter_snapshots(exp_dir, current_policy_adapter_path, spo_rs_tracker)) > 1)
                     else Path(adapter_path).name
                 )
-                print(f"[checkpoint] removed {len(removed_adapters)} "
-                      f"superseded adapter snapshot(s); retained {retained}",
-                      flush=True)
+                setting_log_only(f"[checkpoint] removed {len(removed_adapters)} "
+                                 f"superseded adapter snapshot(s); retained {retained}", flush=True)
             print(f"[checkpoint] completed step {step}; resume at step {step + 1}")
             if (stats.get("exact_overflow_inprocess", False)
                     or getattr(cfg, "_exact_inprocess_recovery_step", None) == step):

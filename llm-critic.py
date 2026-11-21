@@ -13,7 +13,7 @@ from typing import Any, Iterable, Optional
 
 from experiment_io import _atomic_write_text, save_rollout_token_ids
 from generation.gen_workers import GenerationPool, native_final_answer_scope, render_chat_prompt
-from training.critic_step import CRITIC_CONTEXT, CRITIC_RESPONSES, load_tree, save_batch
+from training.critic_step import CRITIC_CONTEXT, CRITIC_RESPONSES, load_tree, save_batch, save_rollout_report
 
 
 # ---------------------------------------------------------------------------
@@ -453,12 +453,15 @@ class AdvantageCritic:
 
 
 def _score_saved_step(path, pool_options):
+    from diagnostics.console import bind_setting_log
     from generation.gen_workers import _start_vllm_parent_watchdog
     from transformers import AutoTokenizer
 
     _start_vllm_parent_watchdog(int(os.environ["TTT_CRITIC_PARENT_PID"]))
+    run_dir = path.parents[2]
+    bind_setting_log(run_dir / "setting.log")
     batch = json.loads(path.read_text(encoding="utf-8"))
-    tree = load_tree(path.parents[2], batch)
+    tree = load_tree(run_dir, batch)
     higher_is_better = batch["higher_is_better"]
     tokenizer = AutoTokenizer.from_pretrained(pool_options["model_name"], trust_remote_code=True)
     prompt, nodes, ids = prepare_prompt(tokenizer, tree, batch["sota"], higher_is_better)
@@ -475,6 +478,7 @@ def _score_saved_step(path, pool_options):
               f"{len(tokenizer.encode(prompt))} prompt tokens", flush=True)
         advantages, info = critic.score_prompt(prompt, nodes, ids, higher_is_better, path.parent)
         batch.update(advantages=advantages, **info)
+        save_rollout_report(path.parent, batch, tree)
         save_batch(path, batch)
         print(f"[llm-critic] selected batch {info['selected_batch']}, rollout {info['selected_rollout']:03d}; "
               "releasing both workers", flush=True)

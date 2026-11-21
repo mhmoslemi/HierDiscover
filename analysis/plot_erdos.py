@@ -219,9 +219,10 @@ def plot_step_function(h_values, c5_val, n_points, title, save_path):
             bbox=dict(boxstyle="round,pad=0.35", facecolor="white",
                       edgecolor="#B0B0B0", linewidth=0.8, alpha=0.9))
     plt.tight_layout()
-    plt.savefig(save_path, bbox_inches="tight", dpi=300)
-    plt.savefig(Path(save_path).with_suffix(".pdf"), bbox_inches="tight")
-    print(f"wrote {save_path} and {Path(save_path).with_suffix('.pdf')}")
+    pdf_path = Path(save_path).with_suffix(".pdf")
+    fig.savefig(pdf_path, bbox_inches="tight")
+    plt.close(fig)
+    print(f"wrote {pdf_path}")
 
 
 # ----------------------------------------------------------------------
@@ -249,7 +250,7 @@ def main():
                          "construction is available (for automatic plotting)")
     ap.add_argument("--no-initial", action="store_true",
                     help="do not provide initial_h_values at all")
-    ap.add_argument("--out", default=None)
+    ap.add_argument("--out", default=None, help="output PDF path")
     ap.add_argument("--title", default=None)
     args = ap.parse_args()
     if args.saved_only and (args.replay or args.file):
@@ -365,7 +366,7 @@ def main():
                  "   (replay DIVERGED: the program is stochastic, or it used a "
                  "parent construction this script could not supply)"))
 
-    out = args.out or str(run_dir / "erdos_solution.png")
+    out = args.out or run_dir / "erdos_solution.pdf"
     plot_step_function(h, computed, n,
                        args.title or f"Erdos h  ({label})", out)
 

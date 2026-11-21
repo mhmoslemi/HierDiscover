@@ -337,7 +337,7 @@ def _best_path(nodes, edges):
     return path_nodes, path_edges
 
 
-def write_svg(run_dir, nodes, edges):
+def _render_svg(nodes, edges):
     x_positions = tree_layout(nodes, edges)
     path_nodes, path_edges = _best_path(nodes, edges)
     max_level = max(node["level"] for node in nodes.values())
@@ -413,42 +413,28 @@ def write_svg(run_dir, nodes, edges):
         f'transform="rotate(-90 18 {height/2:.2f})">Generation step</text>',
         '</g>', '</svg>',
     ])
-    output = Path(run_dir) / "parent_child_tree.svg"
-    output.write_text("\n".join(lines), encoding="utf-8")
-    return output
+    return "\n".join(lines)
 
 
-def _export_static(svg_path, nodes, edges):
+def _export_pdf(pdf_path, nodes, edges):
     converter = shutil.which("rsvg-convert")
     if converter:
-        commands = [
-            [converter, "-f", "png", "-o", str(svg_path.with_suffix(".png")),
-             str(svg_path)],
-            [converter, "-f", "pdf", "-o", str(svg_path.with_suffix(".pdf")),
-             str(svg_path)],
-        ]
-    elif shutil.which("magick"):
-        converter = shutil.which("magick")
-        commands = [[converter, str(svg_path), str(svg_path.with_suffix(suffix))]
-                    for suffix in (".png", ".pdf")]
+        command = [converter, "-f", "pdf", "-o", str(pdf_path), "-"]
+    elif converter := shutil.which("magick"):
+        command = [converter, "svg:-", str(pdf_path)]
     else:
-        commands = None
-    if commands is not None:
-        succeeded = True
-        for command in commands:
-            result = subprocess.run(
-                command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                timeout=60, check=False)
-            succeeded = succeeded and result.returncode == 0
-        if succeeded:
+        command = None
+    if command is not None:
+        result = subprocess.run(
+            command, input=_render_svg(nodes, edges).encode("utf-8"),
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=60, check=False)
+        if result.returncode == 0:
             return
 
-    # The training environment already depends on matplotlib for its other
-    # automatic plots; this keeps PNG/PDF output available without a new tool.
     try:
         import matplotlib.pyplot as plt
-    except ImportError:
-        return
+    except ImportError as exc:
+        raise SystemExit("Rendering the parent tree PDF requires matplotlib or a working SVG converter") from exc
     positions = tree_layout(nodes, edges)
     path_nodes, path_edges = _best_path(nodes, edges)
     leaf_span = max(positions.values(), default=0.0) + 1.0
@@ -485,10 +471,7 @@ def _export_static(svg_path, nodes, edges):
     for spine in axis.spines.values():
         spine.set_visible(False)
     figure.tight_layout()
-    figure.savefig(svg_path.with_suffix(".png"), dpi=180,
-                   bbox_inches="tight", facecolor="white")
-    figure.savefig(svg_path.with_suffix(".pdf"), bbox_inches="tight",
-                   facecolor="white")
+    figure.savefig(pdf_path, bbox_inches="tight", facecolor="white")
     plt.close(figure)
 
 
@@ -499,8 +482,8 @@ def main():
     args = parser.parse_args()
     tree_log = write_tree_log(args.run_dir, args.max_step)
     nodes, edges = load_plot_genealogy(args.run_dir, args.max_step)
-    output = write_svg(args.run_dir, nodes, edges)
-    _export_static(output, nodes, edges)
+    output = args.run_dir / "parent_child_tree.pdf"
+    _export_pdf(output, nodes, edges)
     print(f"Wrote {tree_log} and {output}")
 
 

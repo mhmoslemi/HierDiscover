@@ -634,13 +634,11 @@ def _run_oom_resilient_backward(
     if reused_modes:
         signature = tuple(reused_modes)
         if getattr(model, "_ttt_reported_oom_profile", None) != signature:
-            mode_source = (
-                "starting long-sequence mode"
-                if start_checkpointed or start_with_headroom else
-                "reusing learned safe mode"
-            )
-            log_prefix = ("[train-memory]" if start_checkpointed or start_with_headroom else "[train-oom]")
-            print(f"{log_prefix} {device_label}: {mode_source} ({', '.join(reused_modes)})", flush=True)
+            modes = ", ".join(reused_modes)
+            if start_checkpointed or start_with_headroom:
+                setting_log_only(f"[train-memory] {device_label}: starting long-sequence mode ({modes})", flush=True)
+            else:
+                print(f"[train-oom] {device_label}: reusing learned safe mode ({modes})", flush=True)
             setattr(model, "_ttt_reported_oom_profile", signature)
 
     cuda_devices = sorted({
@@ -1400,8 +1398,8 @@ class ProcessDistributedTrainer:
                 message = self._collect_event("loaded", (rank,))[rank]
             if message.get("parameter_signature") != expected_signature:
                 raise RuntimeError(f'fast trainer rank {rank} has a different trainable parameter layout')
-            print(f"[{self._process_label}] trainer replica {rank + 1}/"
-                  f"{self._world_size} loaded on logical GPU {rank}", flush=True)
+            setting_log_only(f"[{self._process_label}] trainer replica {rank + 1}/"
+                             f"{self._world_size} loaded on logical GPU {rank}", flush=True)
 
         for command_queue in self._command_queues.values():
             command_queue.put({"kind": "init_distributed"})
@@ -1588,13 +1586,13 @@ class ProcessDistributedTrainer:
             self._work_queue.put(example)
         if announce:
             if offload_waves is None:
-                print(f"[{self._process_label}] queued {len(ordered)} "
-                      "examples longest-first; each free GPU claims the "
-                      "next adaptive batch", flush=True)
+                setting_log_only(f"[{self._process_label}] queued {len(ordered)} "
+                                 "examples longest-first; each free GPU claims the "
+                                 "next adaptive batch", flush=True)
             else:
                 preview = ",".join(str(value) for value in offload_waves[:8])
                 suffix = "..." if len(offload_waves) > 8 else ""
-                print(
+                setting_log_only(
                     f"[{self._process_label}] queued {len(ordered)} "
                     "oversized examples longest-first; conservative "
                     f"startup ranks/wave={preview}{suffix}, then measured "
@@ -1639,11 +1637,10 @@ class ProcessDistributedTrainer:
         max_examples_per_batch = (
             max(1, math.ceil(len(queued_examples) / (2 * self._world_size)))
             if packed_expert_training else 64)
-        print(f"[train-fast] one process/GPU; memory ceiling="
-              f"{100.0 * update_memory_fraction:g}%; "
-              f"exact singleton rescue={rescue}; "
-              f"initial padded-token budgets/GPU={self._token_budgets}",
-              flush=True)
+        setting_log_only(f"[train-fast] one process/GPU; memory ceiling="
+                         f"{100.0 * update_memory_fraction:g}%; "
+                         f"exact singleton rescue={rescue}; "
+                         f"initial padded-token budgets/GPU={self._token_budgets}", flush=True)
 
         # Packed GPT-OSS retries complete microbatches on the live replicas.
         defer_exact_oom = not packed_expert_training and _uses_replayable_policy_update(cfg.advantage_mode)
@@ -2509,11 +2506,10 @@ class ProcessDistributedTrainer:
               f"vLLM supplied old={supplied_old}/{total_examples}, "
               f"reference={supplied_reference}/{total_examples}",
               flush=True)
-        print(f"[{process_label}] one process/GPU with adaptive batching; "
-              f"memory ceiling={self._memory_percentage:g}%; "
-              "exact singleton rescue=96%->98%->99%; "
-              f"initial padded-token budgets/GPU={self._token_budgets}",
-              flush=True)
+        setting_log_only(f"[{process_label}] one process/GPU with adaptive batching; "
+                         f"memory ceiling={self._memory_percentage:g}%; "
+                         "exact singleton rescue=96%->98%->99%; "
+                         f"initial padded-token budgets/GPU={self._token_budgets}", flush=True)
 
         self._workers_idle = False
         for rank in range(1, self._world_size):

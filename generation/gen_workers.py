@@ -2095,9 +2095,9 @@ class GenerationPool:
             self.backend == "vllm" and self.vllm_staged_loading
             and self.num_workers > 1)
         mode = " one at a time" if staged else ""
-        print(f"[pool] loading {self.num_workers} {self.backend} engine(s){mode} "
-              f"for {self.model_name} (TP={tp}, PP={pp}) on "
-              f"{requested_num_gpus} GPU(s) ...", flush=True)
+        setting_log_only(f"[pool] loading {self.num_workers} {self.backend} engine(s){mode} "
+                         f"for {self.model_name} (TP={tp}, PP={pp}) on "
+                         f"{requested_num_gpus} GPU(s) ...", flush=True)
         self._staged_loading = staged
         self._start_workers(range(self.num_workers), initial=True)
         self.sleep_supported = bool(
@@ -3154,8 +3154,8 @@ class PhasedVLLMGenerationPool:
         with startup_reservation as reserved:
             if parallel_bytes and reserved >= parallel_bytes:
                 options["vllm_staged_loading"] = False
-                print("[pool] loading GPT-OSS replicas concurrently with "
-                      f"{reserved / 2**30:.1f} GiB of host RAM admitted", flush=True)
+                setting_log_only("[pool] loading GPT-OSS replicas concurrently with "
+                                 f"{reserved / 2**30:.1f} GiB of host RAM admitted", flush=True)
             return GenerationPool(**(self._pool_kwargs | options))
 
     def _ensure_started(self, *, base_policy_only=False, require_lora=False):
