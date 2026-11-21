@@ -488,6 +488,7 @@ def native_final_answer_scope(tokenizer, token_ids, *, prompt_text="", require_f
     closing_ids = {native[tag] for tag in ("</think>", "</analysis>", "</reasoning>") if tag in native}
     opening_ids = {native[tag] for tag in ("<think>", "<analysis>", "<reasoning>") if tag in native}
     channel_id, message_id = native.get("<|channel|>"), native.get("<|message|>")
+    constrain_id = native.get("<|constrain|>")
     harmony = channel_id is not None and message_id is not None
     if not closing_ids and not harmony:
         return None
@@ -515,7 +516,10 @@ def native_final_answer_scope(tokenizer, token_ids, *, prompt_text="", require_f
             while end < len(token_ids) and token_ids[end] not in (message_id, channel_id):
                 end += 1
             if end < len(token_ids) and token_ids[end] == message_id:
-                channel = decode(token_ids[position + 1:end]).strip()
+                header = list(token_ids[position + 1:end])
+                if constrain_id in header:
+                    header = header[:header.index(constrain_id)]
+                channel = decode(header).strip()
                 if channel == "final":
                     final_start = end + 1
                     break
