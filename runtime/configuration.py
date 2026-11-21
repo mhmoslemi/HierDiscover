@@ -11,8 +11,9 @@ from types import SimpleNamespace
 import yaml
 from config_validation import (
     ADVANTAGE_MODES, COMMON_OPTIONAL_KEYS, COMMON_REQUIRED_KEYS, LEGACY_CODER_CAP_KEY,
-    PARENT_SELECTION_MODES, RETIRED_BATCH_GROWTH_KEYS, RETIRED_TRAINER_KEYS, reject_retired_coder_cap,
-    retired_search_keys, validate_hybrid_weight, validate_problem_config,
+    LLM_CRITIC_MODE, PARENT_SELECTION_MODES, RETIRED_BATCH_GROWTH_KEYS, RETIRED_TRAINER_KEYS,
+    reject_retired_coder_cap, retired_search_keys, uses_hybrid_policy_loss,
+    validate_hybrid_weight, validate_problem_config,
 )
 from runtime.hardware_profiles import generation_cpu_ids, local_checkpoint, restore_hardware_settings
 
@@ -48,6 +49,10 @@ def _uses_reward_history(mode):
     return str(mode).lower() in {"spo-rs", "hybrid"}
 
 
+def _uses_replayable_policy_update(mode):
+    return _uses_reward_history(mode) or uses_hybrid_policy_loss(mode)
+
+
 def _normalize_saved_advantage_config(saved):
     """Migrate retained policy controls without reactivating removed objectives."""
     saved = dict(saved)
@@ -70,15 +75,16 @@ def _normalize_saved_advantage_config(saved):
 
 
 def _resolve_policy_options(merged):
-    """Resolve full-policy sampling for SPO-RS and hybrid updates."""
+    """Match coder sampling to the likelihood used by importance sampling."""
     clipped = _uses_clipped_policy_loss(merged.get("advantage_mode"))
+    hybrid_loss = uses_hybrid_policy_loss(merged.get("advantage_mode"))
     if clipped and int(merged["group_size"]) < 2:
         raise ValueError("SPO-RS requires group_size >= 2")
-    if clipped or merged.get("advantage_mode") == "hybrid":
+    if clipped or hybrid_loss:
         kl_coef = float(merged["kl_penalty_coef"])
         if not math.isfinite(kl_coef) or kl_coef < 0.0:
             raise ValueError("kl_penalty_coef must be finite and nonnegative")
-        if merged.get("advantage_mode") == "hybrid":
+        if hybrid_loss:
             merged["kl_penalty_coef"] = kl_coef
         if float(merged["temperature"]) != 1.0 or float(merged["top_p"]) != 1.0:
             print("[config] full-policy training sets temperature=1 "
@@ -213,7 +219,8 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--advantage-mode", type=str.lower,
                    choices=list(ADVANTAGE_MODES), default=None,
                    help="Objective: entropic (adaptive beta), spo-rs (historical "
-                        "baseline), or hybrid (TTT credit plus a weighted historical correction).")
+                        "baseline), hybrid (sibling and historical credit), or "
+                        "llm-critic (GPT-OSS credit with the hybrid policy loss).")
     p.add_argument("--spo-rs-beta", type=float, default=None,
                    help="Fixed exponential coefficient and advantage divisor for SPO-RS "
                         f"(default {SPO_RS_BETA_DEFAULT}).")
@@ -619,10 +626,13 @@ def load_config():
                          os.environ.get("TTT_LAUNCH_ADVANTAGE_DEFAULT", "entropic")).lower()
     if advantage_mode not in ADVANTAGE_MODES:
         raise ValueError(f"advantage_mode must be one of {ADVANTAGE_MODES}")
+    if advantage_mode == LLM_CRITIC_MODE and generation_backend != "vllm":
+        raise ValueError("llm-critic requires vLLM generation for the shared-GPU handoff")
     merged["advantage_mode"] = advantage_mode
     saved_mode = str(saved.get("advantage_mode") or "entropic").lower()
-    if saved and advantage_mode != saved_mode and "hybrid" in {advantage_mode, saved_mode}:
-        raise ValueError("Resume a hybrid run with its saved advantage mode and reward scale")
+    hybrid_loss = uses_hybrid_policy_loss(advantage_mode)
+    if saved and advantage_mode != saved_mode and (hybrid_loss or uses_hybrid_policy_loss(saved_mode)):
+        raise ValueError(f"Resume this run with its saved advantage mode ({saved_mode}) and reward scale")
     if advantage_mode == "hybrid":
         if saved and "hybrid_spo_weight" not in saved:
             raise ValueError("Start a fresh hybrid run to use the new advantage formula")
@@ -632,11 +642,12 @@ def load_config():
             weight = (saved or merged).get(key, default)
             validate_hybrid_weight(key, weight, source=weight_source)
             merged[key] = float(weight)
+    if hybrid_loss:
         merged["grad_clip"] = 0.0
         if not saved and args.kl_penalty_coef is None:
             merged["kl_penalty_coef"] = 0.1
         if saved and float(merged["kl_penalty_coef"]) != float(saved["kl_penalty_coef"]):
-            raise ValueError("Hybrid resume requires the saved reference KL coefficient")
+            raise ValueError(f"{advantage_mode} resume requires the saved reference KL coefficient")
     # Use zero in config to disable top-k filtering in both backends.
     merged["sampling_top_k"] = 0
     if "min_p" in merged:
@@ -793,7 +804,7 @@ def load_config():
                 "with an HF LoRA or GPT-OSS-120B packed-MXFP4 Unsloth replica on each GPU.")
 
     if (resume_dir is not None and not merged["no_train"]
-            and _uses_reward_history(merged["advantage_mode"])):
+            and _uses_replayable_policy_update(advantage_mode)):
         recovery = _read_exact_sharded_recovery(resume_dir)
         if recovery is not None:
             step = int(recovery["step"])
@@ -883,7 +894,7 @@ def load_config():
     # Resumes must keep the reward units stored in the archive and SPO-RS tracker.
     from problems.base import ERDOS_REWARD_ANCHORS, TRIMUL_REWARD_POINTS
     reward_task = str(merged.get("problem_type", merged["problem"])).lower()
-    if advantage_mode == "hybrid":
+    if hybrid_loss:
         merged["fail_score"] = 0.0
         if reward_task in {"trimul", "mla_decode_nvidia"}:
             merged["score_scale"] = 1500.0 if reward_task == "trimul" else 5000.0

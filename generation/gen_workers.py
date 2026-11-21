@@ -462,11 +462,24 @@ def _canonical_generated_text(tokenizer, token_ids, generated_text):
     return decoded or original
 
 
-def native_final_answer_scope(tokenizer, token_ids, *, prompt_text=""):
+def render_chat_prompt(tokenizer, messages, *, reasoning_effort=None):
+    options = {} if reasoning_effort is None else {"reasoning_effort": str(reasoning_effort)}
+    try:
+        return tokenizer.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True, **options)
+    except TypeError as error:
+        if reasoning_effort is None:
+            raise
+        raise RuntimeError(
+            f"the installed GPT-OSS tokenizer cannot apply reasoning_effort={reasoning_effort}. "
+            "Update Transformers and refresh the tokenizer files.") from error
+
+
+def native_final_answer_scope(tokenizer, token_ids, *, prompt_text="", require_final=False):
     """Decode the final channel from original IDs, not lookalike text markers.
 
     None retains legacy extraction for tokenizers without a native reasoning
-    protocol; an empty string means reasoning never reached the final channel.
+    protocol. An empty string means the required final answer is absent.
     """
     added_vocab = getattr(tokenizer, "get_added_vocab", None)
     native = dict(added_vocab()) if callable(added_vocab) else {}
@@ -508,7 +521,7 @@ def native_final_answer_scope(tokenizer, token_ids, *, prompt_text=""):
                     break
                 reasoning = reasoning or channel == "analysis"
     if final_start is None:
-        if reasoning:
+        if reasoning or require_final:
             return ""
         final_start = 0
     final_ids = list(token_ids[final_start:])

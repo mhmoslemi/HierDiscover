@@ -8,9 +8,14 @@ from numbers import Real
 from pathlib import Path
 
 
-ADVANTAGE_MODES = ("entropic", "spo-rs", "hybrid")
+LLM_CRITIC_MODE = "llm-critic"
+ADVANTAGE_MODES = ("entropic", "spo-rs", "hybrid", LLM_CRITIC_MODE)
 PARENT_SELECTION_MODES = ("puct", "uct")
 LEGACY_CODER_CAP_KEY = "coder_thinking_budget"
+
+
+def uses_hybrid_policy_loss(mode):
+    return mode in ("hybrid", LLM_CRITIC_MODE)
 
 
 # These settings are consumed by the shared training, generation, search,

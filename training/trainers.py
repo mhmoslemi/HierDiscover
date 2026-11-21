@@ -10,11 +10,12 @@ from types import SimpleNamespace
 
 import numpy as np
 
+from config_validation import uses_hybrid_policy_loss
 from diagnostics.console import setting_log_only
 from runtime.configuration import (
     SPO_RS_CLIP_EPSILON_DEFAULT, SPO_RS_CLIP_EPSILON_HIGH_DEFAULT,
     SPO_RS_CLIP_EPSILON_LOW_DEFAULT,
-    _parse_gpu_ids, _uses_reward_history,
+    _parse_gpu_ids, _uses_replayable_policy_update, _uses_reward_history,
 )
 from training.exact_overflow import (
     ExactLongContextTrainingOOM, _clip_sharded_grad_norm_,
@@ -989,7 +990,7 @@ def _clipped_policy_options(cfg):
 def historical_policy_loss(cfg, current_logprobs, example, clip_options, *,
                            return_tensor_metrics=False, check_finite=True):
     """Use one objective across the replicas and both overflow paths."""
-    if cfg.advantage_mode == "hybrid":
+    if uses_hybrid_policy_loss(cfg.advantage_mode):
         from training.hybrid import importance_sampling_loss
 
         return importance_sampling_loss(
@@ -1006,7 +1007,7 @@ def historical_policy_loss(cfg, current_logprobs, example, clip_options, *,
 
 def _historical_grad_clip(cfg):
     # Keep the nonfinite gradient check when the TTT update clips no gradient.
-    return math.inf if cfg.advantage_mode == "hybrid" else cfg.grad_clip
+    return math.inf if uses_hybrid_policy_loss(cfg.advantage_mode) else cfg.grad_clip
 
 
 def _prepare_entropic_overlap_group(
@@ -1227,7 +1228,7 @@ def _finalize_exact_spo_rs_overflow(
     print(
         f"[step {step_idx}] {cfg.advantage_mode} epoch 1/1: "
         f"loss={totals['loss']:.6f} "
-        f"reference={'on' if cfg.advantage_mode == 'hybrid' and cfg.kl_penalty_coef else 'off'} "
+        f"reference={'on' if uses_hybrid_policy_loss(cfg.advantage_mode) and cfg.kl_penalty_coef else 'off'} "
         f"ratio={totals['ratio']:.6f} max={max_ratio:.6f} "
         f"clipped={totals['clipped_fraction']:.1%} "
         "OOM-quarantined=0 "
@@ -1623,7 +1624,7 @@ class ProcessDistributedTrainer:
         supplied_old = sum(_valid_example_token_logprobs(example, "behavior_logprobs") for example in queued_examples)
         reference_label = (
             f"{sum(_valid_example_token_logprobs(ex, 'reference_logprobs') for ex in queued_examples)}/{len(examples)}"
-            if cfg.advantage_mode == "hybrid" and cfg.kl_penalty_coef else "off")
+            if uses_hybrid_policy_loss(cfg.advantage_mode) and cfg.kl_penalty_coef else "off")
         print(f"[step {step_idx}] {cfg.advantage_mode} logprobs: "
               "vLLM supplied old="
               f"{supplied_old}/{len(examples)}, reference={reference_label}",
@@ -1645,7 +1646,7 @@ class ProcessDistributedTrainer:
               flush=True)
 
         # Packed GPT-OSS retries complete microbatches on the live replicas.
-        defer_exact_oom = not packed_expert_training and _uses_reward_history(cfg.advantage_mode)
+        defer_exact_oom = not packed_expert_training and _uses_replayable_policy_update(cfg.advantage_mode)
         self._workers_idle = False
         for rank in range(1, self._world_size):
             self._command_queues[rank].put({
@@ -1798,8 +1799,8 @@ class ProcessDistributedTrainer:
             reduce_trainable_gradients,
         )
 
-        if not _uses_reward_history(getattr(cfg, "advantage_mode", "")):
-            raise ValueError("exact overflow recovery requires a historical advantage mode")
+        if not _uses_replayable_policy_update(getattr(cfg, "advantage_mode", "")):
+            raise ValueError("exact overflow recovery requires a replayable policy objective")
         if self._closed or not self._workers_idle:
             raise RuntimeError("process trainer is not idle for exact overflow recovery")
         if self._offloaded:
@@ -1995,7 +1996,7 @@ class ProcessDistributedTrainer:
         print(
             f"[step {step_idx}] {cfg.advantage_mode} epoch 1/1: "
             f"loss={totals['loss']:.6f} "
-            f"reference={'on' if cfg.advantage_mode == 'hybrid' and cfg.kl_penalty_coef else 'off'} "
+            f"reference={'on' if uses_hybrid_policy_loss(cfg.advantage_mode) and cfg.kl_penalty_coef else 'off'} "
             f"ratio={totals['ratio']:.6f} max={max_ratio:.6f} "
             f"clipped={totals['clipped_fraction']:.1%} "
             "OOM-quarantined=0 (RAM-bounded replicated exact overflow recovery)",

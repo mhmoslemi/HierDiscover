@@ -10,6 +10,7 @@ from types import SimpleNamespace
 import math
 import traceback
 
+from config_validation import uses_hybrid_policy_loss
 
 STANDARD_TRAINING_MEMORY_FRACTION = 0.80
 MAX_STANDARD_TRAINING_MEMORY_FRACTION = 0.90
@@ -358,7 +359,7 @@ def local_spo_rs_update(backend, model, tokenizer, examples, cfg, logical_id,
     else:
         allocator_fraction = set_total_memory_ceiling(
             logical_id, initial_fraction)
-    hybrid = cfg.advantage_mode == "hybrid"
+    hybrid = uses_hybrid_policy_loss(cfg.advantage_mode)
     clip_options = None if hybrid else training._clipped_policy_options(cfg)
     parameters = trainable_parameters(model)
     packed_memory = (

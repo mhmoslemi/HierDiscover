@@ -92,6 +92,7 @@ def evaluate_batch(path):
     if batch["completed"]:
         return
     root, step = path.parent.parent, int(batch["step"])
+    critic_context = batch["scoring"].get("critic")
     problem = GpuMode(batch["config"])
     if problem.problem_type != "trimul" or not problem.kernel_gpu_ids:
         raise ValueError("isolated evaluation requires TriMul and at least one evaluation GPU")
@@ -111,6 +112,8 @@ def evaluate_batch(path):
         if result.failure_kind == "infrastructure":
             raise RuntimeError(f"TriMul evaluation infrastructure failed: {result.msg}")
         outcome = asdict(result)
+        if critic_context is not None:
+            outcome["archive_eligible"] = bool(result.valid and result.code)
         outcome.pop("code")
         outcome.pop("construction")
         outcome["sandbox_stdout"] = outcome.pop("stdout")
@@ -138,7 +141,18 @@ def evaluate_batch(path):
                 raise
     finally:
         bar.close()
-    batch.update(completed=True, evaluation_seconds=time.monotonic() - begin)
+    batch["evaluation_seconds"] = time.monotonic() - begin
+    if critic_context is not None:
+        from types import SimpleNamespace
+        from training import critic_step
+
+        rows = []
+        for row in sorted(batch["candidates"], key=lambda item: (item["group"], item["rollout"])):
+            meta = rollout_path(root, step, row).with_suffix(".meta.json")
+            rows.append(critic_step.rollout_row(json.loads(meta.read_text(encoding="utf-8"))))
+        critic_step.prepare_batch(root, step, critic_context, rows)
+        critic_step.score_batch(root, step, SimpleNamespace(**batch["config"]))
+    batch["completed"] = True
     _save_batch(path, batch)
 
 

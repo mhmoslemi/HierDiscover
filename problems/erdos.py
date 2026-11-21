@@ -4,6 +4,7 @@ from __future__ import annotations
 import inspect
 from typing import Any, List
 import numpy as np
+from config_validation import uses_hybrid_policy_loss
 from problems.base import Problem, ParentContext, RewardResult, SeedState
 from prompts.task import erdos
 from prompts.utils import render_state_context
@@ -94,7 +95,7 @@ class ErdosMinOverlap(Problem):
 
     def __init__(self, cfg: dict):
         super().__init__(cfg)
-        self._reward_epsilon = 1e-8 if cfg.get("advantage_mode") == "hybrid" else 0.0
+        self._reward_epsilon = 1e-8 if uses_hybrid_policy_loss(cfg.get("advantage_mode")) else 0.0
         if self.target is None:
             self.target = 0.3808
         self.budget_s = float(cfg.get("budget_s", 60.0))

@@ -17,6 +17,7 @@ import re
 import sys
 import time
 
+from config_validation import uses_hybrid_policy_loss
 
 METRICS = ("loss", "policy_loss", "kl_estimate", "ratio", "clipped_fraction")
 
@@ -217,7 +218,7 @@ def backward_overflow_example(backend, tokenizer, example, cfg, gpu_ids):
             input_device = next(model.get_input_embeddings().parameters()).device
             for key in ("prompt_ids", "response_ids"):
                 item[key] = item[key].to(input_device)
-            hybrid = cfg.advantage_mode == "hybrid"
+            hybrid = uses_hybrid_policy_loss(cfg.advantage_mode)
             clip_options = None if hybrid else training._clipped_policy_options(cfg)
             missing_old = training._initialize_behavior_logprobs([item])
             if hybrid and missing_old:

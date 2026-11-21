@@ -15,6 +15,7 @@ from typing import Any, List
 
 import numpy as np
 
+from config_validation import uses_hybrid_policy_loss
 from examples.ac_inequalities.seeds import (
     example_ae_program_random_init,
     thetaevolve_initial_program_prev_init,
@@ -104,7 +105,7 @@ class ACInequalities(Problem):
         self.budget_s = int(cfg.get("budget_s", 1000))
 
         if self.problem_type == "ac1":
-            self._ttt_reward = cfg.get("advantage_mode") == "hybrid"
+            self._ttt_reward = uses_hybrid_policy_loss(cfg.get("advantage_mode"))
             self._reward_anchors = cfg.get("erdos_reward_anchors", ERDOS_REWARD_ANCHORS["ac1"])
             self.entrypoint = "propose_candidate"
             self.metric_name = "upper bound"

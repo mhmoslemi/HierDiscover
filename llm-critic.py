@@ -1,19 +1,23 @@
 from __future__ import annotations
 
-import datetime as _dt
 import json
 import math
-import re
+import os
+import secrets
 import statistics
 import sys
 from collections import defaultdict
 from dataclasses import dataclass
-from functools import lru_cache
+from decimal import Decimal
+from pathlib import Path
 from typing import Any, Iterable, Optional
 
+from generation.gen_workers import native_final_answer_scope, render_chat_prompt
+from training.critic_step import CRITIC_CONTEXT, CRITIC_MODEL, load_tree, save_batch
+
+
 # ---------------------------------------------------------------------------
-# Developer prompt (harmony developer message). The "# Instructions" header and
-# the <|start|>/<|end|> tokens are added by openai-harmony when rendering.
+# The GPT-OSS chat template formats this developer message.
 # Placeholders are filled with str.replace, never str.format: the JSON braces
 # in the prompt would break .format().
 # ---------------------------------------------------------------------------
@@ -24,9 +28,9 @@ You are an expert in reinforcement learning for language models (policy-gradient
 A policy LLM is solving a scientific discovery problem step by step. Its attempts form a search tree:
 
 - Rollout: one attempt by the policy. It starts from a parent solution, produces a new candidate solution, and an external evaluator scores that candidate. Every rollout has a unique ID.
-- Step: the depth in the tree. Step 0 is the root (the initial problem, possibly with a baseline score). Every rollout at step t was generated from a parent at step t-1.
+- Step: the training iteration. Step 0 contains the initial seeds. A later step can expand a parent from any earlier step.
 - Parent: the solution a rollout started from.
-- Child: a rollout generated from a given parent. A rollout you score now may become a parent at the next step.
+- Child: a rollout generated from a given parent. A rollout you score now may become a parent in a later step.
 - Siblings: rollouts with the same parent at the same step. A sibling group is the set of alternatives the policy produced from one starting point.
 - SOTA: the best known score for this problem from outside the tree (literature or best known result).
 - n/a: the rollout failed and has no valid score (crash, timeout, invalid output, constraint violation, or any other reason). You are not told why.
@@ -312,236 +316,165 @@ def build_developer_prompt(higher_is_better: bool, ids: list[str]) -> str:
             .replace("{RESPONSE_SCHEMA}", json.dumps(schema, separators=(",", ":"))))
 
 
-# ---------------------------------------------------------------------------
-# Harmony rendering and parsing
-# ---------------------------------------------------------------------------
-@lru_cache(maxsize=1)
-def _encoding():
-    # Loaded lazily. The first call downloads the tokenizer vocab; on an offline
-    # machine, pre-download it and set TIKTOKEN_ENCODINGS_BASE.
-    from openai_harmony import HarmonyEncodingName, load_harmony_encoding
-    return load_harmony_encoding(HarmonyEncodingName.HARMONY_GPT_OSS)
-
-
-def render_prompt_ids(developer_text: str, user_text: str, reasoning: str = "high") -> list[int]:
-    from openai_harmony import (Conversation, DeveloperContent, Message,
-                                ReasoningEffort, Role, SystemContent)
-    effort = {"low": ReasoningEffort.LOW, "medium": ReasoningEffort.MEDIUM,
-              "high": ReasoningEffort.HIGH}[reasoning]
-    system = (SystemContent.new()
-              .with_reasoning_effort(effort)
-              .with_conversation_start_date(_dt.date.today().isoformat()))
-    convo = Conversation.from_messages([
-        Message.from_role_and_content(Role.SYSTEM, system),
-        Message.from_role_and_content(Role.DEVELOPER,
-                                      DeveloperContent.new().with_instructions(developer_text)),
-        Message.from_role_and_content(Role.USER, user_text),
-    ])
-    return _encoding().render_conversation_for_completion(convo, Role.ASSISTANT)
-
-
-_FINAL_MARK = "<|channel|>final<|message|>"
-
-
-def extract_final_text(token_ids, text: Optional[str] = None) -> Optional[str]:
-    """Return the final-channel text, or None if the model never reached it."""
-    from openai_harmony import Role
-    try:
-        msgs = _encoding().parse_messages_from_completion_tokens(list(token_ids), Role.ASSISTANT)
-        finals = [m for m in msgs if m.channel == "final"]
-        if finals:
-            return "".join(getattr(c, "text", "") for c in finals[-1].content)
-    except Exception:
-        pass  # strict parser rejected the stream; fall back to the raw text
-    if text is None:
-        try:
-            text = _encoding().decode_utf8(list(token_ids))
-        except Exception:
-            return None
-    if _FINAL_MARK not in text:
-        return None
-    return re.split(r"<\|(?:return|end|call)\|>", text.rsplit(_FINAL_MARK, 1)[1])[0]
+def _unique_json_keys(pairs):
+    obj = {}
+    for key, value in pairs:
+        if key in obj:
+            raise ValueError(f"duplicate id {key!r}")
+        obj[key] = value
+    return obj
 
 
 def parse_advantages(text: Optional[str], ids: list[str]):
-    """Return (advantages, None) or (None, error message)."""
+    """Require exactly the requested IDs and numbers with at most two decimal places."""
     if not text:
         return None, "no final-channel output"
-    m = re.search(r"\{.*\}", text, re.S)
-    if not m:
-        return None, "no JSON object in final channel"
     try:
-        obj = json.loads(m.group(0))
-    except json.JSONDecodeError as exc:
+        obj = json.loads(text, parse_float=Decimal, object_pairs_hook=_unique_json_keys)
+    except (ValueError, ArithmeticError, RecursionError) as exc:
         return None, f"invalid JSON: {exc}"
-    if not isinstance(obj, dict):
-        return None, "final output is not a JSON object"
-    missing = [i for i in ids if i not in obj]
-    if missing:
-        return None, f"missing ids: {missing}"
+    if not isinstance(obj, dict) or set(obj) != set(ids):
+        return None, "expected one JSON object with exactly the requested rollout IDs"
     out = {}
-    for i in ids:
-        try:
-            v = float(obj[i])
-        except (TypeError, ValueError):
-            return None, f"non-numeric advantage for {i}: {obj[i]!r}"
-        if not math.isfinite(v):
-            return None, f"non-finite advantage for {i}"
-        out[i] = v
+    for key, value in obj.items():
+        if type(value) not in (int, Decimal) or not -10 <= value <= 10:
+            return None, f"advantage for {key} must be a number in [-10, 10]"
+        if value != Decimal(value).quantize(Decimal("0.01")):
+            return None, f"advantage for {key} has more than two decimal places"
+        out[key] = float(value)
     return out, None
 
 
-def enforce_constraints(adv, nodes, ids, higher_is_better=True):
-    """Deterministically enforce hard constraints 1-3 (range, monotonic within
-    a group, failures strictly last). Keeps the model's set of values per group
-    and only reorders them if needed. Returns (advantages, repaired_parent_ids)."""
-    sign = 1.0 if higher_is_better else -1.0
+def constraint_issue(advantages, nodes, higher_is_better):
+    sign = 1 if higher_is_better else -1
     groups = defaultdict(list)
-    for i in ids:
-        groups[nodes[i].parent_id].append(i)
+    for rollout_id in advantages:
+        rollout = nodes[rollout_id]
+        groups[rollout.parent_id].append(rollout)
 
-    out, repaired = {}, []
-    for pid, members in groups.items():
-        def key(i):  # best first, failures last
-            s = nodes[i].score
-            return (1, 0.0) if s is None else (0, -sign * s)
-
-        order = sorted(members, key=key)
-        vals = sorted((min(10.0, max(-10.0, adv[i])) for i in members), reverse=True)
-        a = dict(zip(order, vals))
-
-        k = 0  # equal outcomes -> equal advantages
-        while k < len(order):
-            j = k
-            while j + 1 < len(order) and key(order[j + 1]) == key(order[k]):
-                j += 1
-            tie = order[k:j + 1]
-            avg = statistics.fmean(a[i] for i in tie)
-            for i in tie:
-                a[i] = avg
-            k = j + 1
-        a = {i: round(v, 2) for i, v in a.items()}
-
-        valid = [i for i in members if nodes[i].score is not None]
-        failed = [i for i in members if nodes[i].score is None]
-        if valid and failed:
-            floor = min(a[i] for i in valid)
-            if floor <= -9.99:
-                for i in valid:
-                    a[i] = max(a[i], -9.99)
-                floor = -9.99
-            cap = round(floor - 0.01, 2)
-            for i in failed:
-                a[i] = min(a[i], cap)
-
-        if any(abs(a[i] - adv[i]) > 0.005 for i in members):
-            repaired.append(pid)
-        out.update(a)
-    return out, repaired
+    for siblings in groups.values():
+        siblings.sort(key=lambda row: (row.score is None, -sign * (row.score or 0.0)))
+        for better, worse in zip(siblings, siblings[1:]):
+            a, b = advantages[better.id], advantages[worse.id]
+            if better.score == worse.score:
+                if a != b:
+                    return f"tied siblings {better.id} and {worse.id} have different advantages"
+            elif worse.score is None:
+                if a <= b:
+                    return f"failed rollout {worse.id} must rank below valid sibling {better.id}"
+            elif a < b:
+                return f"better sibling {better.id} ranks below {worse.id}"
+    return None
 
 
-# ---------------------------------------------------------------------------
-# Critic
-# ---------------------------------------------------------------------------
+def prepare_prompt(tokenizer, tree, sota, higher_is_better, *, to_score=None, include_history=True,
+                   max_context=CRITIC_CONTEXT):
+    payload, nodes, ids = build_user_payload(tree, sota, higher_is_better, to_score, include_history)
+    messages = [{"role": "developer", "content": build_developer_prompt(higher_is_better, ids)},
+                {"role": "user", "content": ""}]
+    # Even a compact final JSON needs room when the optional history is long.
+    compact_answer = json.dumps({i: -0.51 if nodes[i].score is None else -0.5 for i in ids},
+                                separators=(",", ":"))
+    answer_tokens = len(tokenizer.encode(
+        f"<|channel|>final<|message|>{compact_answer}<|return|>", add_special_tokens=False))
+    history = payload.pop("history", [])
+    while True:
+        if history:
+            payload["history"] = history
+        else:
+            payload.pop("history", None)
+        messages[1]["content"] = json.dumps(payload, ensure_ascii=False)
+        prompt = tokenizer.encode(render_chat_prompt(tokenizer, messages, reasoning_effort="high"))
+        if len(prompt) + answer_tokens <= max_context:
+            return prompt, nodes, ids
+        if not history:
+            raise ValueError("critic prompt and required JSON exceed its context window")
+        # The summaries and active parent lineages still use all history.
+        history = history[(len(history) + 1) // 2:]
+
+
 class AdvantageCritic:
-    """Frozen gpt-oss critic on vLLM.
+    """Frozen GPT-OSS critic that keeps one vLLM engine across attempts."""
 
-    Extra keyword arguments go to vllm.LLM, e.g. gpu_memory_utilization=0.85,
-    tensor_parallel_size=2, max_model_len=65536. Pass llm=<existing vllm.LLM>
-    to reuse an engine you already created.
-    """
-
-    def __init__(self, model="openai/gpt-oss-120b", reasoning="high", temperature=1.0,
-                 top_p=1.0, max_tokens=16384, max_retries=2, llm=None, **llm_kwargs):
+    def __init__(self, model=CRITIC_MODEL, llm=None, **llm_kwargs):
         from vllm import LLM, SamplingParams
         self._SamplingParams = SamplingParams
         self.llm = llm if llm is not None else LLM(model=model, **llm_kwargs)
-        self.reasoning = reasoning
-        self.temperature = temperature
-        self.top_p = top_p
-        self.max_tokens = max_tokens
-        self.max_retries = max_retries
-        self._stop = _encoding().stop_tokens_for_assistant_actions()
+        self.tokenizer = self.llm.get_tokenizer()
+        self._stop = self.tokenizer.convert_tokens_to_ids(["<|return|>", "<|endoftext|>", "<|call|>"])
+        self._end_tokens = {*self._stop, self.tokenizer.convert_tokens_to_ids("<|end|>")}
 
-    def _params(self, n):
-        return self._SamplingParams(n=n, temperature=self.temperature, top_p=self.top_p,
-                                    max_tokens=self.max_tokens, stop_token_ids=self._stop,
-                                    skip_special_tokens=False)
+    def _params(self, seed):
+        return self._SamplingParams(n=1, temperature=1.0, top_p=1.0, seed=seed,
+                                    max_tokens=None, stop_token_ids=self._stop,
+                                    skip_special_tokens=True)
 
-    def score(self, tree, sota, higher_is_better=True, to_score=None,
-              n_samples=1, include_history=True):
-        """Score one tree. Returns (advantages or None, info)."""
-        req = dict(tree=tree, sota=sota, higher_is_better=higher_is_better,
-                   to_score=to_score, include_history=include_history)
-        return self.score_batch([req], n_samples=n_samples)[0]
+    def score_prompt(self, prompt, nodes, ids, higher_is_better, *, seed=None):
+        attempt = 0
+        if seed is None:
+            seed = secrets.randbits(32)
+        while True:
+            attempt += 1
+            requests = self.llm.generate(
+                [{"prompt_token_ids": prompt}], self._params((seed + attempt) % 2**32),
+                use_tqdm=False)
+            completion = requests[0].outputs[0] if requests and requests[0].outputs else None
+            text = None
+            if completion is not None:
+                token_ids = completion.token_ids
+                end = len(token_ids)
+                while end and token_ids[end - 1] in self._end_tokens:
+                    end -= 1
+                text = native_final_answer_scope(self.tokenizer, token_ids[:end], require_final=True)
+            advantages, issue = parse_advantages(text, ids)
+            if issue is None:
+                issue = constraint_issue(advantages, nodes, higher_is_better)
+            if issue is None:
+                return advantages, {"attempts": attempt}
+            if completion is not None and completion.finish_reason == "length":
+                issue += " (context window exhausted)"
+            print(f"[llm-critic] rejected attempt {attempt}: {issue}; retrying", flush=True)
 
-    def score_batch(self, requests, n_samples=1):
-        """Score many trees in one batched vLLM call. Each request is a dict with
-        keys tree, sota, and optionally higher_is_better, to_score, include_history.
+    def score(self, tree, sota, higher_is_better=True, to_score=None, include_history=True):
+        prompt, nodes, ids = prepare_prompt(
+            self.tokenizer, tree, sota, higher_is_better, to_score=to_score, include_history=include_history)
+        return self.score_prompt(prompt, nodes, ids, higher_is_better)
 
-        n_samples > 1 draws several judgments per tree and averages them, which
-        lowers the critic's variance. The average of constraint-satisfying
-        samples still satisfies the constraints."""
-        jobs = []
-        for req in requests:
-            hib = req.get("higher_is_better", True)
-            payload, nodes, ids = build_user_payload(req["tree"], req["sota"], hib,
-                                                     req.get("to_score"),
-                                                     req.get("include_history", True))
-            user_text = json.dumps(payload, ensure_ascii=False)
-            jobs.append({
-                "hib": hib, "nodes": nodes, "ids": ids, "user_text": user_text,
-                "prompt_ids": render_prompt_ids(build_developer_prompt(hib, ids),
-                                                user_text, self.reasoning),
-                "samples": [], "errors": [], "repaired": [],
-            })
 
-        pending = list(range(len(jobs)))
-        for _ in range(self.max_retries + 1):
-            if not pending:
-                break
-            outs = self.llm.generate(
-                [{"prompt_token_ids": jobs[k]["prompt_ids"]} for k in pending],
-                [self._params(n_samples - len(jobs[k]["samples"])) for k in pending],
-                use_tqdm=False,
-            )
-            for k, out in zip(pending, outs):
-                job = jobs[k]
-                for comp in out.outputs:
-                    text = extract_final_text(comp.token_ids, comp.text)
-                    adv, err = parse_advantages(text, job["ids"])
-                    if adv is None:
-                        if getattr(comp, "finish_reason", None) == "length":
-                            err += " (hit max_tokens)"
-                        job["errors"].append(err)
-                        continue
-                    fixed, repaired = enforce_constraints(adv, job["nodes"], job["ids"], job["hib"])
-                    job["samples"].append(fixed)
-                    job["repaired"].append(repaired)
-            pending = [k for k in pending if len(jobs[k]["samples"]) < n_samples]
+def _score_saved_step(path, engine_options):
+    from generation.gen_workers import (
+        _prepare_flashinfer_comm_compat, _shutdown_vllm_engine, _start_vllm_parent_watchdog,
+    )
 
-        results = []
-        for job in jobs:
-            info = {
-                "n_samples": len(job["samples"]),
-                "samples": job["samples"],
-                "errors": job["errors"],
-                "repaired_groups": job["repaired"],
-                "user_message": job["user_text"],
-            }
-            if not job["samples"]:
-                results.append((None, info))
-                continue
-            avg = {i: statistics.fmean(s[i] for s in job["samples"]) for i in job["ids"]}
-            final, _ = enforce_constraints(avg, job["nodes"], job["ids"], job["hib"])
-            results.append((final, info))
-        return results
+    _start_vllm_parent_watchdog(int(os.environ["TTT_CRITIC_PARENT_PID"]))
+    batch = json.loads(path.read_text(encoding="utf-8"))
+    tree = load_tree(path, batch)
+    higher_is_better = batch["higher_is_better"]
+    os.environ.setdefault("VLLM_USE_FLASHINFER_SAMPLER", "0")
+    _prepare_flashinfer_comm_compat()
+    critic = AdvantageCritic(**engine_options)
+    try:
+        prompt, nodes, ids = prepare_prompt(critic.tokenizer, tree, batch["sota"], higher_is_better)
+        print(f"[llm-critic] ready to score {len(ids)} rollouts with {len(prompt)} prompt tokens", flush=True)
+        seed = batch.get("seed")
+        if seed is not None:
+            seed = seed * 1_000_003 + batch["step"] * 1009
+        advantages, info = critic.score_prompt(prompt, nodes, ids, higher_is_better, seed=seed)
+        batch.update(advantages=advantages, **info)
+        save_batch(path, batch)
+        print(f"[llm-critic] accepted attempt {info['attempts']}; releasing the critic GPU memory", flush=True)
+    finally:
+        _shutdown_vllm_engine(critic.llm, None)
 
 
 # ---------------------------------------------------------------------------
 # Demo
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
+    if len(sys.argv) == 4 and sys.argv[1] == "--score-step":
+        _score_saved_step(Path(sys.argv[2]), json.loads(sys.argv[3]))
+        sys.exit(0)
+
     demo_tree = [
         {"id": "root",  "step": 0, "parent_id": None,    "score": 0.50},
         {"id": "s1_r0", "step": 1, "parent_id": "root",  "score": 0.58},
@@ -562,7 +495,4 @@ if __name__ == "__main__":
     critic = AdvantageCritic(model="openai/gpt-oss-120b", gpu_memory_utilization=0.90)
     adv, info = critic.score(demo_tree, sota=0.80, higher_is_better=True)
     print("advantages:", adv)
-    if info["errors"]:
-        print("errors:", info["errors"])
-    if any(info["repaired_groups"]):
-        print("groups repaired after constraint check:", info["repaired_groups"])
+    print("attempts:", info["attempts"])

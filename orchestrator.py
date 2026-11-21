@@ -1,8 +1,9 @@
-"""TTT-Discover multi-problem runner with entropic and SPO-RS training.
+"""TTT-Discover multi-problem runner with test-time LoRA training.
 
 Configuration: saved settings, current YAML rollout controls, then CLI.
 Entropic training uses adaptive-beta, leave-one-out group advantages.
 SPO-RS uses a historical run-wide baseline and clipped policy updates.
+Hybrid and llm-critic use a token-summed importance-sampling update.
 """
 
 import warnings
@@ -24,7 +25,9 @@ from runtime.host_memory import HostMemoryUnavailable, HostMemoryTimeout
 from pathlib import Path
 from types import SimpleNamespace
 import numpy as np
-from config_validation import PARENT_SELECTION_MODES, reject_retired_coder_cap
+from config_validation import (
+    LLM_CRITIC_MODE, PARENT_SELECTION_MODES, reject_retired_coder_cap, uses_hybrid_policy_loss,
+)
 from generation.output_validation import coder_output_issue
 # Same-name aliases retain entrypoint exports used by existing tools/tests.
 from diagnostics.console import (
@@ -43,7 +46,7 @@ from runtime.configuration import (
     _normalize_saved_advantage_config as _normalize_saved_advantage_config, _parse_gpu_ids,
     _resolve_training_backend as _resolve_training_backend,
     _resolve_training_memory_budgets as _resolve_training_memory_budgets,
-    _uses_clipped_policy_loss, _uses_reward_history,
+    _uses_clipped_policy_loss, _uses_replayable_policy_update, _uses_reward_history,
     _validate_known_training_capacity as _validate_known_training_capacity, load_config,
 )
 from training.exact_overflow import (
@@ -63,6 +66,7 @@ from training.trainers import (
     clipped_surrogate_loss as clipped_surrogate_loss,
     compute_group_advantages, compute_token_logprobs as compute_token_logprobs,
 )
+from training import critic_step
 from training.hybrid import hybrid_advantages, reference_logprob_mean
 
 
@@ -625,7 +629,7 @@ def _ordered_rollout_artifacts(artifacts, group_size):
 
 
 def _recoverable_spo_rs_artifacts(exp_dir, step_idx, cfg):
-    """Return a complete evaluated-but-uncheckpointed SPO-RS step.
+    """Return a complete evaluated-but-uncheckpointed policy update.
 
     Rollout metadata is written only after reward evaluation, while the step
     summary is written only after the adapter and training checkpoint.  Their
@@ -633,6 +637,11 @@ def _recoverable_spo_rs_artifacts(exp_dir, step_idx, cfg):
     interrupted optimizer update without regenerating or reevaluating code.
     """
     step_idx = int(step_idx)
+    critic = None
+    if cfg.advantage_mode == LLM_CRITIC_MODE:
+        critic = critic_step.load_batch(exp_dir, step_idx)
+        if critic is None or "advantages" not in critic:
+            return None
     paths = _complete_unfinished_rollout_paths(exp_dir, step_idx, cfg)
     if not paths:
         return None
@@ -646,6 +655,14 @@ def _recoverable_spo_rs_artifacts(exp_dir, step_idx, cfg):
         if not isinstance(meta, dict):
             return None
         reject_retired_coder_cap(meta, source=meta_path)
+        critic_label_pending = critic is not None and "advantage" not in meta
+        if critic is not None:
+            advantage = critic["advantages"].get(meta.get("node_id"))
+            if type(advantage) not in (int, float) or not -10 <= advantage <= 10:
+                raise ValueError(f"missing or invalid accepted critic advantage for {meta_path}")
+            if not critic_label_pending and meta["advantage"] != advantage:
+                raise ValueError(f"rollout metadata disagrees with the accepted critic label in {meta_path}")
+            meta["advantage"] = advantage
         required = (
             "step", "group", "rollout", "reward", "valid", "advantage",
             "advantage_mode", "n_response_tokens",
@@ -671,6 +688,8 @@ def _recoverable_spo_rs_artifacts(exp_dir, step_idx, cfg):
         behavior_path = meta_path.with_name(base + ".behavior_logprobs.zlib")
         if not response_path.is_file() or not prompt_path.is_file():
             return None
+        if critic is not None and not token_path.is_file():
+            raise FileNotFoundError(f"critic resume requires exact rollout tokens at {token_path}")
         artifacts.append({
             "meta_path": meta_path,
             "response_path": response_path,
@@ -679,8 +698,15 @@ def _recoverable_spo_rs_artifacts(exp_dir, step_idx, cfg):
             "behavior_logprobs_path": (behavior_path if behavior_path.is_file() else None),
             "meta": meta,
         })
+        if critic_label_pending:
+            artifacts[-1]["critic_label_pending"] = True
 
-    return _ordered_rollout_artifacts(artifacts, int(cfg.group_size))
+    artifacts = _ordered_rollout_artifacts(artifacts, int(cfg.group_size))
+    if critic is not None and (artifacts is None
+            or [critic_step.rollout_row(item["meta"]) for item in artifacts] != critic["rollouts"]
+            or set(critic["advantages"]) != {row["id"] for row in critic["rollouts"]}):
+        raise ValueError(f"saved critic batch does not match the step {step_idx} rollout artifacts")
+    return artifacts
 
 
 def _recoverable_pending_spo_rs_artifacts(exp_dir, step_idx, cfg):
@@ -711,7 +737,7 @@ def _recoverable_pending_spo_rs_artifacts(exp_dir, step_idx, cfg):
         if (int(meta.get("step", -1)) != step_idx
                 or meta.get("status") not in {"evaluation_pending", "evaluated"}):
             return None
-        if cfg.advantage_mode == "hybrid" and meta.get("advantage_mode") != "hybrid":
+        if uses_hybrid_policy_loss(cfg.advantage_mode) and meta.get("advantage_mode") != cfg.advantage_mode:
             return None
         required = (
             "group", "parent_group", "rollout", "n_response_tokens",
@@ -1325,24 +1351,96 @@ def _rebind_interrupted_step_zero_selection(sampler, exp_dir, parents):
         sampler.reassign_seed_id(parent, str(row["parent_id"]))
 
 
+def _restore_saved_spo_rs_update(cfg, artifacts, spo_rs_tracker, sampling_adapter_path, step_idx):
+    hybrid_mode = cfg.advantage_mode == "hybrid"
+    rewards = [float(item["meta"]["reward"]) for item in artifacts]
+    saved_advantages = np.asarray([float(item["meta"]["advantage"]) for item in artifacts], dtype=np.float64)
+    spo_infos = [_literal_metadata_mapping(item["meta"].get("spo_rs")) for item in artifacts]
+    if any(not info or not bool(info.get("used_for_policy_update", False)) for info in spo_infos):
+        raise RuntimeError(
+            "evaluated-step recovery found a rollout that was not part of "
+            "the saved SPO-RS policy update")
+    transformed = spo_rs_tracker.transformed_rewards(rewards)
+    recovered_advantages = spo_rs_tracker.normalized_advantages(transformed)
+    if hybrid_mode and recovered_advantages is not None:
+        group_size = int(cfg.group_size)
+        for start in range(0, len(rewards), group_size):
+            siblings = slice(start, start + group_size)
+            recovered_advantages[siblings], _ = hybrid_advantages(
+                rewards[siblings], recovered_advantages[siblings],
+                ttt_weight=cfg.hybrid_ttt_weight,
+                spo_weight=cfg.hybrid_spo_weight)
+    spo_info = spo_infos[0]
+    saved_value_before = spo_info.get("value_before")
+    if (saved_value_before is None
+            or not math.isclose(float(saved_value_before),
+                                float(spo_rs_tracker.baseline()),
+                                rel_tol=0.0, abs_tol=1e-10)):
+        raise RuntimeError('evaluated-step recovery does not match the saved pre-step SPO-RS value')
+    if int(spo_info.get("group_size", -1)) != len(artifacts):
+        raise RuntimeError('evaluated-step recovery rollout count differs from the saved SPO-RS update')
+    if Path(str(spo_info.get("policy_adapter", ""))).name != Path(sampling_adapter_path).name:
+        raise RuntimeError('evaluated-step recovery sampling adapter differs from the saved SPO-RS update')
+    for index, (info, transformed_reward) in enumerate(zip(spo_infos, transformed)):
+        saved_transformed = info.get("transformed_reward")
+        if (saved_transformed is None
+                or not math.isclose(float(saved_transformed), float(transformed_reward), rel_tol=0.0, abs_tol=1e-10)):
+            raise RuntimeError(
+                "evaluated-step recovery transformed reward differs from "
+                f"the saved SPO-RS record at rollout {index}")
+    divergence = spo_info.get("divergence")
+    if divergence is None:
+        if bool(spo_info.get("divergence_missing", False)):
+            divergence = math.inf
+        else:
+            raise RuntimeError("evaluated-step recovery has no saved SPO-RS divergence")
+    divergence = float(divergence)
+    if math.isnan(divergence) or divergence < 0.0:
+        raise RuntimeError("evaluated-step recovery found an invalid SPO-RS divergence")
+    tracker_update = spo_rs_tracker.update(
+        transformed, divergence=divergence,
+        policy_adapter=sampling_adapter_path, step=step_idx)
+    saved_after = spo_info.get("value_after")
+    if (saved_after is not None
+            and not math.isclose(float(saved_after), float(tracker_update["value_after"]), rel_tol=0.0, abs_tol=1e-10)):
+        raise RuntimeError(
+            "evaluated-step recovery produced a different SPO-RS tracker "
+            "value; refusing an inexact update")
+
+    if (recovered_advantages is None
+            or recovered_advantages.shape != saved_advantages.shape
+            or not np.allclose(recovered_advantages, saved_advantages, rtol=0.0, atol=1e-10)):
+        raise RuntimeError(
+            "evaluated-step recovery advantages differ from the saved SPO "
+            "objective; refusing an inexact update")
+    return spo_info, tracker_update, divergence
+
+
 def _resume_spo_rs_step_from_artifacts(
         model, tokenizer, sampler, step_idx, cfg, exp_dir,
         problem, parallel_trainer, spo_rs_tracker, sampling_adapter_path,
         artifacts, evaluation_complete=None):
-    """Finish one interrupted SPO-RS step from its durable evaluations."""
+    """Finish one interrupted policy update from its durable evaluations."""
     import torch
     from experiment_io import load_rollout_logprobs, save_best_state_snapshot, save_rollout
     from evaluation.reward import extract_python_code
     from generation.gen_workers import native_final_answer_scope
     from search.sampler import State
 
-    if parallel_trainer is None:
+    critic_mode = cfg.advantage_mode == LLM_CRITIC_MODE
+    training_enabled = not bool(getattr(cfg, "no_train", False))
+    if parallel_trainer is None and (training_enabled or not critic_mode):
         raise RuntimeError("evaluated-step recovery requires the process-distributed trainer")
-    if (spo_rs_tracker is None or not spo_rs_tracker.initialized):
+    if not critic_mode and (spo_rs_tracker is None or not spo_rs_tracker.initialized):
         raise RuntimeError("evaluated-step recovery requires the pre-step SPO-RS tracker")
     if sampling_adapter_path is None or not Path(sampling_adapter_path).is_dir():
         raise FileNotFoundError(f'evaluated-step recovery cannot find the sampling adapter: {sampling_adapter_path}')
     hybrid_mode = cfg.advantage_mode == "hybrid"
+    hybrid_loss = uses_hybrid_policy_loss(cfg.advantage_mode)
+    if critic_mode:
+        judged = critic_step.load_batch(exp_dir, step_idx)
+        if judged["adapter"] != Path(sampling_adapter_path).name:
+            raise RuntimeError("evaluated-step recovery sampling adapter differs from the saved critic batch")
 
     by_group = {}
     for item in artifacts:
@@ -1390,74 +1488,14 @@ def _resume_spo_rs_step_from_artifacts(
                     "the restored sampler checkpoint")
         sampler.record_expansion(parent, count=int(cfg.group_size))
 
-    rewards = [float(item["meta"]["reward"]) for item in artifacts]
-    saved_advantages = np.asarray([float(item["meta"]["advantage"]) for item in artifacts], dtype=np.float64)
-    spo_infos = [_literal_metadata_mapping(item["meta"].get("spo_rs")) for item in artifacts]
-    if any(not info or not bool(info.get("used_for_policy_update", False)) for info in spo_infos):
-        raise RuntimeError(
-            "evaluated-step recovery found a rollout that was not part of "
-            "the saved SPO-RS policy update")
-    recovery_updates = []
-    transformed = spo_rs_tracker.transformed_rewards(rewards)
-    recovered_advantages = spo_rs_tracker.normalized_advantages(transformed)
-    if hybrid_mode and recovered_advantages is not None:
-        group_size = int(cfg.group_size)
-        for start in range(0, len(rewards), group_size):
-            siblings = slice(start, start + group_size)
-            recovered_advantages[siblings], _ = hybrid_advantages(
-                rewards[siblings], recovered_advantages[siblings],
-                ttt_weight=cfg.hybrid_ttt_weight,
-                spo_weight=cfg.hybrid_spo_weight)
-    spo_info = spo_infos[0]
-    saved_value_before = spo_info.get("value_before")
-    if (saved_value_before is None
-            or not math.isclose(float(saved_value_before),
-                                float(spo_rs_tracker.baseline()),
-                                rel_tol=0.0, abs_tol=1e-10)):
-        raise RuntimeError('evaluated-step recovery does not match the saved pre-step SPO-RS value')
-    if int(spo_info.get("group_size", -1)) != len(artifacts):
-        raise RuntimeError('evaluated-step recovery rollout count differs from the saved SPO-RS update')
-    if Path(str(spo_info.get("policy_adapter", ""))).name != Path(sampling_adapter_path).name:
-        raise RuntimeError('evaluated-step recovery sampling adapter differs from the saved SPO-RS update')
-    for index, (info, transformed_reward) in enumerate(zip(spo_infos, transformed)):
-        saved_transformed = info.get("transformed_reward")
-        if (saved_transformed is None
-                or not math.isclose(float(saved_transformed), float(transformed_reward), rel_tol=0.0, abs_tol=1e-10)):
-            raise RuntimeError(
-                "evaluated-step recovery transformed reward differs from "
-                f"the saved SPO-RS record at rollout {index}")
-    divergence = spo_info.get("divergence")
-    if divergence is None:
-        if bool(spo_info.get("divergence_missing", False)):
-            divergence = math.inf
-        else:
-            raise RuntimeError("evaluated-step recovery has no saved SPO-RS divergence")
-    divergence = float(divergence)
-    if math.isnan(divergence) or divergence < 0.0:
-        raise RuntimeError("evaluated-step recovery found an invalid SPO-RS divergence")
-    tracker_update = spo_rs_tracker.update(
-        transformed, divergence=divergence,
-        policy_adapter=sampling_adapter_path, step=step_idx)
-    recovery_updates = [tracker_update]
-    saved_after = spo_info.get("value_after")
-    if (saved_after is not None
-            and not math.isclose(float(saved_after), float(tracker_update["value_after"]), rel_tol=0.0, abs_tol=1e-10)):
-        raise RuntimeError(
-            "evaluated-step recovery produced a different SPO-RS tracker "
-            "value; refusing an inexact update")
-
-    if (recovered_advantages is None
-            or recovered_advantages.shape != saved_advantages.shape
-            or not np.allclose(recovered_advantages, saved_advantages, rtol=0.0, atol=1e-10)):
-        raise RuntimeError(
-            "evaluated-step recovery advantages differ from the saved SPO "
-            "objective; refusing an inexact update")
+    if not critic_mode:
+        spo_info, tracker_update, divergence = _restore_saved_spo_rs_update(
+            cfg, artifacts, spo_rs_tracker, sampling_adapter_path, step_idx)
 
     prompt_cache = {}
     prompt_job_ids = {}
     all_examples = []
     all_children = []
-    group_sizes = {group: len(records) for group, records in by_group.items()}
     restored_terminal_tokens = 0
     canonical_recovery_responses = 0
     unavailable_original_tokens = 0
@@ -1502,7 +1540,7 @@ def _resume_spo_rs_step_from_artifacts(
             prompt_cache[prompt_text] = tokenizer(prompt_text, return_tensors="pt").input_ids
             prompt_job_ids[prompt_text] = len(prompt_job_ids)
         group = int(meta["group"])
-        if response_tokens:
+        if response_tokens and training_enabled:
             behavior_values = item.get("behavior_logprobs")
             behavior_logprobs = (
                 torch.tensor(behavior_values, dtype=torch.float32)
@@ -1522,9 +1560,9 @@ def _resume_spo_rs_step_from_artifacts(
                 "sample_weight": 0.0,
                 "_overlap_key": (group, int(meta["rollout"])),
             }
-            if hybrid_mode:
+            if hybrid_loss:
                 if not item["token_path"] or not _valid_example_token_logprobs(example, "behavior_logprobs"):
-                    raise RuntimeError("hybrid recovery requires the saved sampler tokens and logprobs")
+                    raise RuntimeError(f"{cfg.advantage_mode} recovery requires the saved sampler tokens and logprobs")
                 if cfg.kl_penalty_coef:
                     reference_path = item["response_path"].with_suffix(".reference_logprobs.zlib")
                     example["reference_logprobs"] = torch.tensor(
@@ -1554,22 +1592,25 @@ def _resume_spo_rs_step_from_artifacts(
                 child.id = str(meta["node_id"])
             parent_group = int(meta.get("parent_group", group))
             all_children.append((child, parents[parent_group]))
+        if item.get("critic_label_pending"):
+            save_rollout(exp_dir, step_idx, group, int(meta["rollout"]), response_text,
+                         meta, artifacts_already_saved=True)
 
-    if not all_examples and not hybrid_mode:
+    if not all_examples and not hybrid_loss:
         raise RuntimeError("evaluated-step recovery found no nonempty responses to train")
     if all_examples:
         trajectory_weight = 1.0 / len(all_examples)
         for example in all_examples:
             example["sample_weight"] = trajectory_weight
     hybrid_reference_mean = None
-    if hybrid_mode and cfg.kl_penalty_coef:
+    if hybrid_loss and cfg.kl_penalty_coef and training_enabled:
         hybrid_reference_mean = reference_logprob_mean(
             (example["response_ids"].shape[1], example["behavior_logprobs"], example["reference_logprobs"])
             for example in all_examples)
         for example in all_examples:
             example["reference_logprob_mean"] = hybrid_reference_mean
 
-    overflow_state = _load_exact_spo_rs_overflow(exp_dir, step_idx)
+    overflow_state = _load_exact_spo_rs_overflow(exp_dir, step_idx) if training_enabled else None
     recovery_examples = all_examples
     if overflow_state is not None:
         try:
@@ -1617,7 +1658,7 @@ def _resume_spo_rs_step_from_artifacts(
     archive_stats = sampler.update(all_children)
     print(
         f"[resume] step {step_idx}: reusing {len(artifacts)} saved rollout "
-        "evaluations; generation and CPU evaluation are skipped",
+        "evaluations; generation and evaluation are skipped",
         flush=True,
     )
     if restored_terminal_tokens:
@@ -1683,25 +1724,32 @@ def _resume_spo_rs_step_from_artifacts(
         "valid_fraction": (sum(bool(item["meta"]["valid"]) for item in artifacts) / len(artifacts)),
         "code_valid_fraction": (
             1.0 - sum(_metadata_is_code_failure(item["meta"]) for item in artifacts) / len(artifacts)),
-        "spo_rs_updates": recovery_updates,
-        "spo_rs_tracker_size": (0 if spo_rs_tracker is None else len(spo_rs_tracker)),
-        "spo_rs_divergence": (None if not math.isfinite(divergence) else divergence),
-        "spo_rs_context_divergences": spo_info.get("context_divergences", {}),
-        "spo_rs_missing_policy_scores": int(spo_info.get('missing_policy_scores', 0) or 0),
-        "spo_rs_sampling_adapter": Path(sampling_adapter_path).name,
-        "spo_rs_policy_updated": False,
         "recovered_evaluated_step": True,
         "recovered_rollouts": len(artifacts),
     }
-    if hybrid_mode:
+    if critic_mode:
+        stats["critic_attempts"] = judged["attempts"]
+        if not training_enabled:
+            stats["training_disabled"] = True
+    else:
+        stats.update({
+            "spo_rs_updates": [tracker_update],
+            "spo_rs_tracker_size": len(spo_rs_tracker),
+            "spo_rs_divergence": divergence if math.isfinite(divergence) else None,
+            "spo_rs_context_divergences": spo_info.get("context_divergences", {}),
+            "spo_rs_missing_policy_scores": int(spo_info.get("missing_policy_scores", 0) or 0),
+            "spo_rs_sampling_adapter": Path(sampling_adapter_path).name,
+        })
+    if hybrid_loss:
         stats["hybrid_reference_kl_mean"] = hybrid_reference_mean
+    if hybrid_mode:
         stats["hybrid_ttt_weight"] = cfg.hybrid_ttt_weight
         stats["hybrid_spo_weight"] = cfg.hybrid_spo_weight
     if overflow_state is not None:
         stats.update(parallel_trainer.recover_spo_rs_overflow(recovery_examples, cfg, step_idx, overflow_state))
     elif all_examples:
         stats.update(parallel_trainer.train_spo_rs(all_examples, cfg, step_idx))
-    stats["spo_rs_policy_updated"] = bool(all_examples)
+    stats["critic_policy_updated" if critic_mode else "spo_rs_policy_updated"] = bool(all_examples)
     return stats
 
 
@@ -1884,6 +1932,22 @@ def _parent_context(parent):
     )
 
 
+def _parent_rollout_fields(parent, pick_info, sampler_type):
+    return {
+        "parent_id": parent.id,
+        "parent_timestep": int(parent.timestep),
+        "sampler_type": sampler_type,
+        "parent_raw_score": parent.raw_score,
+        "parent_value": float(parent.value) if parent.value is not None else None,
+        "parent_is_seed": parent.is_seed,
+        "parent_visit_count": int(pick_info.get("n", 0)),
+        "parent_q_value": float(pick_info["Q"]) if pick_info.get("Q") is not None else None,
+        "parent_prior": float(pick_info["P"]) if pick_info.get("P") is not None else None,
+        "parent_exploration_bonus": float(pick_info["bonus"]) if pick_info.get("bonus") is not None else None,
+        "parent_selection_score": float(pick_info["score"]) if pick_info.get("score") is not None else None,
+    }
+
+
 def _step_best_candidate(states, maximize):
     raw_states = []
     for state in states:
@@ -1903,7 +1967,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                cfg, exp_dir, problem, gen_pool=None,
                parallel_trainer=None,
                spo_rs_tracker=None, sampling_adapter_path=None,
-               evaluation_complete=None, pending_artifacts=None):
+               evaluation_complete=None, pending_artifacts=None, park_trainer=None):
     import os
     import torch
     from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
@@ -1913,7 +1977,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                                save_best_state_snapshot, save_parent_selections,
                                save_rollout, save_rollout_artifacts, save_rollout_logprobs)
     from problems.base import is_code_failure
-    from generation.gen_workers import make_progress_bar, native_final_answer_scope
+    from generation.gen_workers import make_progress_bar, native_final_answer_scope, render_chat_prompt
 
 
     training_enabled = not bool(getattr(cfg, "no_train", False))
@@ -1922,20 +1986,23 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
     step_t0 = time.time()
     active_advantage_mode = str(getattr(cfg, "advantage_mode", "entropic")).lower()
     hybrid_mode = active_advantage_mode == "hybrid"
+    critic_mode = active_advantage_mode == LLM_CRITIC_MODE
+    hybrid_loss = uses_hybrid_policy_loss(active_advantage_mode)
     history_mode = _uses_reward_history(active_advantage_mode)
+    replayable_update = _uses_replayable_policy_update(active_advantage_mode)
     history_label = "hybrid" if hybrid_mode else "SPO-RS"
     if history_mode and (spo_rs_tracker is None or not spo_rs_tracker.initialized):
         raise ValueError("historical advantages require an initialized pre-step reward tracker")
     clipped_policy_mode = _uses_clipped_policy_loss(active_advantage_mode)
     # The historical tracker needs immutable consecutive policy versions.
     adapter_path = None
-    if history_mode:
+    if replayable_update:
         if sampling_adapter_path is None:
             adapter_path = _save_adapter(model, exp_dir, step_idx, directory_name="adapter_initial")
         else:
             adapter_path = str(Path(sampling_adapter_path))
             if not Path(adapter_path).is_dir():
-                raise FileNotFoundError(f"SPO-RS sampling adapter not found: {adapter_path}")
+                raise FileNotFoundError(f"sampling adapter not found: {adapter_path}")
     elif gen_pool is not None:
         adapter_path = _save_adapter(model, exp_dir, step_idx)
 
@@ -1959,6 +2026,12 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
     # adapter training is interrupted.
     sampler_type = ("UCTSampler" if getattr(sampler, "use_uct", False) else type(sampler).__name__)
     save_parent_selections(exp_dir, step_idx, sampler_type, parents, sampler.last_picks_info, rollout_config=cfg)
+    parent_fields = [_parent_rollout_fields(parent, sampler.last_picks_info[i]
+                     if i < len(sampler.last_picks_info) else {}, sampler_type)
+                     for i, parent in enumerate(parents)]
+    if critic_mode:
+        critic_context = critic_step.step_context(
+            problem, (state for state in sampler._states if state.is_seed), adapter_path)
     setting_log_only(
         f"[step {step_idx}] saved {len(parents)} selected parent(s) before "
         f"generation/training", flush=True)
@@ -1984,20 +2057,6 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
         base_messages.append(problem.build_prompt(pc))
 
     coder_effort = getattr(cfg, "coder_reasoning_effort", None)
-    template_options = {} if coder_effort is None else {"reasoning_effort": str(coder_effort)}
-
-    def _render(messages):
-        try:
-            return tokenizer.apply_chat_template(
-                messages, tokenize=False, add_generation_prompt=True,
-                **template_options,
-            )
-        except TypeError as error:
-            if coder_effort is None:
-                raise
-            raise RuntimeError(
-                f"the installed GPT-OSS tokenizer cannot apply reasoning_effort={coder_effort}. "
-                "Update Transformers and refresh the tokenizer files.") from error
 
     prompt_jobs = []
     for g, _parent in enumerate(parents):
@@ -2006,7 +2065,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
         prompt_jobs.append({
             "parent_group": g,
             "messages": messages,
-            "prompt_text": _render(messages),
+            "prompt_text": render_chat_prompt(tokenizer, messages, reasoning_effort=coder_effort),
             "coder_reasoning_effort": coder_effort,
             "count": count,
         })
@@ -2068,11 +2127,16 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                 result = _future.result()
                 live_best_raw, best_line = _advance_live_best_raw(
                     result, live_best_raw, bool(problem.maximize))
+                evaluated_meta = _evaluated_rollout_meta(record["_pending_meta"], result)
+                if critic_mode:
+                    evaluated_meta["archive_eligible"] = bool(result.valid and result.code)
+                    if save_ctor:
+                        evaluated_meta["construction"] = _as_float_list(result.construction, cfg.max_saved_construction)
                 save_future = rollout_io_pool.submit(
                     save_rollout,
                     exp_dir, step_idx, int(record["group_id"]),
                     int(record["rollout_index"]), record["text"],
-                    _evaluated_rollout_meta(record["_pending_meta"], result),
+                    evaluated_meta,
                     artifacts_already_saved=True,
                 )
                 rollout_io_futures.append(save_future)
@@ -2156,8 +2220,11 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
             "solver": "coder",
             "model_name": cfg.coder_model_name,
         }
-        if hybrid_mode:
+        if hybrid_loss:
             pending_meta["advantage_mode"] = active_advantage_mode
+        if critic_mode:
+            pending_meta.update(parent_fields[group_id],
+                                node_id=critic_step.rollout_id(step_idx, group_id, rollout_index))
         record["_pending_meta"] = pending_meta
         if isolated_batch is None:
             rollout_io_futures.append(rollout_io_pool.submit(
@@ -2219,7 +2286,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                     "top_k": getattr(cfg, "sampling_top_k", None),
                     "min_p": getattr(cfg, "sampling_min_p", None),
                     "step_idx": step_idx,
-                    "full_policy_sampling": hybrid_mode,
+                    "full_policy_sampling": hybrid_loss,
                 }
                 if cfg.generation_backend == "vllm":
                     generation_options["return_logprobs"] = training_enabled
@@ -2359,6 +2426,10 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                     if hybrid_mode and cfg.kl_penalty_coef:
                         reference_scores = gen_pool.score_token_logprobs(
                             score_pairs, show_progress=True, require_complete=True)
+                elif critic_mode:
+                    reference_scores = (gen_pool.score_token_logprobs(
+                        score_pairs, show_progress=True, require_complete=True)
+                        if cfg.kl_penalty_coef else [None] * len(score_pairs))
                 else:
                     current_policy_scores = [None] * len(score_pairs)
                     try:
@@ -2370,14 +2441,14 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                               "the HF trainer", flush=True)
                 for record, values in zip(vllm_logprob_records, reference_scores):
                     record["reference_logprobs"] = values
-                    if hybrid_mode and values is not None and not is_trimul:
+                    if hybrid_loss and values is not None and not is_trimul:
                         row = {"group": record["group_id"], "rollout": record["rollout_index"]}
                         path = trimul_evaluation.rollout_path(exp_dir, step_idx, row)
                         rollout_io_futures.append(rollout_io_pool.submit(
                             save_rollout_logprobs, path.with_suffix(".reference_logprobs.zlib"), values))
                 behavior_count = sum(record["behavior_logprobs"] is not None for record in vllm_logprob_records)
                 reference_count = sum(record["reference_logprobs"] is not None for record in vllm_logprob_records)
-                reference_hf_fallbacks = (0 if history_mode else len(vllm_logprob_records) - reference_count)
+                reference_hf_fallbacks = (0 if replayable_update else len(vllm_logprob_records) - reference_count)
                 eval_done_after = sum(future.done() for futures in reward_futures.values() for future in futures)
                 reference_label = (
                     'off for SPO-RS' if clipped_policy_mode else f'{reference_count}/{len(vllm_logprob_records)}')
@@ -2408,7 +2479,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
         finally:
             if gen_pool is not None and getattr(gen_pool, "sequential", False):
                 immediate_restore = bool(
-                    coder_phase_complete and training_enabled
+                    coder_phase_complete and training_enabled and not critic_mode
                     and not defer_gpu_evaluation
                     and hasattr(gen_pool, "release_for_training"))
                 if immediate_restore:
@@ -2436,7 +2507,8 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                 exp_dir, step_idx, problem, cfg.sandbox_timeout_s, candidates,
                 divergence=spo_rs_divergence, context_divergences=spo_rs_context_divergences,
                 missing_policy_scores=spo_rs_missing_policy_scores, previous_best_raw=live_best_raw,
-                rollout_seconds=time.time() - rollout_t0)
+                rollout_seconds=time.time() - rollout_t0,
+                **({"critic": critic_context} if critic_mode else {}))
 
         if isolated_batch is not None:
             for row, record in zip(isolated_batch["candidates"], deferred_rollouts):
@@ -2444,20 +2516,22 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                 _submit_rollout(record, trimul_evaluation.load_result(
                     path, record["text"], record["_final_answer_text"]))
         elif deferred_rollouts:
+            if critic_mode:
+                park_trainer()
             evaluation_trainer_offloaded = _prepare_gpu_evaluation(
                 backend, optimizer, cfg, problem, step_idx, len(deferred_rollouts),
-                trainer_parked=(not training_enabled and cfg.generation_backend == "vllm"
-                                and getattr(gen_pool, "sequential", False)))
+                trainer_parked=(critic_mode or (not training_enabled and cfg.generation_backend == "vllm"
+                                                and getattr(gen_pool, "sequential", False))))
             for record in deferred_rollouts:
                 _submit_rollout(record)
 
         all_futs = [f for g in range(num_groups) for f in reward_futures[g]]
         try:
-            if hybrid_mode and training_enabled:
+            if hybrid_loss and training_enabled:
                 scored_records = [record for g in range(num_groups) for record in group_responses[g]
                                   if record["token_ids"]]
                 if any(record["behavior_logprobs"] is None for record in scored_records):
-                    raise RuntimeError("hybrid training requires the original sampler logprobs for every response")
+                    raise RuntimeError(f"{active_advantage_mode} training requires the original sampler logprobs for every response")
                 if cfg.kl_penalty_coef:
                     hybrid_reference_mean = reference_logprob_mean(
                         (len(record["token_ids"]), record["behavior_logprobs"], record["reference_logprobs"])
@@ -2689,6 +2763,18 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
     # evaluation, so this is only a non-blocking correctness barrier.
     for save_future in rollout_io_futures:
         save_future.result()
+    if critic_mode:
+        rows = []
+        for group in range(num_groups):
+            for record, future in zip(group_responses[group], reward_futures[group], strict=True):
+                result = future.result()
+                rows.append(critic_step.rollout_row({**record["_pending_meta"],
+                                                    "valid": result.valid, "raw_score": result.raw_score}))
+        critic_step.prepare_batch(exp_dir, step_idx, critic_context, rows)
+        if isolated_batch is None:
+            park_trainer()
+        judged = critic_step.score_batch(
+            exp_dir, step_idx, cfg, getattr(gen_pool, "host_memory_admission", None))
     if history_mode and not training_enabled:
         # With policy optimization disabled, consecutive policies are exactly
         # identical even though the selected parents may be new.
@@ -2800,14 +2886,18 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
             spo_rs_trainable = [item["trainable"] for item in prepared]
             spo_rs_rollout_info = [item["info"] for item in prepared]
             spo_rs_v_t = spo_rs_rollout_info[0]["value_before"]
-        if hybrid_mode:
+        if critic_mode:
+            advantages = np.asarray([judged["advantages"][record["_pending_meta"]["node_id"]]
+                                     for record in responses], dtype=np.float64)
+        elif hybrid_mode:
             advantages, ttt_adaptive_beta, ttt_advantages = hybrid_advantages(
                 rewards_np, spo_rs_advantages, ttt_weight=cfg.hybrid_ttt_weight,
                 spo_weight=cfg.hybrid_spo_weight, return_ttt=True)
         else:
             ttt_advantages, ttt_adaptive_beta = compute_group_advantages(rewards_np)
             advantages = spo_rs_advantages if history_mode else ttt_advantages
-        adv_scale = float(cfg.spo_rs_beta) if history_mode else ttt_adaptive_beta
+        adv_scale = (None if critic_mode else
+                     float(cfg.spo_rs_beta) if history_mode else ttt_adaptive_beta)
         ttt_sibling_max = float(rewards_np.max())
         constant = (ttt_sibling_max - float(rewards_np.min()) < 1e-12)
 
@@ -2815,10 +2905,10 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
         step_rollout_count += len(valids)
         step_code_failure_count += sum(is_code_failure(res) for res in outs)
 
+        beta_label = f"  beta={adv_scale:.9f}" if adv_scale is not None else ""
         print(f"  group {g}: rewards min={rewards_np.min():.9f} "
               f"mean={rewards_np.mean():.9f} max={ttt_sibling_max:.9f}  "
-              f"valid={sum(valids)}/{len(valids)}  "
-              f"beta={adv_scale:.9f}")
+              f"valid={sum(valids)}/{len(valids)}{beta_label}")
 
         # Save every rollout (response + meta) to disk for debugging
         for r_idx, record in enumerate(responses):
@@ -2845,10 +2935,11 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                 observation=res.stdout,
                 poisson=res.poisson,
             )
+            if critic_mode:
+                child.id = record["_pending_meta"]["node_id"]
             archive_eligible = bool(valids[r_idx] and codes[r_idx])
             if archive_eligible:
                 all_children.append((child, parent))
-            pick_info = (sampler.last_picks_info[parent_group] if parent_group < len(sampler.last_picks_info) else {})
             spo_rs_advantage = spo_rs_advantages[r_idx] if history_mode else None
             meta = {
                 "output_format_issue": record["output_format_issue"],
@@ -2857,9 +2948,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                 "parent_group": parent_group,
                 "rollout": r_idx,
                 "node_id": child.id,
-                "parent_id": parent.id,
-                "parent_timestep": int(parent.timestep),
-                "sampler_type": sampler_type,
+                **parent_fields[parent_group],
                 "reward": float(rewards[r_idx]),
                 "raw_score": (float(res.raw_score) if res.raw_score is not None else None),
                 "poisson": res.poisson,
@@ -2870,24 +2959,17 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                 "ran": bool(res.ran),
                 "msg": res.msg,
                 "failure_kind": res.failure_kind,
-                **_rollout_advantage_fields(
+                **({"advantage": float(advantages[r_idx])} if critic_mode else _rollout_advantage_fields(
                     advantages[r_idx], ttt_advantage=ttt_advantages[r_idx],
                     spo_rs_advantage=spo_rs_advantage,
                     ttt_sibling_max=ttt_sibling_max, ttt_adaptive_beta=ttt_adaptive_beta,
-                    parent_raw_score=parent.raw_score, spo_rs_v_t=spo_rs_v_t),
-                "beta": float(adv_scale),
+                    parent_raw_score=parent.raw_score, spo_rs_v_t=spo_rs_v_t)),
+                "beta": adv_scale,
                 "advantage_mode": adv_mode,
-                "advantage_scale": (float(adv_scale) if math.isfinite(adv_scale) else None),
+                "advantage_scale": adv_scale if adv_scale is not None and math.isfinite(adv_scale) else None,
                 "n_response_tokens": len(token_ids),
                 "coder_reasoning_effort": job.get("coder_reasoning_effort"),
                 "sandbox_stdout": _saved_evaluator_output(res.stdout),
-                "parent_value": float(parent.value) if parent.value is not None else None,
-                "parent_is_seed": parent.id in sampler._seed_ids,
-                "parent_visit_count": int(pick_info.get("n", 0)),
-                "parent_q_value": (float(pick_info["Q"]) if pick_info.get("Q") is not None else None),
-                "parent_prior": (float(pick_info["P"]) if pick_info.get("P") is not None else None),
-                "parent_exploration_bonus": (float(pick_info["bonus"]) if pick_info.get("bonus") is not None else None),
-                "parent_selection_score": (float(pick_info["score"]) if pick_info.get("score") is not None else None),
                 "archive_eligible": archive_eligible,
                 # The solution itself, and the one it started from. Neither is
                 # recoverable afterwards: `construction` lives only in the
@@ -2916,7 +2998,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
 
         # Entropic training skips constant groups. SPO-RS compares every
         # rollout with its historical baseline, so tied groups can still learn.
-        if constant and not history_mode:
+        if constant and not replayable_update:
             continue
 
         for r_idx, (record, adv) in enumerate(zip(responses, advantages)):
@@ -2971,7 +3053,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                 "prompt_job_id": job_idx,
                 "sample_weight": 1.0 / (num_groups * len(responses)),
             }
-            if hybrid_mode:
+            if hybrid_loss:
                 example["reference_logprob_mean"] = hybrid_reference_mean
                 example["_overlap_key"] = (g, r_idx)
             all_examples.append(example)
@@ -2990,7 +3072,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
     code_valid_fraction = (1.0 - step_code_failure_count / step_rollout_count if step_rollout_count else 1.0)
 
     # Preserve the standard objectives' constant-reward-group filtering.
-    if not history_mode:
+    if not replayable_update:
         all_examples = [ex for ex in all_examples if not ex["reward_constant"]]
 
     if clipped_policy_mode and cfg.generation_backend == "vllm":
@@ -3009,7 +3091,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                   f"{unusable} rollout(s); saved them but excluded only those "
                   "records from the clipped-policy update", flush=True)
 
-    if history_mode and all_examples:
+    if replayable_update and all_examples:
         trajectory_weight = 1.0 / len(all_examples)
         for example in all_examples:
             example["sample_weight"] = trajectory_weight
@@ -3179,10 +3261,14 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
         step_stats["spo_rs_missing_policy_scores"] = int(spo_rs_missing_policy_scores)
         step_stats["spo_rs_sampling_adapter"] = Path(adapter_path).name
         step_stats["spo_rs_policy_updated"] = False
-    if hybrid_mode:
+    if hybrid_loss:
         step_stats["hybrid_reference_kl_mean"] = hybrid_reference_mean
+    if hybrid_mode:
         step_stats["hybrid_ttt_weight"] = cfg.hybrid_ttt_weight
         step_stats["hybrid_spo_weight"] = cfg.hybrid_spo_weight
+    if critic_mode:
+        step_stats["critic_attempts"] = judged["attempts"]
+        step_stats["critic_policy_updated"] = False
 
 
     if not training_enabled:
@@ -3198,14 +3284,14 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
         print(f"[step {step_idx}] no usable training examples")
         return step_stats
 
-    if history_mode:
+    if replayable_update:
         if spo_rs_overlap_state is not None:
             step_stats.update(parallel_trainer.finish_spo_rs_overlap(
                 cfg, step_idx, len(all_examples), apply_update=True))
             spo_rs_overlap_state = None
         else:
             step_stats.update(parallel_trainer.train_spo_rs(all_examples, cfg, step_idx))
-        step_stats["spo_rs_policy_updated"] = True
+        step_stats["critic_policy_updated" if critic_mode else "spo_rs_policy_updated"] = True
         return step_stats
 
     # ----- TRAIN STEP -----
@@ -3301,6 +3387,10 @@ def _main(trainer_startup):
         except trimul_evaluation.EvaluationHandoff as handoff:
             request_evaluation(handoff.path)
             return
+    if cfg.advantage_mode == LLM_CRITIC_MODE and resume_dir and restart_step < cfg.num_steps:
+        judged = critic_step.load_batch(exp_dir, restart_step)
+        if judged is not None and "advantages" not in judged:
+            critic_step.score_batch(exp_dir, restart_step, cfg)
     if cfg.generation_backend == "vllm":
         from runtime.host_memory import validate_memory_handoff_runtime
         runtime = validate_memory_handoff_runtime(__file__)
@@ -3390,7 +3480,10 @@ def _main(trainer_startup):
     print(f"Search selection:   {selection.upper()} ({selection_detail})")
     configured_advantage_mode = getattr(cfg, "advantage_mode", "entropic")
     hybrid_mode = configured_advantage_mode == "hybrid"
+    critic_mode = configured_advantage_mode == LLM_CRITIC_MODE
+    hybrid_loss = uses_hybrid_policy_loss(configured_advantage_mode)
     history_mode = _uses_reward_history(configured_advantage_mode)
+    replayable_update = _uses_replayable_policy_update(configured_advantage_mode)
     print(f"Groups per step:    {cfg.groups_per_step}")
     print(f"Group size:         {cfg.group_size}")
     print(f"Total rollouts/step: {cfg.groups_per_step * cfg.group_size}")
@@ -3400,6 +3493,8 @@ def _main(trainer_startup):
     else:
         print(f"KL coef:            {cfg.kl_penalty_coef}")
     print(f"Advantage mode:     {getattr(cfg, 'advantage_mode', 'entropic')}")
+    if hybrid_loss:
+        print("Policy loss:        TTT token-summed importance sampling")
     if history_mode:
         print(f"SPO-RS beta:        fixed {cfg.spo_rs_beta}")
         print(f"SPO-RS D_half:      {cfg.spo_rs_d_half}")
@@ -3407,7 +3502,6 @@ def _main(trainer_startup):
         if hybrid_mode:
             print(f"Hybrid TTT weight:  {cfg.hybrid_ttt_weight:g}")
             print(f"Hybrid SPO-RS weight: {cfg.hybrid_spo_weight:g}")
-            print("Policy loss:        TTT token-summed importance sampling")
         else:
             print(f"SPO-RS clip eps low/high: "
                   f"{cfg.spo_rs_clip_epsilon_low} / "
@@ -3489,7 +3583,7 @@ def _main(trainer_startup):
     interrupted_spo_rs_artifacts = None
     start_step = 0
     current_policy_adapter_path = None
-    recover_spo_rs = history_mode and not ((is_trimul or hybrid_mode) and cfg.no_train)
+    recover_update = critic_mode or (history_mode and not ((is_trimul or hybrid_mode) and cfg.no_train))
     if resume_dir:
         resume_payload = _load_training_checkpoint(exp_dir, mmap=True)
         if resume_payload is not None:
@@ -3500,8 +3594,11 @@ def _main(trainer_startup):
             print(f"[resume] training checkpoint found; next step is {start_step}")
             if resume_payload["version"] == 1:
                 print('[resume] legacy batch-growth state ignored; using fixed configured batch sizes')
-            if recover_spo_rs:
+            if recover_update:
                 interrupted_spo_rs_artifacts = (_recoverable_spo_rs_artifacts(exp_dir, start_step, cfg))
+                if (critic_mode and interrupted_spo_rs_artifacts is None
+                        and critic_step.load_batch(exp_dir, start_step) is not None):
+                    raise RuntimeError(f"cannot restore rollouts for the saved critic batch at step {start_step}")
                 if interrupted_spo_rs_artifacts is not None:
                     token_recovery = (
                         _prepare_recoverable_response_tokens(model, tokenizer, interrupted_spo_rs_artifacts))
@@ -3519,7 +3616,7 @@ def _main(trainer_startup):
                         flush=True,
                     )
         else:
-            if recover_spo_rs:
+            if recover_update:
                 interrupted_spo_rs_artifacts = (_recoverable_spo_rs_artifacts(exp_dir, 0, cfg))
             initial_adapter = Path(exp_dir) / "adapter_initial"
             recreated_initial_adapter = False
@@ -3684,7 +3781,7 @@ def _main(trainer_startup):
                   f"N_eff={initialization['effective_count_after']:.2f}; "
                   "step 0 policy update enabled", flush=True)
 
-    if (is_trimul or hybrid_mode) and resume_payload is None:
+    if (is_trimul or hybrid_loss) and resume_payload is None:
         if current_policy_adapter_path is None:
             current_policy_adapter_path = Path(_save_adapter(
                 model, exp_dir, start_step, directory_name="adapter_initial",
@@ -4039,7 +4136,7 @@ def _main(trainer_startup):
                 f"[step {step}] batch: G={cfg.groups_per_step} K={cfg.group_size} "
                 f"({cfg.groups_per_step * cfg.group_size} coder rollouts)", flush=True)
 
-            if resume_dir and step == start_step and recover_spo_rs:
+            if resume_dir and step == start_step and recover_update:
                 pending_spo_rs_artifacts = None
                 if interrupted_spo_rs_artifacts is None:
                     interrupted_spo_rs_artifacts = (_recoverable_spo_rs_artifacts(exp_dir, step, step_cfg))
@@ -4050,7 +4147,7 @@ def _main(trainer_startup):
                 interrupted_spo_rs_artifacts = None
                 pending_spo_rs_artifacts = None
 
-            finalize_pending_spo_rs = pending_spo_rs_artifacts is not None and not (is_trimul or hybrid_mode)
+            finalize_pending_spo_rs = pending_spo_rs_artifacts is not None and not (is_trimul or hybrid_loss)
             if interrupted_spo_rs_artifacts is not None:
                 stats = _resume_spo_rs_step_from_artifacts(
                     model, tokenizer, sampler, step,
@@ -4085,9 +4182,10 @@ def _main(trainer_startup):
                     spo_rs_tracker=spo_rs_tracker,
                     sampling_adapter_path=(
                         current_policy_adapter_path
-                        if history_mode else None),
+                        if replayable_update else None),
                     evaluation_complete=step_plotter.submit,
-                    pending_artifacts=pending_spo_rs_artifacts)
+                    pending_artifacts=pending_spo_rs_artifacts,
+                    park_trainer=_offload_trainer_for_generation if critic_mode else None)
 
             stats = stats or {}
             step_training_seconds = float(stats.get("training_seconds", 0.0) or 0.0)
@@ -4107,6 +4205,8 @@ def _main(trainer_startup):
                     adapter_path = _save_adapter(model, exp_dir, step)
                 else:
                     adapter_path = (Path(exp_dir) / stats["spo_rs_sampling_adapter"])
+            elif critic_mode and not stats.get("critic_policy_updated", False):
+                adapter_path = current_policy_adapter_path
             else:
                 adapter_path = _save_adapter(model, exp_dir, step)
             checkpoint_path = _save_training_checkpoint(
@@ -4128,7 +4228,7 @@ def _main(trainer_startup):
             if is_trimul:
                 batch_path = trimul_evaluation.batch_path(exp_dir, step)
                 batch_path.unlink(missing_ok=True)
-            if is_trimul or hybrid_mode:
+            if is_trimul or hybrid_loss:
                 for sidecar in (Path(exp_dir) / f"step{step:02d}").glob("*.reference_logprobs.zlib"):
                     sidecar.unlink(missing_ok=True)
             append_step_result(exp_dir, step, step_summary)
@@ -4188,11 +4288,11 @@ def _main(trainer_startup):
         evaluation_handoff = handoff.path
         print(f"[step {active_step}] saved TriMul candidates; shutting down all model processes", flush=True)
     except ExactLongContextTrainingOOM as error:
-        if active_step is None or not history_mode:
+        if active_step is None or not replayable_update:
             raise
         if _recoverable_spo_rs_artifacts(exp_dir, active_step, cfg) is None:
             raise RuntimeError(
-                "exact overflow recovery requires the complete saved SPO-RS rollout and evaluation batch"
+                "exact overflow recovery requires the complete saved rollout and evaluation batch"
             ) from error
         marker = _write_exact_sharded_recovery(exp_dir, active_step, error)
         recovery = _read_exact_sharded_recovery(exp_dir) or {}
@@ -4203,7 +4303,7 @@ def _main(trainer_startup):
         )
         if recovery.get("replica_offload_exhausted", False) or retrying_same_step:
             raise RuntimeError(
-                f"Exact SPO-RS recovery exhausted the process trainer. "
+                f"Exact {configured_advantage_mode} recovery exhausted the process trainer. "
                 f"The unfinished step is saved in {exp_dir}."
             ) from error
         restart_for_exact_recovery = True
