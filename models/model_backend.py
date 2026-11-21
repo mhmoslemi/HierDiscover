@@ -850,8 +850,9 @@ class UnslothBackend(_ModelPlacementBackend):
             preserve_mxfp4_allocation_errors()
 
         device_map = _training_device_map(self.cfg)
-        print(f"[backend=unsloth] loading {training_name} across "
-              f"{int(getattr(self.cfg, 'num_training_gpus', 1))} GPU(s) ...")
+        log_loading = setting_log_only if getattr(self.cfg, "_startup_step", 0) > 0 else print
+        log_loading(f"[backend=unsloth] loading {training_name} across "
+                    f"{int(getattr(self.cfg, 'num_training_gpus', 1))} GPU(s) ...")
         local_files_only = _local_model_files_only(training_name)
         model, tokenizer = retry_host_allocation(lambda: FastLanguageModel.from_pretrained(
             model_name=training_name,

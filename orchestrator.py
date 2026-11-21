@@ -1669,7 +1669,7 @@ def _resume_spo_rs_step_from_artifacts(
     previous_best_raw = sampler.best_raw_state(maximize=bool(problem.maximize))
     previous_best_value = float(previous_best_raw.raw_score) if previous_best_raw is not None else None
     archive_stats = sampler.update(all_children)
-    print(
+    setting_log_only(
         f"[resume] step {step_idx}: reusing {len(artifacts)} saved rollout "
         "evaluations; generation and evaluation are skipped",
         flush=True,
@@ -1689,7 +1689,7 @@ def _resume_spo_rs_step_from_artifacts(
             "canonical token(s) exceeded recorded counts",
             flush=True,
         )
-    print(
+    setting_log_only(
         f"[resume] step {step_idx}: restored {archive_stats['submitted']} "
         f"valid children and the exact saved {cfg.advantage_mode} advantages; resuming at "
         "adapter training",
@@ -1997,8 +1997,8 @@ def _print_group_rollout_stats(group, rewards, valids, response_tokens, beta=Non
     print(f"  group {group}: rewards min={min(rewards):.9f} "
           f"mean={np.mean(rewards):.9f} max={max(rewards):.9f}  "
           f"valid={sum(valids)}/{len(valids)}{beta_label}  "
-          f"response tokens min={min(response_tokens)} "
-          f"mean={np.mean(response_tokens):.1f} max={max(response_tokens)}")
+          f"response tokens min={min(response_tokens) / 1000:.1f}k "
+          f"mean={np.mean(response_tokens) / 1000:.1f}k max={max(response_tokens) / 1000:.1f}k")
 
 
 def _print_rollout_totals(step, valid, total, training_examples, children, elapsed, *, overlapped=False):
@@ -3591,6 +3591,7 @@ def _main(trainer_startup):
         print_dashboard(startup_log.fields, exp_dir, resuming=bool(resume_dir))
 
     # ---- backend + model ----
+    cfg._startup_step = restart_step
     parallel_trainer = None
     if not cfg.no_train:
         parallel_trainer = ProcessDistributedTrainer(
@@ -4322,7 +4323,7 @@ def _main(trainer_startup):
                 delattr(cfg, "_exact_replica_recovery_step")
     except trimul_evaluation.EvaluationHandoff as handoff:
         evaluation_handoff = handoff.path
-        print(f"[step {active_step}] saved TriMul candidates; shutting down all model processes", flush=True)
+        setting_log_only(f"[step {active_step}] saved TriMul candidates; shutting down all model processes", flush=True)
     except ExactLongContextTrainingOOM as error:
         if active_step is None or not replayable_update:
             raise
@@ -4354,7 +4355,7 @@ def _main(trainer_startup):
         # the training loop exits with an exception or interruption.
         step_plotter.close(wait=sys.exc_info()[0] is None)
         if gen_pool is not None:
-            print("[shutdown] stopping generation pool ...")
+            setting_log_only("[shutdown] stopping generation pool ...")
             gen_pool.shutdown()
         if parallel_trainer is not None:
             print("[shutdown] stopping process-distributed trainer ...")

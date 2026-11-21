@@ -10,6 +10,12 @@ import sys
 import tempfile
 import time
 
+# The shell launchers also run this module as a script.
+if not __package__:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from diagnostics.console import bind_setting_log, setting_log_only
+
 
 def request_restart(reason):
     path = os.environ.get("TTT_SUPERVISOR_RESTART_FILE")
@@ -108,7 +114,8 @@ def supervise(command, *, initial_delay=2.0, maximum_delay=60.0):
                         raise RuntimeError("requested evaluation is outside the current run")
                     evaluation_environment = dict(environment, CUDA_VISIBLE_DEVICES="")
                     evaluation_environment.setdefault("CUDA_DEVICE_ORDER", "PCI_BUS_ID")
-                    print("[supervisor] trainer exited; starting isolated TriMul evaluation", flush=True)
+                    bind_setting_log(run_dir / "setting.log")
+                    setting_log_only("[supervisor] trainer exited; starting isolated TriMul evaluation", flush=True)
                     child = subprocess.Popen(
                         [command[0], "-m", "runtime.trimul_evaluation", str(batch_path)],
                         env=evaluation_environment,
@@ -117,7 +124,7 @@ def supervise(command, *, initial_delay=2.0, maximum_delay=60.0):
                     returncode = child.wait()
                     if stopping or returncode:
                         return returncode or 128 + signal.SIGINT
-                    print("[supervisor] evaluation finished; restoring the trainer", flush=True)
+                    setting_log_only("[supervisor] evaluation finished; restoring the trainer", flush=True)
                     active_command = _resume_command(command, run_dir)
                     delay = float(initial_delay)
                     continue

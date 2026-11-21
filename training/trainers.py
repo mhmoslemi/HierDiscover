@@ -1350,9 +1350,10 @@ class ProcessDistributedTrainer:
                               f"{required / GIB:.1f} GiB of host RAM required for concurrent startup",
                               flush=True)
                     else:
-                        print(f"[{self._process_label}] loading {self._world_size} trainer replicas "
-                              f"concurrently with {reserved / GIB:.1f} GiB of host RAM reserved",
-                              flush=True)
+                        log_loading = setting_log_only if getattr(self.cfg, "_startup_step", 0) > 0 else print
+                        log_loading(f"[{self._process_label}] loading {self._world_size} trainer replicas "
+                                    f"concurrently with {reserved / GIB:.1f} GiB of host RAM reserved",
+                                    flush=True)
                         for rank in range(1, self._world_size):
                             self._start_replica(rank)
                 yield
@@ -1623,10 +1624,9 @@ class ProcessDistributedTrainer:
         reference_label = (
             f"{sum(_valid_example_token_logprobs(ex, 'reference_logprobs') for ex in queued_examples)}/{len(examples)}"
             if uses_hybrid_policy_loss(cfg.advantage_mode) and cfg.kl_penalty_coef else "off")
-        print(f"[step {step_idx}] {cfg.advantage_mode} logprobs: "
-              "vLLM supplied old="
-              f"{supplied_old}/{len(examples)}, reference={reference_label}",
-              flush=True)
+        setting_log_only(f"[step {step_idx}] {cfg.advantage_mode} logprobs: "
+                         f"vLLM supplied old={supplied_old}/{len(examples)}, reference={reference_label}",
+                         flush=True)
         update_memory_fraction = historical_training_memory_fraction(
             self.model, cfg, self._memory_fraction)
         high_memory_update = update_memory_fraction > self._memory_fraction
@@ -2502,10 +2502,9 @@ class ProcessDistributedTrainer:
         supplied_reference = sum(
             _valid_example_token_logprobs(example, "reference_logprobs")
             for example in queued_examples)
-        print(f"[step {step_idx}] {cfg.advantage_mode} logprobs: "
-              f"vLLM supplied old={supplied_old}/{total_examples}, "
-              f"reference={supplied_reference}/{total_examples}",
-              flush=True)
+        setting_log_only(f"[step {step_idx}] {cfg.advantage_mode} logprobs: "
+                         f"vLLM supplied old={supplied_old}/{total_examples}, "
+                         f"reference={supplied_reference}/{total_examples}", flush=True)
         setting_log_only(f"[{process_label}] one process/GPU with adaptive batching; "
                          f"memory ceiling={self._memory_percentage:g}%; "
                          "exact singleton rescue=96%->98%->99%; "

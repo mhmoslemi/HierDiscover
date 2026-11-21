@@ -161,10 +161,12 @@ def evaluate_batch(path):
 
 
 if __name__ == "__main__":
-    from diagnostics.console import _install_console_timestamps, _install_terminal_log
+    from diagnostics.console import _install_console_timestamps, _install_terminal_log, bind_setting_log
 
     _install_console_timestamps()
     log = _install_terminal_log()
-    run_dir = Path(os.environ["TTT_SUPERVISOR_RUN_FILE"]).read_text(encoding="utf-8").strip()
-    log.bind(Path(run_dir) / "temirnal.log")
+    run_file = Path(os.environ["TTT_SUPERVISOR_RUN_FILE"])
+    run_dir = Path(run_file.read_text(encoding="utf-8").strip())
+    log.bind(run_dir / "temirnal.log")
+    bind_setting_log(run_dir / "setting.log")
     evaluate_batch(sys.argv[1])

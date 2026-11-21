@@ -8,6 +8,7 @@ from pathlib import Path
 import subprocess
 import sys
 
+from diagnostics.console import setting_log_only
 from experiment_io import _atomic_write_text
 
 
@@ -157,8 +158,8 @@ def score_batch(root, step, cfg, host_admission=None):
         staging_bytes += int(CRITIC_WORKERS * _estimated_weight_gib(model, "auto") * GIB)
     reservation = host_admission.reservation(
         staging_bytes, stage="parallel critic loading", priority=True, wait_for_external=False)
-    print(f"[step {step}] critic: {CRITIC_WORKERS} workers on GPUs {gpu_ids}, "
-          f"{CRITIC_RESPONSES} replies per batch. Log: {log_path}", flush=True)
+    setting_log_only(f"[step {step}] critic: {CRITIC_WORKERS} workers on GPUs {gpu_ids}, "
+                     f"{CRITIC_RESPONSES} replies per batch. Log: {log_path}", flush=True)
     with reservation, log_path.open("a", encoding="utf-8", buffering=1) as log:
         log.write(f"\n=== critic step {step}, GPUs {gpu_ids}, {model} ===\n")
         worker = subprocess.Popen(
