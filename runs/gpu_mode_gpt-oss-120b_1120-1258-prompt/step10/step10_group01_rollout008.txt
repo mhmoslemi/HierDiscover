@@ -1,0 +1,694 @@
+analysisWe have an instruction to implement a "highly optimized" Triton kernel for TriMul outgoing operator. The user provided an initial skeleton code implementing the full forward pass using three Triton kernels: layernorm_kernel (first LN), split_fuse_gate_kernel (splitting fused projection, applying mask and sigmoid gating), layernorm_mul_kernel (second LN+gate multiplication). In the current runtime, they can achieve ~2050 microseconds. The target is 1000 us, so we need to improve speed.
+
+We need to propose improvements over existing code. Perhaps we can further fuse operations, reduce overhead of separate kernels, and avoid storing intermediate large tensors. For H100, we might want to exploit TensorCores and avoid unnecessary memory traffic between kernels. The primary cost is likely the O(N^3) operation of tri-multiplicative update, which is done via batched GEMM: left_mat (B*H, N, N) and right_mat (B*H, N, N). That's O(B*H*N^2). This is still O(N^2 * H) but they performed a bmm for each batch per hidden dimension. However TriMul's einsum requires sum over k dimension: left[i,k,:] * right[j,k,:] (i and j from (i, j) indices). The existing implementation uses bmm = left @ right^T which yields (B*H, N, N). Wait left_mat shape (B*H, N, N). But they treat left and right as (B, H, N, N). In original code, left and right are [B, N, N, hidden_dim] after projection gating. Then einsum('... i k d, ... j k d -> ... i j d') meaning for each batch and hidden dimension d, sum over k: left[i, k, d] * right[j, k, d]. That yields shape [B, N, N, hidden_dim]. Implementation using batched matrix multiplication: Since left is [B, N, N, H] -> view as [B, H, N, N] (permute). Then left_mat = left.view(B*H, N, N). Similarly for right. Then compute out = left_mat @ right_mat.transpose(1,2) (so for each hidden dimension, compute left[i,k] @ right[j,k].) That's O(B*H*N^2). For N up to 1024, H=128, B=1 -> size of left_mat: (128, 1024, 1024). That's ~128*1024^2 ~ 134 million elements (0.5 Gi of fp16). Mmm. Doing bmm with shape (128, 1024, 1024) requires about 2*128*1024^3 ~ 2.7e11 FLOPs (approx 270 GFLOPs). That's heavy but should be okay on H100 maybe 0.3 sec. However they want runtime 1ms for typical shape like N=256? Let's see.
+
+But maybe we can fuse the bmm with second LN if memory limited? However optimizing runtime may focus on reducing pure kernel overhead.
+
+The current code includes three kernels each with loops over dim: first LN and second LN each compute mean & variance per row (need two passes). That may be okay. The main heavy part is the batched GEMM (torch.bmm) using cuBLAS. Could we replace with triton kernel to compute the tri-multiplicative update more efficiently using shared memory tiling? Possibly use fused approach where we compute out for each (i,j,d) incrementally, maybe using block-level partial sums to reduce memory usage. But bmm is already optimized.
+
+Better improvements might involve:
+- Fuse first LN + linear projection into a single kernel, to avoid storing full x_norm. We can compute x_norm * weight_fused within a kernel that also does the linear (GEMM). But a matrix multiplication fused with LN may be tricky because weight multiplication requires reduction across rows, but we can treat each output element of projection as dot product of x_norm row (dim) with weight column; we could compute using tiling and use weight reuse. However that would essentially implement a fully fused GEMM (which might be slower than cuBLAS). However using triton with FP16 and TensorCores is possible: use `tl.dot` for small block sizes. However we have to handle many rows (R up to 1M). CuBLAS is heavily optimized; Triton may match but with overhead of multiple kernels and multiple passes may degrade.
+
+Maybe we can reduce memory movement: The first LN writes x_norm FP16. Then we feed into fused projection (matrix multiplication). That's memory heavy: store x_norm then multiply. We could compute projection directly on FP32 input with weight and apply LN and gating in kernel: compute for each row, we have d dimension and weight matrix for 5*H. This is essentially a GEMM of shape (R,dim) * (5*H,dim)^T producing (R, 5*H). This can be done by calling torch.nn.functional.linear which uses cuBLAS. It would be more efficient to just call linear and after that apply LN. But LN is done before projection per original code. Wait original PyTorch: 
+```
+x = self.norm(x)
+left = self.left_proj(x)
+right = self.right_proj(x)
+...
+```
+The LN is separate before projection onto left/right stuff. For memory we could compute LN on x and then linear using fused weight. But we can also compute linear directly on original x, and then after the linear apply LN to each output? That changes semantics because LN is applied on x prior to computing left, right, and gates. However we could incorporate the LN parameters into the linear weights (by scaling the weight vectors with weight_norm gamma). Let's examine: LN: x_norm = (x - mu)*rstd * gamma + beta (gamma and beta are per dim). Then left_proj = weight_left @ x_norm.T? Actually left_proj weight shape [hidden_dim, dim]. In linear: left = x_norm @ weight_left.T + bias (bias=False). So left = ( (x - mu) * rstd * gamma + beta ) @ W^T = X @ (diag(gamma)*W^T) + ( ( -mu * rstd * gamma + beta) @ W^T). This introduces per-row biases based on mu and var. Since mu and var depend on each row individually, cannot fuse easily into weight; but we could incorporate gamma scaling into weight and apply bias, but we still need mu and var per row. So not easy.
+
+But maybe we can compute LN and projection together in a single kernel: compute for each row i:
+- compute mean, var of x[i,:]
+- compute normalized x_norm[i,:] = (x[i,:] - mu) * rstd
+- then compute yz = x_norm[i,:] * gamma + beta
+- input yz to a fused GEMM computing five outputs: yz @ w_left.T etc. This can be done using XNOR: compute dot products for each hidden dimension. But that leads to 5*H dot products per row: each dot product of length dim with each column of weight (weight shape 5*H x dim). This is basically a GEMM with weight matrix but after applying scaling (gamma) and addition (beta) to each column of x? Actually gamma and beta are per-dim scaling after normalization: normalized -> normalized * gamma + beta. We can incorporate gamma and beta into input? Means we could scale each element of x before dot product with weight: x_norm[i,:] = (x[i,:] - mu) * rstd * gamma + beta. That's two multiplications plus add, then dot with weight. There is still need for mean and var, which we compute per row anyway.
+
+Hence we can fuse computing LN with the GEMM: produce a tile of rows * dim loading and compute per row partial sums for mean/var, culminating in computed row normalized values, then multiply-add with weight. This would reduce memory writes: avoid storing x_norm.
+
+Potential improvements:
+
+- Use one kernel for LN + fused linear projection to generate left,right,left_gate,right_gate,out_gate directly. That eliminates need to store x_norm and intermediate proj. However we might still need mask and gating (sigmoid). We can also apply mask and sigmoid in the same kernel; actually split_fuse_gate does that: it loads fused projection and then applies mask, sigmoid gating, and product left/right. But we propose to merge LN and fused projection, incorporate mask and sigmoid gating all within a single kernel. Then we can avoid the second storage of proj and also reduce a kernel launch and memory injection.
+
+But perhaps the overhead of extra kernel launches is not huge. The main cost might be the bmm.
+
+But we could further reduce the memory for out_gate: after second LN we multiply by out_gate and then final linear. Since out_gate is [R, H] we need to multiply with out after layernorm. We could fuse second Ln and gate multiplication and final linear into a kernel that does matrix multiplication with final weight.
+
+But the heavy cost likely from bmm: performing O(B*H) bmm each of size (N,N). Could we restructure to compute out using a kernel that loads left and right tiles, computes outer product across k dimension and accumulate? That would be O(N^3) but with GPU tiling it might speed up due to using less memory to store out? However bmm uses cuBLAS's highly optimized gemm with tensor cores; but we need to compute many independent GEMMs (B*H). The total size of all gems is B*H*N^2; that's a large GEMM of shape (B*H*N, N) multiplied by (B*H*N) transpose? Wait we are using bmm replicating each hidden dimension's matrix multiply. Equivalent to using a big batched gemm. It's already optimized.
+
+Possible improvements:
+- Use torch.einsum with `torch.einsum('...ikd, ...jkd -> ...ijd')` using Torch's optimized kernel (maybe fused?), but similar.
+
+- Magic: Use torch.bmm where we compute left @ right per hidden dimension using fused kernel across hidden dim dimension. Actually we are already doing that.
+
+- Use half precision for bmm.
+
+Potential memory overhead: left/right after gating are fp16. Good.
+
+Potential optimization: reduce permutations or view overhead; but these are cheap.
+
+Potential improvement: Use torch.linalg.multi_dot? irrelevant.
+
+But main runtime is 2 ms for N=256, B=2, dim 128, H=128. That's not huge. Perhaps many overhead from kernel launches, not actual compute. For N=256, H=128, B=2, out matrix size (B*H, N, N) = 256*256*256? Actually B*H=256, N=256 => each mat multiply is 256x256 => 256^3=16.7M multiplies per sample (per hidden dim). So total flops: B*H*N^3 = 2*128*256^3 = 2*128*16,777,216 = 4,294,967,296 = 4.29 GFLOPs (rough), maybe 8 GFLOPs double? Actually each multiply-add counts as 2 flops => ~8.6 GFLOPs. That's small. So compute time should be low.
+
+Hence runtime may be dominated by memory and kernel overhead. 2ms is high for small sizes.
+
+Goal ~1ms. We can probably achieve by reducing kernel count and improving data layout to avoid transposes. For N=256 case, we could compute left and right as shape [B, hidden_dim, N, N] already, then compute out = torch.einsum('bhik, bhjk -> bhij') using torch.einsum maybe uses optimized kernel for each batch (maybe uses reshape then bmm). Equivalent to torch.einsum resulting in same compute.
+
+ maybe we can avoid the transpose of right_mat = right_mat.transpose(1,2). It's just a contiguous memory arrangement? Actually right_mat is shape (B*H, N,N). Transpose changes stride. We could treat right as original left shape maybe compute left @ right triggers proper memory order.
+
+But the bigger improvement could be to fuse second LN + out gate multiplication + final linear projection all in single kernel. That reduces memory movement and also maybe reduces runtime.
+
+But we might still need to compute the final projection to dim using a linear layer. Already we have a second linear using F.linear to convert out_fused shape (R,H) to (R,dim). This is also a matrix multiplication across hidden_dim->dim using cuBLAS. That's fine.
+
+Simultaneously gating: we have out_gate, we apply gating by multiply after LN. Then final linear.
+
+Potential to combine second LN + gate multiplication + final linear by computing final linear on normalized out (before gating) then apply gating? Actually gating must be after LN, pre final linear. But we could compute final linear after gating, but gating multiplies per element with out_gate of shape (R,H). After final linear (weight_out shape (dim, H)), the gating effect would be different.
+
+But maybe we can combine into a fused matmul with elementwise multiply 'output = Linear(LN(out) * out_gate)'? That's not valid because out_gate multiplies per hidden dimension before linear. Next linear weight multiplies across hidden dimension, so gating is effectively scaling each column of out before applying weight matrix. Could incorporate gating into the weight matrix: new weight' = weight_out * out_gate[:, None]? Actually gating is per row hidden dimension element; it's like out_gate[i,h] * out[i,h]. final = sum_h weight_out[d,h] * (out_gate[i,h] * out[i,h]) = sum_h (weight_out[d,h] * out_gate[i,h]) * out[i,h]. So you can compute per-row elementwise scaling of the weight matrix: weight_scaled[i, d, h] = weight_out[d,h] * out_gate[i,h]. That's per-row scaling of weight, cannot be fused easily into a single GEMM without per-row scaling applied to weight.
+
+But you can restructure using batched GEMM: out_fused (R, H) multiplied by weight_out^T (dim x H) after gating: final = (out_fused * out_gate) @ weight_out.T? Wait out_fused already includes gated normalized output; out_fused = layernorm(out) * out_gate. Then final = out_fused @ weight_out.T. So we can fuse gating into out_fused earlier; but still needs a matrix multiply.
+
+Thus we still have a linear at the end.
+
+Maybe we can get rid of separate out_fused buffer (R,H) and directly compute final output via a kernel that performs layernorm, gate multiplication, and output linear in one go, by reusing weight_out. That would be a fused kernel performing per-row calculations: compute layernorm on out (R, H) and then output final = (norm_out * gate) @ weight_out.T. This can be implemented using a batched GEMM per row; but each row is length H, and there are many rows (R up to B*N*N). That's like a big GEMM of shape (R, dim) = (R, dim) where each row is scaled by normalized out * gate, then multiplied by weight_out^T (dim x H). It's essentially a matrix multiplication of R x H (after scaling) by H x dim weight_out.T; that's just a big GEMM. So we can fuse LN, gate, and final projection and compute final = (ln(out) * out_gate) @ weight_out.T (with weight_out (dim, H)). This eliminates storing out_fused and separate linear.
+
+Similarly, first LN + projection can be fused: first compute LN on x and then compute the fused projection (5H). That's a GEMM of shape R x 5H. So we can fuse LN + GEMM directly: compute per row normalized input, then dot with weight_fused matrix. That would produce proj directly without storing x_norm. This reduces memory writes and a kernel launch. So we can reduce total kernel launches from three to maybe two (or one). However we also have gating and mask integrated.
+
+How to implement fused LN + GEMM in Triton? We need to compute per row mean and variance across dim, then compute dot product with weight columns (5H columns). That can be done in a kernel that loads a tile of rows and dims, computes sum for mean/var per row, simultaneously compute partial dot products with weight. The final result would be stored as fp16. After that we can apply mask (if present) and sigmoid gating and get left/right/out_gate in same kernel. So combine layernorm and split_fuse_gate into one kernel. Then after bmm, we need second LN + gating + final projection fused into another kernel.
+
+Alternatively, we could compute second LN + gating + final linear in similarly fused kernel after bmm, so we only have 2 kernels besides bmm.
+
+One more optimization: The bmm also can be done using cuBLAS for the fused final linear: as described, after layernorm and gating we could compute a batched matmul between left and right per hidden dim and then final linear with weight_out in a single batched GEMM: Actually weight_out is (dim, H); but we have output shape (B, N, N, dim). Already we produce out shape (B, N, N, H) after bmm; we could feed through weight_out now. The out after LN and gating is needed before final linear. Suppose we perform LN and gating (elementwise) on out, then a linear (out_fused @ weight_out.T). So we could fuse using a GEMM with out as left matrix and weight_out.T as right matrix; but we need to apply LN and gating before multiplication. Could we compute LN and gating within a fused kernel that also multiplies each row of out (size H) with weight_out.T in a batched manner? We can treat it as a GEMM with input matrix X = (LN(out) * out_gate) shape (R, H) and weight matrix W = weight_out.T shape (H, dim). That's just a standard GEMM (R x H) @ (H x dim). That's a huge GEMM, but R can be large (B * N * N). For N=1024, B=1, R=1*1024*1024=1,048,576; H=128, dim maybe 384. So matrix multiply of size 1M x 128 with 128 x 384 yields 1M*128*384 ~ 49B FLOPs; that's huge. That's too large! Wait earlier we did two GEMMs: (R, 5H) projection (R ~ N^2~1M, H=128 => 5H=640 columns) is heavy matrix multiply (R * dim * 5H?). dim also maybe 128. Actually the fused projection is (R, dim) x (5*H, dim)^T => (R, 5H). That's also huge (R*dim*5H). For N=1024, R=1M, dim=128, H=128 => 1M*128*640 ~ 82B FLOPs... That's insane. So it's not feasible to compute all those GEMMs directly with regular cuBLAS for such large N. However actual TriMul uses heavy computation; maybe they rely on low hidden_dim relative to dim? Actually hidden_dim is 128; it's still large.
+
+But the given test cases include N=1024 but hidden_dim=128 and dim=128 or 384. This would be heavy. But perhaps they don't run >1 ms; they maybe use GPU. N=1024 yields R=1,048,576; projection R*dim*5H =1M*128*640 = 81.9 B FLOPs; that seems beyond what can be done within 1 second. However maybe the test only checks correctness, not speed, for large N; the runtime target (1000 us) maybe aimed at mid sizes like 256/512. Hard to guarantee. However we need to implement code that can handle large N but may be memory bound.
+
+Nevertheless, original code used F.linear and first LN, which will compute these huge GEMMs using cuBLAS. That's likely to be too slow. But they have runtime for 1024 tasks maybe moderate? They gave runtime of 2050 us for some config. But which config yields that runtime? Not clear. Perhaps they measured runtime for N=256 or 512. Might be for all test shapes.
+
+Given all test shapes, we need to support heavy compute but runtime target ~1ms across all. Could be unrealistic for 1024 case; perhaps they evaluate runtime only for moderate sizes? Maybe they just want to reduce kernel overhead not compute complexity. The heavy compute may be the bmm step and the fused projection, which dominate.
+
+Minimizing overhead of kernel launches and memory operations could cut runtime roughly in half.
+
+Another possible speed boost: use torch.nn.functional.layer_norm (which uses one pass) maybe more efficient than custom Triton, but they already used Triton for LN because per-row operations are needed. However PyTorch's layernorm can be applied in batch with vectorized ops: it's highly optimized. Could replace custom kernels with torch.nn.functional.layer_norm which works on last dimension and uses GPU kernels (likely using cudnn). That might be faster. Also we don't need custom LN if we use built-in function.
+
+In the code, they performed custom rowwise LN on flattened shape [R, dim] with an epsilon etc. But we could just do x = torch.nn.functional.layer_norm(x, normalized_shape=[dim], weight=norm_weight, bias=norm_bias, eps=eps). That's likely efficient. That's a single call. Then we can combine mask and gating after projection. However the current custom LN may be slower. Using built-in LN reduces time.
+
+Similarly, the second LN can be done with torch.nn.functional.layer_norm applied to out (shape [..., hidden_dim]) with weight to_out_norm.weight and bias. That's also efficient.
+
+Thus we could entirely drop the Triton LN kernels and just use torch.nn.functional.layer_norm which will use fused kernels (maybe similar to existing but likely performant). However the problem requires "you must implement at least part of the operations in a kernel." So we need at least one custom Triton kernel. We could keep split_fuse_gate_kernel as the only custom kernel, and use built-in LN.
+
+Alternatively, we could attempt to fuse mask & gating using Triton kernel, which is already present: split_fuse_gate_kernel. So we can retain that. Replace layernorm kernels with torch.nn.functional.layer_norm.
+
+But the prompt says "You are allowed to use mixed precision... You must use triton 3.3.1 and these kernels will be run on an H100." It doesn't strictly require multiple kernels. At least part must be in a kernel.
+
+So to improve performance, we could replace layernorm kernels with built-in LayerNorm and keep split_fuse_gate and maybe second layernorm fused with gate multiplication and final linear fused into a kernel: we could combine second LN + gating + final projection into a kernel. But maybe simpler to keep second layernorm as built-in torch.nn.functional.layer_norm and final linear using torch.nn.functional.linear. Then we would have only split_fuse_gate kernel (mask + gates). That reduces kernel launches and memory passes.
+
+Thus new algorithm:
+
+- Input: x (B,N,N,dim) fp32.
+- Perform first layernorm: torch.nn.functional.layer_norm(x, (dim,), weight=norm_weight, bias=norm_bias, eps=eps), converting to half (maybe half later). Could do as FP32 but fine.
+
+- (Optional) For performance, we can cast to float16 after LN (x_norm = x_norm.to(torch.float16))
+
+- Compute fused projection linear (x_norm half) using torch.nn.functional.linear with fused weight (5*H, dim). results -> proj (R, 5H) half.
+
+- Use split_fuse_gate kernel to compute left, right, out_gate from proj and mask. This kernel has per-row mask and sigmoid gating.
+
+- Compute left and right gating as above.
+
+- Compute batched GEMM left @ right^T using torch.bmm on shape B*H, N, N.
+
+- After bmm, we have out (B,N,N,H) half.
+
+- Perform second layernorm and apply out_gate in fused kernel: we could combine using a kernel that does layernorm, multiply by gate, then linear projection. But we can also do built-in layernorm for out (over H dimension), then multiply with out_gate, then final linear using torch.nn.functional.linear.
+
+But final linear will be shape (R, dim) with weight (dim, H). That's a GEMM of size (R x H) x (H x dim). That's huge but we need to do that anyway. Use torch.nn.functional.linear. Could also use torch.einsum maybe.
+
+Potential improvements: Store out_gate after layernorm as same shape and multiply before linear. All good.
+
+Thus final runtime dominated by two large GEMMs (fused projection and final projection) plus bmm which is also large. Could try to fuse final projection with earlier bmm? Example, combine out (B*H,N,N) produce final output (B,N,N,dim) directly: final = (LN(out) * out_gate) @ weight_out.T -> shape (B,N,N,dim) each (i,j) across H. That's a matrix multiplication per pair (i,j). This is exactly a batched GEMM: each (i,j) pair across H produce dim output. Representation: out (B,N,N,H) reshape to (B*N*N, H). Gate same shape (B*N*N, H). Apply LN (rowwise) & multiplication then matmul with weight_out.T (H, dim) => result (B*N*N, dim). This is a big GEMM of shape (R, H) * (H, dim). Equivalent to final linear after LN + gating.
+
+Thus we can skip the second LayerNorm and final linear - we can do them together: our final matmul acts as both LN+gate+linear? Wait LN still needed: we need apply LN to out before gate multiplication. So we need LN before scaling. Could do second LN with custom kernel to compute normalized out (R, H) -> out_norm. Then multiply by gate (R,H) (elementwise). Then final linear: we can fuse gate multiplication with final linear because it's just scaling each hidden dimension by gate per row before linear; we can incorporate gating into the matmul as per earlier discussion but that means weight_out per row scaling, not feasible.
+
+However we can treat LN+gate multiplication as we produce a matrix Q = out_norm * out_gate (R, H). Then final linear = Q @ weight_out.T (H, dim). That's a GEMM where each row is multiplied with weight. This can be performed with cuBLAS. So we need: second LN kernel produce out_norm (R,H) half; multiply with out_gate: out_norm * out_gate (elementwise). That could be fused with final linear using a kernel that does "y = (layernorm(x) * gate) @ weight", performing rowwise reduction while accumulating into G (dim). Could be done but requires complexity.
+
+Instead we can simply apply second LN with Triton (increase performance? maybe not needed). Use built-in layernorm for second step as also efficient.
+
+Thus maybe we reduce runtime to under 1ms for moderate sizes.
+
+But the original code's runtime is 2050 us, maybe due to custom LN kernels overhead: they each have loops over dim blocks; per row compute sum and sum sq across dim. Could be slower than torch.nn.functional.layer_norm which may be fused with vectorized reduction.
+
+Thus replace custom LN with torch.nn.functional.layer_norm.
+
+But we still need at least one kernel: split_fuse_gate kernel is present.
+
+But we can also improve split_fuse_gate kernel to remove unnecessary memory loads of mask if nomask = True: we can compile with HAS_MASK=0 to skip loading mask.
+
+The split_fuse_gate kernel also loads five sections of fused projection and applies sigmoid gating. Could we fuse sigmoids into more efficient approximations? Use tl.sigmoid? Not exist; they use exp. Good.
+
+But can we reduce memory traffic by writing left/right/out_gate into contiguous memory that can be used directly for bmm without extra permutations? Already left/right stored as shape (R, H) then view/permuted into shape (B, H, N, N). Good.
+
+Potential improvements for bmm: we can use torch.bmm with half precision; already is.
+
+Potential improvement for mask: The mask is applied before gating on left and right. In code, we multiply left_raw * mask_val * left_gate. Mask is per row value (R). Since mask shape originally [B,N,N] (maybe bool). Indeed mask is broadcast across hidden dim H. So we could incorporate mask in the split kernel directly as they do; fine.
+
+Thus main change: replace custom LN with torch.nn.functional.layer_norm.
+
+But we must still keep a Triton kernel for gating. That meets requirement.
+
+Let's analyze potential performance: For N=256 and dim=128, hidden_dim=128, total rows R = B * N * N = 2 * 256 * 256 = 131,072. First layernorm with torch.nn.functional.layer_norm on shape (B,N,N,dim) i.e., 2*256*256*128 = 16,777,216 elements. That's fine. Should be fast.
+
+Fused projection: (R, dim) * (5*H, dim)^T => (131,072, 640) about 84M output elements. Using torch.nn.functional.linear with half precision will be around 131k*128*640 = 10.7B FLOPs! That's heavy but done by cuBLAS. But maybe performance is okay.
+
+We can measure approximate runtime: 10.7 B ops at ~peta-flop GPU maybe < 10 ms? Not sure.
+
+But overall runtime target 1 ms is unrealistic for 10 B ops. Possibly they only evaluate runtime on shapes like N=256, H=128, dim=128, giving ~10 B ops. Hmm.
+
+Let's approximate: Single-precision FP16 performance: H100 can achieve ~62 TFLOPs FP16 (tensor cores). 10.7 B ops would take ~0.000172 seconds ~0.172 ms. So within 1ms. So plausible.
+
+Thus overall runtime likely dominated by kernel overhead and memory copies. Replacing custom LN reduces overhead.
+
+Potential other overhead: splitting projection into left/right etc uses a kernel reading proj (R, 5H) and storing three separate tensors left,right,out_gate (R,H). This creates another memory read/write. Could we compute left and right directly by separate GEMM from x_norm? But that's multiple GEMMs: left_proj, right_proj (two), left_gate, right_gate, out_gate (three). That's 5 separate GEMMs with weight dims (H,dim). That equals the same flops as fused linear, but would require separate loads of x_norm and weight and separate GEMM launches. That may increase overhead (5 calls). Fused linear reduces to one GEMM plus cheap gating.
+
+Thus split_fuse_gate kernel is needed to separate.
+
+Thus overall kernel launches: built-in layernorm (maybe implemented using C++ kernel but still fast). Then fused linear (one call). Then split_fuse_gate (one Triton kernel). Then bmm (one call). Then second layernorm (built-in). Then final linear (one call). So total of 5 heavy calls + 1 small kernel.
+
+Original code had extra two Triton kernels for LNs. So removal may reduce runtime.
+
+But we also added linear on half precision; they used it for projection.
+
+Now we must implement this optimized version.
+
+Also we need to compute final output as float32.
+
+Implementation details:
+
+- Acquire config values.
+- Input shape B,N,N,d.
+
+First LN: Using torch.nn.functional.layer_norm encountered with weight and bias per dim. Provide weight as 1D (dim) maybe from weight dict. The default F.layer_norm expects normalized_shape same shape as last dimension(s). So call torch.nn.functional.layer_norm(x, (dim,), weight=norm_weight, bias=norm_bias, eps=eps). This returns same dtype as x (float32). We'll cast to half for subsequent linear.
+
+Better to cast after LN to half: x_norm = ... .to(torch.float16).
+
+Second linear: Concatenate weight matrices as described. Note all linear weights are bias=False. weight_fused shape (5*H, dim) float16.
+
+Perform linear: proj = F.linear(x_norm, fused_weight) -> shape (B,N,N,5*H), but to simplify we flatten to (R,5H) as before.
+
+Now we need to optionally apply mask. The mask can be bool or float. mask type may be bool; we convert to half (or float16) as needed. In split_fuse_gate, we feed mask_ptr.
+
+Implementation: For no mask, set HAS_MASK=0 and provide dummy mask ptr.
+
+Define block sizes optimized: BLOCK_R = 128 or 256? Since we have potentially large rows (R up to 1M). Use BLOCK_R=128 and BLOCK_H=64 maybe to match hidden_dim (H) up to 384. Choose block_H=64 to cover 384 via two loops.
+
+But for hidden_dim up to 384, we need BLOCK_H dividing. Choose BLOCK_H = 32 for simplicity.
+
+Need to implement kernel similarly.
+
+After kernel, left,right,gates (all shape (R,H) half).
+
+Now compute batched GEMM: need left and right shaped as (B, N, N, H). Permute to (B, H, N, N). Use .contiguous() after permute for proper memory.
+
+Then left_mat = left.view(B*H, N, N); right_mat similar.
+
+Define out_mat = torch.bmm(left_mat, right_mat.transpose(1,2)). Expect shape (B*H, N, N).
+
+Now have out = out_mat.view(B, H, N, N). Permute back to (B,N,N,H). Might need contiguous.
+
+Now second LayerNorm: Use torch.nn.functional.layer_norm on out (shape [B,N,N,H]) with normalized_shape = (H,) and weight=to_out_norm_weight and bias=to_out_norm_bias. Then multiply elementwise with out_gate (shape (R,H)?) Actually out_gate shape (R,H) half. After viewing out to (R,H) we can multiply.
+
+Simplify: out_norm = torch.nn.functional.layer_norm(out, (H,), weight=to_out_norm_weight, bias=to_out_norm_bias, eps=eps). This returns same dtype as out (half). Need to cast to half.
+
+Now multiply by out_gate: need to broadcast. Out_gate shape (R,H). Need to reshape back to (B,N,N,H). So out_gate_reshape = out_gate.view(B,N,N,H). Multiply: out_norm = out_norm * out_gate_reshape
+
+Now final linear: out_flat = out_norm.view(R, H). Then final_half = F.linear(out_flat, to_out_weight) where to_out_weight shape (dim, H). Output shape (R, dim) half.
+
+Then final = final_half.view(B,N,N,dim). to float32.
+
+Potential small memory overhead.
+
+Now implement custom Kernel: we must import torch and triton. Provide the split_fuse_gate kernel as defined earlier.
+
+Potential improvement: split_fuse_gate can also apply mask after gating; already done.
+
+But we need to handle mask shape: mask (B,N,N) could be bool. Convert to half or float. Could do mask_float = mask.to(torch.float16) maybe after unsqueeze - but we just need one value per row. In kernel we need raw pointer to mask per row (scalar) type fp16.
+
+If mask is bool, to half will produce 0 or 1.
+
+Edge Cases: When mask is None? Based on input signature they provide mask tensor always? In reference they use mask variable, but maybe mask may be None? But config includes "nomask": bool specifying no mask. So maybe we can treat mask as None or pass placeholder; but provide bool.
+
+Implementation: if cfg.get("nomask", True): has_mask = 0 else: have mask.
+
+But we need to ensure mask_ptr is contiguous of shape R (flatten). Use mask = mask.to(torch.float16).reshape(R).
+
+Now grid calculations: Use triton.cdiv(R, BLOCK_R)
+
+Set num_warps maybe 4 by default.
+
+Now compile.
+
+Potential issues: The split_fuse_gate kernel expects proj_ptr shape [R, 5*H] contiguous. torch.nn.functional.linear returns [R, 5*H] row-major contiguous.
+
+Now memory accesses within kernel:
+
+Indices: base = offs_r[:, None] * (5 * H) + offs_h[None, :]; but this pointer math is correct only if we treat row-major layout?
+
+Data pointer offset: proj_ptr + base. Implementation uses ptr indexing accordingly.
+
+But need to ensure that base offset works: row * stride + col = row * (5*H) + col. In Triton pointer arithmetic: pointer address = base pointer + offset (scalar). Since row stride = (5*H). Here base is combination of row offset times stride. Offs_r is row index (0..BLOCK_R). Using offs_r[:, None] * (5*H) yields shape [BLOCK_R,1] multiplications. Offs_h is column offset.
+
+Thus correct.
+
+Now for mask: mask_val = tl.load(mask_ptr + offs_r, mask=mask_r, other=1.0). This loads per-row mask float16.
+
+Now left/right multiplication.
+
+Now store left/right/out_gate for each row.
+
+Potential unsafety: The query "mask = mask.unsqueeze(-1); left = left * mask;" but they want mask broadcast across hidden dim. Our kernel uses mask scalar * gate.
+
+Edge Cases: H may not be divisible by BLOCK_H. The kernel loops over h_off steps with mask_h.
+
+Works fine.
+
+Now second LN: Use torch.nn.functional.layer_norm. However we also need to produce out_gate * gating. Already done: out_norm = out_norm * out_gate. This order matters: gate is applied after LN, not before. In original code: out = self.to_out_norm(out); out = out * out_gate; return self.to_out(out). So apply LN first then multiplication. Good.
+
+Now memory: out_gate shape (R,H) half. But after we reshape out_gate reshape to (B,N,N,H) and multiply.
+
+Potential diff: out_gate has already been through sigmoid (out_gate = (sigmoid(proj_out_gate)). In kernel we computed out_gate = sigmoid(proj_out_gate_raw). Good.
+
+Now final linear expects weight shape (dim, H) half. Provide to_out_weight half.
+
+Now output conversion to float32 row-major (B,N,N,dim). Use .to(torch.float32) for final.
+
+Now add docstring summarizing algorithm.
+
+Now need to test.
+
+Potential concerns: Using torch.nn.functional.layer_norm on shape (B,N,N,dim) with weight and bias that are 1D (dim). We need to broadcast weight and bias across batch dims which is fine. The function expects weight and bias optional; but shape (dim,) works.
+
+But must set eps=1e-5.
+
+Potential memory usage: intermediate x_norm half => shape (B,N,N,dim) half -> 2 bytes per element. For large shape R=1M, dim=384 => 1M*384*2 ~ 768 MB, maybe okay. But we allocate plus projection (R, 5*H) half; for H=128, 5*H=640 => 1M*640*2 = 1.28GB. Combined maybe > 2GB memory; okay for H100.
+
+Now implement code.
+
+Potential micro-optimizations:
+
+- Set torch.backends.cuda.matmul.allow_tf32 = False? maybe not needed.
+
+- Use torch.set_float32_matmul_precision('high' or 'medium')? Not needed.
+
+- Use torch.cuda.synchronize at times? Not needed.
+
+- Use pin_memory? Not needed.
+
+Implementation notes:
+
+- Must import torch.nn.functional as F.
+
+- Use 'torch.nn.functional.linear' for fused projection and final linear.
+
+- Use .contiguous() for tensors before passing to Triton.
+
+- Use .view(R, H) etc.
+
+Edge Cases: When nomask = True, split_fuse_gate kernel passes dummy mask with size 0. Use dummy pointer as torch.empty(0, dtype=torch.float16, device=device). Need to compile kernel with HAS_MASK=0 and mask_ptr param unused; to avoid errors we can pass dummy pointer.
+
+Now final code:
+
+```python
+import torch
+import torch.nn.functional as F
+import triton
+import triton.language as tl
+
+@triton.jit
+def split_fuse_gate_kernel(...):
+    # as above
+```
+
+Define custom_kernel accordingly.
+
+Potential improvements: Use torch.autocast? Could remain.
+
+Now test with example.
+
+Let's simulate with python code, but we cannot run here.
+
+Now produce final answer.
+
+Will need docstring summarizing algorithm.
+
+Let's craft final code accordingly.
+
+Implementation Steps:
+
+1. Input extraction.
+2. Flatten R.
+3. First layernorm (torch.nn.functional.layer_norm).
+4. Cast to half.
+5. fuse projection weight: cat left_proj, right_proj, left_gate, right_gate, out_gate.
+6. Linear: proj = F.linear(x_norm_half, fused_weights) -> shape (R, 5*H)
+7. Allocate left,right,out_gate half tensors of shape (R, H)
+8. Determine mask and compile kernel parameters.
+9. Launch split_fuse_gate kernel.
+10. Reshape left/right to (B,N,N,H) and permute to (B, H, N, N) for bmm.
+11. Compute out_mat = torch.bmm(left_mat, right_mat.transpose(1,2)).
+12. Reshape out to (B,N,N,H).
+13. Second LayerNorm using torch.nn.functional.layer_norm on out, weight=to_out_norm_weight, bias=to_out_norm_bias.
+14. Multiply with out_gate after reshaping.
+15. Final projection: out_flat = out_norm_gate.view(R, H); final_half = F.linear(out_flat, to_out_weight) (half). Possibly use torch.nn.functional.linear.
+16. Reshape to (B,N,N,dim) and convert to float32.
+
+Make sure to free intermediate large tensors with del to reduce memory.
+
+Potential additional improvement: Use torch.cuda.amp.autocast to cast matmul to half? We'll perform manual casting.
+
+Now confirm weight shapes:
+
+- norm.weight and norm.bias: [dim]
+- left_proj.weight: [hidden_dim, dim]
+- right_proj: same
+- left_gate.weight: [hidden_dim, dim]
+- right_gate: [hidden_dim, dim]
+- out_gate.weight: [hidden_dim, dim]
+- to_out_norm.weight: [hidden_dim]
+- to_out_norm.bias: [hidden_dim]
+- to_out.weight: [dim, hidden_dim]
+
+Thus fused_w: torch.cat([...], dim=0) yields shape (5*hidden_dim, dim). Good.
+
+Note that weight matrices are originally float32; we cast to half. That's okay.
+
+Now ensure dtype conversion correct:
+
+- fused_w.to(torch.float16)
+- to_out_weight.to(torch.float16)
+
+Potential problem: torch.nn.functional.linear expects weight shape (out_features, in_features) where out_features = 5*H for projection; in_features=dim. That's fine.
+
+Now arbitrarily need to ensure device.
+
+Set any torch.backends.cudnn.enabled maybe.
+
+Make sure to set eps.
+
+Now ensure split_fuse_gate kernel signature args: proj_ptr, left_ptr, right_ptr, out_gate_ptr, mask_ptr, rows, H, HAS_MASK, BLOCK_R, BLOCK_H. We'll define block sizes as compile-time constants.
+
+Currently we used grid = (triton.cdiv(R, BLOCK_R),)
+
+Set num_warps maybe 4.
+
+Now test for nomask True: Provide mask_ptr dummy pointer, HAS_MASK=0.
+
+Potential syntax error: The Triton kernel can't have default value for mask_ptr; but we have to pass an argument. The dummy element should be sized 0 but pointer must be defined (device). That is fine.
+
+Now final code.
+
+Potential memory usage of proj may be large; but we free after split_fuse_gate.
+
+Now final answer: Provide code block.
+
+Will include docstring.
+
+Now proceed to produce final solution.assistantfinal```python
+"""
+TriMul (outgoing) – fast forward pass.
+
+Algorithm
+---------
+1️⃣ Row‑wise LayerNorm of the 4‑D input (torch.nn.functional.layer_norm,
+   fp32 → fp16).
+
+2️⃣ Fuse the five linear maps (left/right proj + three gates) into one
+   GEMM:  X_norm @ W_fusedᵀ  →  (R, 5·H),  R = B·N·N.
+   The weight matrix is built once and kept in fp16.
+
+3️⃣ Triton kernel `split_fuse_gate_kernel`:
+   • reads the fused projection,
+   • (optionally) multiplies by the pair‑wise mask,
+   • evaluates the three sigmoid gates (fp32 → fp16),
+   • writes three tensors  left, right, out_gate  of shape (R, H).
+
+4️⃣ Batched half‑precision GEMM over the hidden dimension:
+        out[b·H+i] = left[b·H+i] @ right[b·H+i]ᵀ
+   Implemented with `torch.bmm`, which uses cuBLAS Tensor‑Cores.
+
+5️⃣ Row‑wise LayerNorm on the result, element‑wise multiplication with
+   `out_gate` (torch.nn.functional.layer_norm, fp16).
+
+6️⃣ Final projection back to the original `dim`:
+        out_fused @ to_out.weightᵀ
+   (again a single GEMM in fp16).
+
+All heavy linear algebra is performed by cuBLAS; only the mask / gating
+stage is handcrafted in Triton.  The implementation stays fully
+autograd‑free (forward‑only) and returns a float32 tensor.
+"""
+
+import torch
+import torch.nn.functional as F
+import triton
+import triton.language as tl
+
+
+# ----------------------------------------------------------------------
+# Triton kernel  : split fused projection, apply mask & sigmoid gates
+# ----------------------------------------------------------------------
+@triton.jit
+def split_fuse_gate_kernel(
+    proj_ptr,          # const   *[rows, 5*H]    (fp16)
+    left_ptr,          # mutable *[rows, H]    (fp16)
+    right_ptr,         # mutable *[rows, H]    (fp16)
+    out_gate_ptr,      # mutable *[rows, H]    (fp16)
+    mask_ptr,          # const   *[rows]       (fp16)   (ignored if HAS_MASK=0)
+    rows: tl.int32,
+    H: tl.int32,
+    HAS_MASK: tl.constexpr,
+    BLOCK_R: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+):
+    """
+    For each row r (r indexes B·N·N):
+        left  = (proj_left  * mask[r]) * sigmoid(proj_left_gate)
+        right = (proj_right * mask[r]) * sigmoid(proj_right_gate)
+        out_gate = sigmoid(proj_out_gate)
+    All arithmetic is fp16 except the sigmoid (computed in fp32 for
+    numerical stability).  The layout of `proj` is
+        [ left , right , left_gate , right_gate , out_gate ].
+    """
+    pid = tl.program_id(0)
+    row_start = pid * BLOCK_R
+    offs_r = row_start + tl.arange(0, BLOCK_R)          # [BLOCK_R]
+    mask_r = offs_r < rows
+
+    # ----- optional mask (scalar per row) ---------------------------------
+    if HAS_MASK:
+        # mask values are {0.,1.} stored as fp16
+        mask_val = tl.load(mask_ptr + offs_r, mask=mask_r, other=1.0)
+        mask_val = mask_val[:, None]                     # broadcast over H
+    else:
+        mask_val = tl.full([BLOCK_R, 1], 1.0, dtype=tl.float16)
+
+    # ----- iterate over hidden dimension ----------------------------------
+    for h_off in range(0, tl.cdiv(H, BLOCK_H)):
+        offs_h = h_off * BLOCK_H + tl.arange(0, BLOCK_H)   # [BLOCK_H]
+        mask_h = offs_h < H
+
+        # pointers inside the fused projection
+        # layout: [ left , right , left_gate , right_gate , out_gate ]
+        base = offs_r[:, None] * (5 * H) + offs_h[None, :]   # [BLOCK_R, BLOCK_H]
+
+        left_raw_ptr     = proj_ptr + base
+        right_raw_ptr    = proj_ptr + base + H
+        left_gate_ptr    = proj_ptr + base + 2 * H
+        right_gate_ptr   = proj_ptr + base + 3 * H
+        out_gate_raw_ptr = proj_ptr + base + 4 * H
+
+        left_raw      = tl.load(left_raw_ptr,
+                                mask=mask_r[:, None] & mask_h[None, :],
+                                other=0.0)
+        right_raw     = tl.load(right_raw_ptr,
+                                mask=mask_r[:, None] & mask_h[None, :],
+                                other=0.0)
+        left_gate_raw = tl.load(left_gate_ptr,
+                                mask=mask_r[:, None] & mask_h[None, :],
+                                other=0.0)
+        right_gate_raw= tl.load(right_gate_ptr,
+                                mask=mask_r[:, None] & mask_h[None, :],
+                                other=0.0)
+        out_gate_raw  = tl.load(out_gate_raw_ptr,
+                                mask=mask_r[:, None] & mask_h[None, :],
+                                other=0.0)
+
+        # ----- sigmoid (stable, fp32) --------------------------------------
+        left_gate  = (1.0 / (1.0 + tl.exp(-left_gate_raw.to(tl.float32)))).to(tl.float16)
+        right_gate = (1.0 / (1.0 + tl.exp(-right_gate_raw.to(tl.float32)))).to(tl.float16)
+        out_gate   = (1.0 / (1.0 + tl.exp(-out_gate_raw.to(tl.float32)))).to(tl.float16)
+
+        # ----- apply mask and gates ----------------------------------------
+        left  = left_raw  * mask_val * left_gate
+        right = right_raw * mask_val * right_gate
+
+        # ----- store --------------------------------------------------------
+        left_dst_ptr     = left_ptr     + offs_r[:, None] * H + offs_h[None, :]
+        right_dst_ptr    = right_ptr    + offs_r[:, None] * H + offs_h[None, :]
+        out_gate_dst_ptr = out_gate_ptr + offs_r[:, None] * H + offs_h[None, :]
+
+        tl.store(left_dst_ptr,     left,
+                 mask=mask_r[:, None] & mask_h[None, :])
+        tl.store(right_dst_ptr,    right,
+                 mask=mask_r[:, None] & mask_h[None, :])
+        tl.store(out_gate_dst_ptr, out_gate,
+                 mask=mask_r[:, None] & mask_h[None, :])
+
+
+# ----------------------------------------------------------------------
+# Entry point – outgoing TriMul forward pass
+# ----------------------------------------------------------------------
+def custom_kernel(data):
+    """
+    Forward pass of the outgoing TriMul operator (no gradient).
+
+    Args
+    ----
+    data = (input_tensor, mask_tensor, weights_dict, config_dict)
+        input_tensor : torch.Tensor, [B, N, N, dim], dtype float32
+        mask_tensor  : torch.Tensor, [B, N, N] (bool/float) or None
+        weights_dict : dict with all Linear/LayerNorm params (float32)
+        config_dict  : contains "dim", "hidden_dim", "nomask" (bool)
+
+    Returns
+    -------
+    torch.Tensor of shape [B, N, N, dim] (float32)
+    """
+    # ------------------------------------------------------------------
+    # 0️⃣ unpack
+    # ------------------------------------------------------------------
+    inp, mask, w, cfg = data
+    dim        = cfg["dim"]            # input channel dimension
+    hidden_dim = cfg["hidden_dim"]    # hidden dimension (H)
+    eps        = 1e-5
+    device     = inp.device
+
+    B, N, _, _ = inp.shape
+    R = B * N * N                     # number of rows in the flattened view
+    H = hidden_dim
+
+    # ------------------------------------------------------------------
+    # 1️⃣ First LayerNorm (torch, fp32 → fp16)
+    # ------------------------------------------------------------------
+    # LayerNorm over the last dimension (dim)
+    x_norm = torch.nn.functional.layer_norm(
+        inp,
+        normalized_shape=(dim,),
+        weight=w["norm.weight"],
+        bias=w["norm.bias"],
+        eps=eps,
+    ).to(torch.float16)               # shape [B, N, N, dim] , fp16
+
+    # flatten to (R, dim) for the fused linear projection
+    x_norm_flat = x_norm.view(R, dim).contiguous()
+    del inp, x_norm   # free memory
+
+    # ------------------------------------------------------------------
+    # 2️⃣ Fused projection → (R, 5*H)
+    # ------------------------------------------------------------------
+    fused_w = torch.cat(
+        [
+            w["left_proj.weight"],   # (H, dim)
+            w["right_proj.weight"],  # (H, dim)
+            w["left_gate.weight"],   # (H, dim)
+            w["right_gate.weight"],  # (H, dim)
+            w["out_gate.weight"],    # (H, dim)
+        ],
+        dim=0,
+    ).to(torch.float16)               # (5*H, dim)
+
+    proj = F.linear(x_norm_flat, fused_w)   # (R, 5*H), fp16
+    del fused_w, x_norm_flat
+
+    # ------------------------------------------------------------------
+    # 3️⃣ Split, mask & sigmoid gates (Triton)
+    # ------------------------------------------------------------------
+    left      = torch.empty(R, H, dtype=torch.float16, device=device)
+    right     = torch.empty(R, H, dtype=torch.float16, device=device)
+    out_gate  = torch.empty(R, H, dtype=torch.float16, device=device)
+
+    if cfg.get("nomask", True):
+        # no mask → compile kernel with HAS_MASK=0
+        has_mask = 0
+        dummy_mask = torch.empty(0, dtype=torch.float16, device=device)
+        mask_ptr = dummy_mask
+    else:
+        # mask stored as {0.,1.} – flatten to (R,)
+        mask_fp16 = mask.to(torch.float16).reshape(R).contiguous()
+        has_mask = 1
+        mask_ptr = mask_fp16
+
+    # launch configuration
+    BLOCK_R = 128                     # rows per program
+    BLOCK_H = 32                      # hidden dim chunk (must divide H≤384)
+    grid = (triton.cdiv(R, BLOCK_R),)
+
+    split_fuse_gate_kernel[grid](
+        proj,
+        left,
+        right,
+        out_gate,
+        mask_ptr,
+        R,
+        H,
+        HAS_MASK=has_mask,
+        BLOCK_R=BLOCK_R,
+        BLOCK_H=BLOCK_H,
+        num_warps=4,
+    )
+    del proj, mask_ptr
+
+    # ------------------------------------------------------------------
+    # 4️⃣ Tri‑multiplicative update  (batched GEMM over H)
+    # ------------------------------------------------------------------
+    # shape to (B, H, N, N) → (B*H, N, N) for torch.bmm
+    left  = left.view(B, N, N, H).permute(0, 3, 1, 2).contiguous()   # [B, H, N, N]
+    right = right.view(B, N, N, H).permute(0, 3, 1, 2).contiguous()  # [B, H, N, N]
+
+    left_mat  = left.view(B * H, N, N)        # [B·H, N, N]
+    right_mat = right.view(B * H, N, N)       # [B·H, N, N]
+
+    # left @ rightᵀ  (half‑precision Tensor‑Core)
+    out_mat = torch.bmm(left_mat, right_mat.transpose(1, 2))   # [B·H, N, N]
+
+    # restore original layout: [B, N, N, H]
+    out = out_mat.view(B, H, N, N).permute(0, 2, 3, 1).contiguous()
+    del left_mat, right_mat, left, right, out_mat
+
+    # ------------------------------------------------------------------
+    # 5️⃣ Second LayerNorm + gate multiplication (torch)
+    # ------------------------------------------------------------------
+    out_norm = torch.nn.functional.layer_norm(
+        out,
+        normalized_shape=(H,),
+        weight=w["to_out_norm.weight"],
+        bias=w["to_out_norm.bias"],
+        eps=eps,
+    )                                 # fp16
+
+    # apply out_gate (need the same layout)
+    out_gate_reshaped = out_gate.view(B, N, N, H)
+    out_norm = out_norm * out_gate_reshaped
+    del out_gate, out_gate_reshaped, out
+
+    # ------------------------------------------------------------------
+    # 6️⃣ Final projection back to `dim`
+    # ------------------------------------------------------------------
+    out_flat = out_norm.view(R, H).contiguous()
+    final_half = F.linear(
+        out_flat,
+        w["to_out.weight"].to(torch.float16),   # (dim, H)
+    )   # (R, dim), fp16
+
+    final = final_half.view(B, N, N, dim).to(torch.float32)
+    return final
+```
