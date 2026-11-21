@@ -22,7 +22,7 @@ BEFORE_AFTER = (
 )
 
 
-CURRENT_VALUE = "\nCurrent {metric_name} (higher is better): {after:.6f}"
+CURRENT_VALUE = "\nCurrent {metric_name} (lower is better): {after:.6f}"
 
 
 TARGET_GAP = (
