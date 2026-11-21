@@ -124,23 +124,27 @@ def evaluate_batch(path):
 
     begin = time.monotonic()
     best = batch["scoring"].get("previous_best_raw")
-    bar = make_progress_bar(len(batch["candidates"]), desc="evaluating TriMul")
+    bar = None
     try:
         with ThreadPoolExecutor(max_workers=len(problem.kernel_gpu_ids)) as pool:
             futures = [pool.submit(evaluate, row) for row in batch["candidates"]]
             try:
                 for future in as_completed(futures):
                     raw = future.result()
+                    if bar is None:
+                        bar = make_progress_bar(len(futures), desc="evaluating TriMul", initial=1)
+                    else:
+                        bar.update(1)
                     if raw is not None and (best is None or raw < best):
                         getattr(bar, "write", print)(f"[step {step}] best kernel runtime: {raw:.9f} µs")
                         best = raw
-                    bar.update(1)
             except BaseException:
                 for future in futures:
                     future.cancel()
                 raise
     finally:
-        bar.close()
+        if bar is not None:
+            bar.close()
     batch["evaluation_seconds"] = time.monotonic() - begin
     if critic_context is not None:
         from types import SimpleNamespace

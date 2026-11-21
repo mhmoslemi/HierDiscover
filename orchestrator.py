@@ -1081,14 +1081,28 @@ def _finalize_pending_spo_rs_artifacts(
                 isolated_slots.put(cpu_id)
 
     evaluation_pool = ThreadPoolExecutor(max_workers=workers)
-    evaluation_futures = {
-        evaluation_pool.submit(evaluate, item): index
-        for index, item in enumerate(artifacts)}
+    eval_bar = None
+    eval_progress_lock = threading.Lock()
+
+    def evaluation_completed(_future):
+        nonlocal eval_bar
+        with eval_progress_lock:
+            if eval_bar is None:
+                eval_bar = make_progress_bar(len(artifacts), desc="recovering evaluations", initial=1)
+            else:
+                eval_bar.update(1)
+
     results = [None] * len(artifacts)
     live_best_state = sampler.best_raw_state(maximize=bool(problem.maximize))
     live_best_raw = (
         float(live_best_state.raw_score) if live_best_state is not None else None)
     try:
+        evaluation_futures = {}
+        for index, item in enumerate(artifacts):
+            future = evaluation_pool.submit(evaluate, item)
+            evaluation_futures[future] = index
+            future.add_done_callback(evaluation_completed)
+
         prompt_cache = {}
         score_pairs = []
         current_scores = []
@@ -1150,32 +1164,29 @@ def _finalize_pending_spo_rs_artifacts(
         if missing_scores or not math.isfinite(divergence):
             raise RuntimeError('generated-step recovery did not obtain every exact consecutive-policy score')
 
-        eval_bar = make_progress_bar(len(evaluation_futures), desc="recovering evaluations")
-        try:
-            for future in as_completed(evaluation_futures):
-                index = evaluation_futures[future]
-                result = future.result()
-                results[index] = result
-                live_best_raw, best_line = _advance_live_best_raw(
-                    result, live_best_raw, bool(problem.maximize))
-                item = artifacts[index]
-                evaluated_meta = _evaluated_rollout_meta(item["meta"], result)
-                save_rollout(
-                    exp_dir, step_idx, int(item["meta"]["group"]),
-                    int(item["meta"]["rollout"]), "", evaluated_meta,
-                    artifacts_already_saved=True)
-                item["meta"] = evaluated_meta
-                eval_bar.update(1)
-                if best_line:
-                    writer = getattr(eval_bar, "write", None)
-                    if callable(writer):
-                        writer(f"[step {step_idx}] {best_line}")
-                    else:
-                        print(f"[step {step_idx}] {best_line}", flush=True)
-        finally:
-            eval_bar.close()
+        for future in as_completed(evaluation_futures):
+            index = evaluation_futures[future]
+            result = future.result()
+            results[index] = result
+            live_best_raw, best_line = _advance_live_best_raw(
+                result, live_best_raw, bool(problem.maximize))
+            item = artifacts[index]
+            evaluated_meta = _evaluated_rollout_meta(item["meta"], result)
+            save_rollout(
+                exp_dir, step_idx, int(item["meta"]["group"]),
+                int(item["meta"]["rollout"]), "", evaluated_meta,
+                artifacts_already_saved=True)
+            item["meta"] = evaluated_meta
+            if best_line:
+                writer = getattr(eval_bar, "write", None)
+                if callable(writer):
+                    writer(f"[step {step_idx}] {best_line}")
+                else:
+                    print(f"[step {step_idx}] {best_line}", flush=True)
     finally:
         evaluation_pool.shutdown(wait=True, cancel_futures=False)
+        if eval_bar is not None:
+            eval_bar.close()
 
     rewards = [float(result.reward) for result in results]
     prompt_indices = {}
@@ -1862,8 +1873,8 @@ def _open_reward_pool(cfg, problem, rollout_count, step_idx, gen_pool,
             "stdout+stderr capture is bounded")
     else:
         n_reward_workers = _resolve_reward_workers(cfg, problem)
-        print(f"[step {step_idx}] evaluation pool: {n_reward_workers} worker(s), "
-              f"{getattr(problem, 'eval_cpus', 1)} CPU(s) per candidate")
+        setting_log_only(f"[step {step_idx}] evaluation pool: {n_reward_workers} worker(s), "
+                         f"{getattr(problem, 'eval_cpus', 1)} CPU(s) per candidate")
     reward_pool = ThreadPoolExecutor(max_workers=n_reward_workers)
 
     def run_isolated(text, parent_ctx, **answer_options):
@@ -2184,12 +2195,8 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
     rollout_io_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix=f"rollout-save-step{step_idx}")
     rollout_io_futures = []
 
-    # This bar must exist before generation begins.  Reward futures are added
-    # incrementally as rollout batches arrive, so constructing it from
-    # ``all_futs`` after generation made correctly overlapped evaluation look
-    # as though it started late at 0%.  Future callbacks keep it live from the
-    # first completed sandbox while GPU generation is still running.
-    eval_bar = make_progress_bar(total_rollouts, desc="evaluating")
+    # Show the first completed evaluation instead of drawing an empty bar.
+    eval_bar = None
     eval_progress_condition = threading.Condition()
     eval_progress_completed = 0
     eval_bar_closed = False
@@ -2198,7 +2205,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
         float(live_best_state.raw_score) if live_best_state is not None else None)
 
     def _record_evaluation_completion(_future, record=None):
-        nonlocal eval_progress_completed, live_best_raw
+        nonlocal eval_bar, eval_progress_completed, live_best_raw
         with eval_progress_condition:
             best_line = None
             if (record is not None and not _future.cancelled()
@@ -2221,7 +2228,11 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                 rollout_io_futures.append(save_future)
             eval_progress_completed += 1
             try:
-                eval_bar.update(1)
+                if eval_bar is not None:
+                    eval_bar.update(1)
+                elif record is not None:
+                    eval_bar = make_progress_bar(
+                        total_rollouts, desc="evaluating", initial=eval_progress_completed)
             finally:
                 eval_progress_condition.notify_all()
             if best_line:
@@ -2545,14 +2556,14 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                         f"missing={spo_rs_missing_policy_scores}")
                 else:
                     policy_label = ""
-                print(f"[step {step_idx}] vLLM logprobs: rollout "
-                      f"{behavior_count}/{len(vllm_logprob_records)}, "
-                      f"reference {reference_label}{policy_label} in "
-                      f"{time.time() - scoring_started:.1f}s "
-                      f"(HF exact reference fallbacks: "
-                      f"{reference_hf_fallbacks}; "
-                      f"CPU evaluations completed during scoring: "
-                      f"{eval_done_before}->{eval_done_after})", flush=True)
+                setting_log_only(
+                    f"[step {step_idx}] vLLM logprobs: rollout "
+                    f"{behavior_count}/{len(vllm_logprob_records)}, "
+                    f"reference {reference_label}{policy_label} in "
+                    f"{time.time() - scoring_started:.1f}s "
+                    f"(HF exact reference fallbacks: {reference_hf_fallbacks}; "
+                    f"CPU evaluations completed during scoring: {eval_done_before}->{eval_done_after})",
+                    flush=True)
 
             coder_phase_complete = True
         finally:
@@ -2827,12 +2838,13 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
             with eval_progress_condition:
                 eval_progress_condition.wait_for(lambda: eval_progress_completed >= len(all_futs))
         finally:
-            eval_bar.close()
-            eval_bar_closed = True
+            if eval_bar is not None:
+                eval_bar.close()
+                eval_bar_closed = True
     finally:
         reward_pool.shutdown(wait=True)
         rollout_io_pool.shutdown(wait=True)
-        if not eval_bar_closed:
+        if eval_bar is not None and not eval_bar_closed:
             eval_bar.close()
         if evaluation_trainer_offloaded:
             _restore_after_gpu_evaluation(backend, optimizer, step_idx)
@@ -4063,9 +4075,9 @@ def _main(trainer_startup):
             def _restore_trainer_after_generation():
                 nonlocal trainer_offloaded
                 if parallel_trainer is None:
-                    print("[gpu] keeping the inactive model offloaded")
+                    setting_log_only("[gpu] keeping the inactive model offloaded")
                 elif parallel_trainer.is_offloaded:
-                    print("[gpu] keeping trainer replicas offloaded until the adapter update", flush=True)
+                    setting_log_only("[gpu] keeping trainer replicas offloaded until the adapter update", flush=True)
                 else:
                     trainer_offloaded = False
 

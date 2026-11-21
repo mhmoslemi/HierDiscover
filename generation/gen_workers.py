@@ -297,7 +297,7 @@ class _PrintBar:
             print(f"[pool] {self.desc} {self.n}/{self.total}", flush=True)
 
 
-def make_progress_bar(total, desc="progress"):
+def make_progress_bar(total, desc="progress", *, initial=0):
     total = int(max(total, 1))
     if _HAS_TQDM:
         # The main runner exposes a TTY-preserving progress tee. It keeps the
@@ -305,8 +305,11 @@ def make_progress_bar(total, desc="progress"):
         # in temirnal.log instead of appending every carriage-return refresh.
         output = getattr(sys.stderr, "progress_stream", sys.stderr)
         return tqdm(total=total, desc=desc, unit="it",
-                    leave=True, dynamic_ncols=True, file=output)
-    return _PrintBar(total, desc=desc)
+                    leave=True, dynamic_ncols=True, file=output, initial=initial)
+    bar = _PrintBar(total, desc=desc)
+    if initial:
+        bar.update(initial)
+    return bar
 
 
 def distribute_jobs(prompts_by_group, group_size, num_workers,
@@ -2224,8 +2227,8 @@ class GenerationPool:
             if self.backend == "vllm":
                 self._remember_worker_children(rank)
             deadline = time.monotonic() + self._startup_timeout
-            print(f"[pool] {len(self._ready_worker_ids)}/"
-                  f"{self.num_workers} workers ready", flush=True)
+            setting_log_only(f"[pool] {len(self._ready_worker_ids)}/"
+                             f"{self.num_workers} workers ready", flush=True)
 
     def _start_workers(self, worker_ids, *, initial=False):
         worker_ids = tuple(int(rank) for rank in worker_ids)
@@ -3177,8 +3180,8 @@ class PhasedVLLMGenerationPool:
                 self._base_policy_only = base_policy_only
                 options = dict(vllm_base_policy_only=base_policy_only)
                 if base_policy_only:
-                    print("[pool] initial GPT-OSS policy is the base model; "
-                          "serving it without LoRA kernels", flush=True)
+                    setting_log_only("[pool] initial GPT-OSS policy is the base model; "
+                                     "serving it without LoRA kernels", flush=True)
                 if self._force_transient or self._pool_kwargs.get("vllm_persistent_workers") == 0:
                     self._pool = self._create_pool(**options)
                 else:

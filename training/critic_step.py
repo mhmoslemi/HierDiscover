@@ -79,7 +79,10 @@ def load_tree(root, batch):
         previous = load_batch(root, previous_step)
         if previous is None or "advantages" not in previous:
             raise ValueError(f"missing accepted critic history for step {previous_step}")
-        tree.extend({**row, "step": previous_step + 1} for row in previous["rollouts"])
+        tree.extend(
+            {**row, "step": previous_step + 1, "assigned_advantage": previous["advantages"][row["id"]]}
+            for row in previous["rollouts"]
+        )
     tree.extend({**row, "step": step + 1} for row in batch["rollouts"])
     return tree
 

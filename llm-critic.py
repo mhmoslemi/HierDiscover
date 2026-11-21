@@ -33,12 +33,13 @@ A policy LLM is solving a scientific discovery problem step by step. Its attempt
 - Child: a rollout generated from a given parent. A rollout you score now may become a parent in a later step.
 - Siblings: rollouts with the same parent at the same step. A sibling group is the set of alternatives the policy produced from one starting point.
 - SOTA: the best known score for this problem from outside the tree (literature or best known result).
-- n/a: the rollout failed and has no valid score (crash, timeout, invalid output, constraint violation, or any other reason). You are not told why.
+- n/a on a policy rollout means it failed and has no valid score. An unmeasured seed (tree step 0, score n/a) provides ancestry only. Exclude unmeasured seeds from judgments about success rates, failure rates, and search difficulty, even if the seed row reports a failure rate.
 
-You see only numbers: rollout IDs, tree structure, raw scores, and SOTA. You never see the content of any solution.
+You see rollout IDs, tree structure, raw scores, previously assigned advantages, and SOTA. You never see the content of any solution.
 
 Score direction: {SCORE_DIRECTION}
 Below, "better" and "worse" always refer to this direction.
+{FIRST_BATCH_GUIDANCE}
 
 ## Task
 The user message contains the tree history, statistics computed from it, and a set of new rollouts to score, all from the same step. For each new rollout, output an advantage: a real number in [-10, 10]. A positive advantage reinforces the rollout and a negative one discourages it. The range is bounded, but you do not need to use all of it.
@@ -65,7 +66,7 @@ Sign convention: every field whose name starts with "improvement_" is signed so 
   - "improvement_vs_running_best": difference from running_best_before. Positive means it sets a new running best.
   - "improvement_vs_sota": difference from SOTA. Zero or positive means it matches or beats SOTA.
   - "z_in_step": standardized score among all valid rollouts at the current step.
-- "history" (may be absent): every earlier rollout as [id, step, parent_id, score].
+- "history" (may be absent): earlier entries as [id, step, parent_id, raw_score, assigned_advantage]. The last value is the selected critic advantage used for training that rollout. A failed rollout has raw_score "n/a" and keeps its assigned advantage. Seeds have a null advantage because they received no critic judgment.
 
 ## Reasoning procedure
 Work through these stages in your analysis before answering.
@@ -80,7 +81,7 @@ Work through these stages in your analysis before answering.
    c. Standing in the whole tree: does it set a new running best? How does it compare with the best and mean of recent steps?
    d. Trajectory: does it break a plateau of several stagnant steps, continue the recent trend, or reverse it?
 
-4. Assign values, then check every hard constraint below and fix any violation before answering.
+4. Use previous advantages to calibrate the sign and magnitude of your judgments. Compare rollouts with similar improvements over their parents, sibling outcomes, and standing in the tree at the time. As the search progresses, the same raw score may deserve a different advantage. Assign values only to the current to_score rollouts, then check every hard constraint below.
 
 ## Hard constraints
 1. Range: every advantage is in [-10, 10], with at most two decimal places.
@@ -117,6 +118,7 @@ class Rollout:
     step: int
     parent_id: Optional[str]
     score: Optional[float]  # None = failed ("n/a")
+    assigned_advantage: Optional[float] = None
 
 
 def _as_rollouts(tree: Iterable[Any]) -> list[Rollout]:
@@ -133,7 +135,8 @@ def _as_rollouts(tree: Iterable[Any]) -> list[Rollout]:
             if not math.isfinite(s):
                 s = None
         pid = r.get("parent_id")
-        out.append(Rollout(str(r["id"]), int(r["step"]), None if pid is None else str(pid), s))
+        out.append(Rollout(str(r["id"]), int(r["step"]), None if pid is None else str(pid), s,
+                           assigned_advantage=r.get("assigned_advantage")))
     ids = [r.id for r in out]
     if len(ids) != len(set(ids)):
         raise ValueError("rollout ids must be unique")
@@ -297,13 +300,14 @@ def build_user_payload(tree, sota, higher_is_better=True, to_score=None, include
     }
     if include_history:
         payload["history"] = [
-            [r.id, r.step, r.parent_id, _r(r.score) if r.score is not None else "n/a"]
+            [r.id, r.step, r.parent_id, _r(r.score) if r.score is not None else "n/a", r.assigned_advantage]
             for r in sorted(rollouts, key=lambda r: r.step) if r.step < cur
         ]
     return payload, nodes, ids
 
 
-def build_developer_prompt(higher_is_better: bool, ids: list[str]) -> str:
+def build_developer_prompt(higher_is_better: bool, ids: list[str], *, first_batch=False,
+                           shared_starting_prompt=False) -> str:
     """Fill the placeholders. The schema lists the exact IDs for this call."""
     schema = {
         "type": "object",
@@ -311,8 +315,22 @@ def build_developer_prompt(higher_is_better: bool, ids: list[str]) -> str:
         "required": list(ids),
         "additionalProperties": False,
     }
+    guidance = ""
+    if first_batch:
+        guidance = (
+            "\n## First batch\n"
+            "These are the first policy attempts. Use this batch's observed successes and failures "
+            "to judge difficulty. Compare valid scores across the batch. "
+            "Use a seed as a parent baseline only when it has a measured score. "
+            "If all seeds are unmeasured, the best valid rollout establishes the first record. "
+            "There are no earlier policy judgments to match or plateaus to break.\n"
+        )
+        if shared_starting_prompt:
+            guidance += ("All rollouts in this batch received the same starting prompt. "
+                         "Compare them as alternatives from that shared starting point across seed IDs.\n")
     return (DEVELOPER_PROMPT
             .replace("{SCORE_DIRECTION}", _direction(higher_is_better))
+            .replace("{FIRST_BATCH_GUIDANCE}", guidance)
             .replace("{RESPONSE_SCHEMA}", json.dumps(schema, separators=(",", ":"))))
 
 
@@ -368,9 +386,12 @@ def constraint_issue(advantages, nodes, higher_is_better):
 
 
 def prepare_prompt(tokenizer, tree, sota, higher_is_better, *, to_score=None, include_history=True,
-                   max_context=CRITIC_CONTEXT):
+                   max_context=CRITIC_CONTEXT, shared_starting_prompt=False):
     payload, nodes, ids = build_user_payload(tree, sota, higher_is_better, to_score, include_history)
-    messages = [{"role": "developer", "content": build_developer_prompt(higher_is_better, ids)},
+    developer_prompt = build_developer_prompt(
+        higher_is_better, ids, first_batch=payload["tree"]["current_step"] == 1,
+        shared_starting_prompt=shared_starting_prompt)
+    messages = [{"role": "developer", "content": developer_prompt},
                 {"role": "user", "content": ""}]
     # Even a compact final JSON needs room when the optional history is long.
     compact_answer = json.dumps({i: -0.51 if nodes[i].score is None else -0.5 for i in ids},
@@ -464,7 +485,14 @@ def _score_saved_step(path, pool_options):
     tree = load_tree(run_dir, batch)
     higher_is_better = batch["higher_is_better"]
     tokenizer = AutoTokenizer.from_pretrained(pool_options["model_name"], trust_remote_code=True)
-    prompt, nodes, ids = prepare_prompt(tokenizer, tree, batch["sota"], higher_is_better)
+    shared_starting_prompt = False
+    if batch["step"] == 0:
+        coder_prompts = list((run_dir / "step00").glob("step00_group*_rollout*.prompt.txt"))
+        if coder_prompts and len(coder_prompts) == len(batch["rollouts"]):
+            first_prompt = coder_prompts[0].read_bytes()
+            shared_starting_prompt = all(p.read_bytes() == first_prompt for p in coder_prompts[1:])
+    prompt, nodes, ids = prepare_prompt(tokenizer, tree, batch["sota"], higher_is_better,
+                                        shared_starting_prompt=shared_starting_prompt)
     prompt_path = path.with_name("prompt.txt")
     if prompt_path.is_file():
         prompt = prompt_path.read_text(encoding="utf-8")
@@ -496,10 +524,10 @@ if __name__ == "__main__":
 
     demo_tree = [
         {"id": "root",  "step": 0, "parent_id": None,    "score": 0.50},
-        {"id": "s1_r0", "step": 1, "parent_id": "root",  "score": 0.58},
-        {"id": "s1_r1", "step": 1, "parent_id": "root",  "score": 0.66},
-        {"id": "s1_r2", "step": 1, "parent_id": "root",  "score": None},
-        {"id": "s1_r3", "step": 1, "parent_id": "root",  "score": 0.61},
+        {"id": "s1_r0", "step": 1, "parent_id": "root",  "score": 0.58, "assigned_advantage": 0.0},
+        {"id": "s1_r1", "step": 1, "parent_id": "root",  "score": 0.66, "assigned_advantage": 4.5},
+        {"id": "s1_r2", "step": 1, "parent_id": "root",  "score": None, "assigned_advantage": -3.0},
+        {"id": "s1_r3", "step": 1, "parent_id": "root",  "score": 0.61, "assigned_advantage": 1.5},
         {"id": "s2_r0", "step": 2, "parent_id": "s1_r1", "score": 0.71},
         {"id": "s2_r1", "step": 2, "parent_id": "s1_r1", "score": 0.64},
         {"id": "s2_r2", "step": 2, "parent_id": "s1_r3", "score": 0.69},
