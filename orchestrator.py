@@ -3816,9 +3816,10 @@ def _main(trainer_startup):
         or (cfg.num_gpus > 1 and cfg.num_training_gpus == 1))
     if use_gen_pool:
         from generation.gen_workers import (GenerationPool, HybridHFGenerationPool,
-                                 PhasedVLLMGenerationPool, worker_seed)
+                                 PhasedVLLMGenerationPool, rollout_engine_options, worker_seed)
         gpu_ids = _parse_gpu_ids(cfg.gpu_ids)
         pool_options = dict(
+            **rollout_engine_options(cfg),
             model_name=cfg.coder_model_name,
             num_workers=cfg.num_gpus,
             gpu_ids=gpu_ids,
@@ -3828,14 +3829,8 @@ def _main(trainer_startup):
             gen_micro_batch=cfg.gen_micro_batch,
             backend=cfg.generation_backend,
             lora_rank=(cfg.lora_rank),
-            vllm_gpu_memory_utilization=float(cfg.vllm_gpu_memory_utilization),
-            vllm_enforce_eager=cfg.vllm_enforce_eager,
-            vllm_enable_prefix_caching=cfg.vllm_enable_prefix_caching,
-            vllm_quantization=cfg.vllm_quantization,
             vllm_tensor_parallel_size=cfg.vllm_tensor_parallel_size,
             vllm_pipeline_parallel_size=cfg.vllm_pipeline_parallel_size,
-            vllm_max_num_batched_tokens=cfg.vllm_max_num_batched_tokens,
-            vllm_enable_expert_parallel=cfg.vllm_enable_expert_parallel,
             vllm_sleep_level=cfg.vllm_sleep_level,
             # A sleeping GPT-OSS EngineCore retains enough CUDA/NCCL state to
             # starve the packed-MXFP4 trainer's fused dequant workspace.  A
@@ -3848,10 +3843,8 @@ def _main(trainer_startup):
             # generation. Give that vocabulary projection explicit memory
             # headroom; this changes scheduling only, never the scores.
             vllm_token_scoring=not bool(cfg.no_train),
-            vllm_runtime_reserve_gib=float(cfg.vllm_runtime_reserve_gib),
             vllm_staged_loading=cfg.vllm_staged_loading,
             vllm_log_path=vllm_log_path,
-            hardware_profile=cfg.hardware_profile,
         )
         if getattr(model, "_ttt_gpt_oss_shared_lora", False):
             from generation.gen_workers import gpt_oss_coder_engine_options

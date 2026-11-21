@@ -329,6 +329,10 @@ def restart_changed_rollout_step(cfg, exp_dir, step):
     for path in dict.fromkeys(sidecars):
         if path.is_file():
             path.rename(backup / path.name)
+    critic_dir = run / "critic" / directory.name
+    if critic_dir.is_dir():
+        (backup / "critic").mkdir()
+        critic_dir.rename(backup / "critic" / directory.name)
     if directory.is_dir():
         directory.rename(backup / directory.name)
 

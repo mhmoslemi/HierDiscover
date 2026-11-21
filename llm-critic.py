@@ -3,7 +3,6 @@ from __future__ import annotations
 import json
 import math
 import os
-import secrets
 import statistics
 import sys
 from collections import defaultdict
@@ -12,8 +11,9 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Any, Iterable, Optional
 
-from generation.gen_workers import native_final_answer_scope, render_chat_prompt
-from training.critic_step import CRITIC_CONTEXT, CRITIC_MODEL, load_tree, save_batch
+from experiment_io import _atomic_write_text, save_rollout_token_ids
+from generation.gen_workers import GenerationPool, native_final_answer_scope, render_chat_prompt
+from training.critic_step import CRITIC_CONTEXT, CRITIC_RESPONSES, load_tree, save_batch
 
 
 # ---------------------------------------------------------------------------
@@ -384,8 +384,8 @@ def prepare_prompt(tokenizer, tree, sota, higher_is_better, *, to_score=None, in
         else:
             payload.pop("history", None)
         messages[1]["content"] = json.dumps(payload, ensure_ascii=False)
-        prompt = tokenizer.encode(render_chat_prompt(tokenizer, messages, reasoning_effort="high"))
-        if len(prompt) + answer_tokens <= max_context:
+        prompt = render_chat_prompt(tokenizer, messages, reasoning_effort="high")
+        if len(tokenizer.encode(prompt)) + answer_tokens <= max_context:
             return prompt, nodes, ids
         if not history:
             raise ValueError("critic prompt and required JSON exceed its context window")
@@ -394,77 +394,92 @@ def prepare_prompt(tokenizer, tree, sota, higher_is_better, *, to_score=None, in
 
 
 class AdvantageCritic:
-    """Frozen GPT-OSS critic that keeps one vLLM engine across attempts."""
+    """Keep both rollout workers loaded across retries of the same prompt."""
 
-    def __init__(self, model=CRITIC_MODEL, llm=None, **llm_kwargs):
-        from vllm import LLM, SamplingParams
-        self._SamplingParams = SamplingParams
-        self.llm = llm if llm is not None else LLM(model=model, **llm_kwargs)
-        self.tokenizer = self.llm.get_tokenizer()
-        self._stop = self.tokenizer.convert_tokens_to_ids(["<|return|>", "<|endoftext|>", "<|call|>"])
-        self._end_tokens = {*self._stop, self.tokenizer.convert_tokens_to_ids("<|end|>")}
+    def __init__(self, pool, tokenizer):
+        self.pool = pool
+        self.tokenizer = tokenizer
+        self._end_tokens = set(tokenizer.convert_tokens_to_ids(
+            ["<|return|>", "<|endoftext|>", "<|call|>", "<|end|>"]))
 
-    def _params(self, seed):
-        return self._SamplingParams(n=1, temperature=1.0, top_p=1.0, seed=seed,
-                                    max_tokens=None, stop_token_ids=self._stop,
-                                    skip_special_tokens=True)
-
-    def score_prompt(self, prompt, nodes, ids, higher_is_better, *, seed=None):
-        attempt = 0
-        if seed is None:
-            seed = secrets.randbits(32)
+    def score_prompt(self, prompt, nodes, ids, higher_is_better, directory):
+        batches = [path for path in directory.glob("batch*")
+                   if path.is_dir() and path.name[5:].isdigit()]
+        batch_number = max((int(path.name[5:]) for path in batches), default=0)
+        attempts = sum(1 for path in batches for _ in path.glob("rollout*.txt"))
         while True:
-            attempt += 1
-            requests = self.llm.generate(
-                [{"prompt_token_ids": prompt}], self._params((seed + attempt) % 2**32),
-                use_tqdm=False)
-            completion = requests[0].outputs[0] if requests and requests[0].outputs else None
-            text = None
-            if completion is not None:
-                token_ids = completion.token_ids
+            batch_number += 1
+            batch_dir = directory / f"batch{batch_number:03d}"
+            batch_dir.mkdir()
+            valid = {}
+            verdicts = {}
+            print(f"[llm-critic] {directory.name}, batch {batch_number}: "
+                  f"generating {CRITIC_RESPONSES} replies", flush=True)
+            # The rollout worker subtracts the prompt length from the context budget.
+            for index, responses in self.pool.iter_group_jobs(
+                    [prompt] * CRITIC_RESPONSES, group_size=1, adapter_path=None,
+                    max_new_tokens=CRITIC_CONTEXT, temperature=1.0, top_p=1.0,
+                    step_idx=batch_number, full_policy_sampling=True, show_progress=False):
+                if index not in range(CRITIC_RESPONSES) or index in verdicts or len(responses) != 1:
+                    raise RuntimeError("unexpected critic rollout index or response count")
+                token_ids = responses[0][1]
+                path = batch_dir / f"rollout{index:03d}.txt"
+                raw = self.tokenizer.decode(
+                    token_ids, skip_special_tokens=False, clean_up_tokenization_spaces=False)
+                _atomic_write_text(path, raw, errors="replace")
+                save_rollout_token_ids(path.with_suffix(".tokens.zlib"), token_ids)
                 end = len(token_ids)
                 while end and token_ids[end - 1] in self._end_tokens:
                     end -= 1
                 text = native_final_answer_scope(self.tokenizer, token_ids[:end], require_final=True)
-            advantages, issue = parse_advantages(text, ids)
-            if issue is None:
-                issue = constraint_issue(advantages, nodes, higher_is_better)
-            if issue is None:
-                return advantages, {"attempts": attempt}
-            if completion is not None and completion.finish_reason == "length":
-                issue += " (context window exhausted)"
-            print(f"[llm-critic] rejected attempt {attempt}: {issue}; retrying", flush=True)
+                advantages, issue = parse_advantages(text, ids)
+                if issue is None:
+                    issue = constraint_issue(advantages, nodes, higher_is_better)
+                if issue is None:
+                    valid[index] = advantages
+                verdicts[index] = {"rollout": index, "tokens": len(token_ids), "error": issue}
+                print(f"[llm-critic] batch {batch_number}, rollout {index:03d}: {issue or 'valid'}", flush=True)
+            if len(verdicts) != CRITIC_RESPONSES:
+                raise RuntimeError(f"critic batch returned {len(verdicts)} of {CRITIC_RESPONSES} replies")
+            attempts += CRITIC_RESPONSES
+            selected = min(valid, default=None)
+            save_batch(batch_dir / "validation.json", {
+                "selected_rollout": selected, "rollouts": [verdicts[index] for index in range(CRITIC_RESPONSES)],
+            })
+            if selected is not None:
+                return valid[selected], {"attempts": attempts, "selected_batch": batch_number,
+                                         "selected_rollout": selected}
+            print(f"[llm-critic] batch {batch_number}: all replies rejected; retrying", flush=True)
 
-    def score(self, tree, sota, higher_is_better=True, to_score=None, include_history=True):
-        prompt, nodes, ids = prepare_prompt(
-            self.tokenizer, tree, sota, higher_is_better, to_score=to_score, include_history=include_history)
-        return self.score_prompt(prompt, nodes, ids, higher_is_better)
 
-
-def _score_saved_step(path, engine_options):
-    from generation.gen_workers import (
-        _prepare_flashinfer_comm_compat, _shutdown_vllm_engine, _start_vllm_parent_watchdog,
-    )
+def _score_saved_step(path, pool_options):
+    from generation.gen_workers import _start_vllm_parent_watchdog
+    from transformers import AutoTokenizer
 
     _start_vllm_parent_watchdog(int(os.environ["TTT_CRITIC_PARENT_PID"]))
     batch = json.loads(path.read_text(encoding="utf-8"))
-    tree = load_tree(path, batch)
+    tree = load_tree(path.parents[2], batch)
     higher_is_better = batch["higher_is_better"]
-    os.environ.setdefault("VLLM_USE_FLASHINFER_SAMPLER", "0")
-    _prepare_flashinfer_comm_compat()
-    critic = AdvantageCritic(**engine_options)
+    tokenizer = AutoTokenizer.from_pretrained(pool_options["model_name"], trust_remote_code=True)
+    prompt, nodes, ids = prepare_prompt(tokenizer, tree, batch["sota"], higher_is_better)
+    prompt_path = path.with_name("prompt.txt")
+    if prompt_path.is_file():
+        prompt = prompt_path.read_text(encoding="utf-8")
+    else:
+        _atomic_write_text(prompt_path, prompt)
+
+    pool = GenerationPool(**pool_options)
     try:
-        prompt, nodes, ids = prepare_prompt(critic.tokenizer, tree, batch["sota"], higher_is_better)
-        print(f"[llm-critic] ready to score {len(ids)} rollouts with {len(prompt)} prompt tokens", flush=True)
-        seed = batch.get("seed")
-        if seed is not None:
-            seed = seed * 1_000_003 + batch["step"] * 1009
-        advantages, info = critic.score_prompt(prompt, nodes, ids, higher_is_better, seed=seed)
+        critic = AdvantageCritic(pool, tokenizer)
+        print(f"[llm-critic] ready to score {len(ids)} rollouts with "
+              f"{len(tokenizer.encode(prompt))} prompt tokens", flush=True)
+        advantages, info = critic.score_prompt(prompt, nodes, ids, higher_is_better, path.parent)
         batch.update(advantages=advantages, **info)
         save_batch(path, batch)
-        print(f"[llm-critic] accepted attempt {info['attempts']}; releasing the critic GPU memory", flush=True)
+        print(f"[llm-critic] selected batch {info['selected_batch']}, rollout {info['selected_rollout']:03d}; "
+              "releasing both workers", flush=True)
     finally:
-        _shutdown_vllm_engine(critic.llm, None)
+        pool.shutdown()
 
 
 # ---------------------------------------------------------------------------
@@ -492,7 +507,4 @@ if __name__ == "__main__":
         print(json.dumps(payload, indent=1))
         sys.exit(0)
 
-    critic = AdvantageCritic(model="openai/gpt-oss-120b", gpu_memory_utilization=0.90)
-    adv, info = critic.score(demo_tree, sota=0.80, higher_is_better=True)
-    print("advantages:", adv)
-    print("attempts:", info["attempts"])
+    sys.exit("Use sh run.sh --advantage-mode llm-critic, or pass --dry-run to inspect the demo payload.")

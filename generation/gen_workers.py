@@ -794,6 +794,19 @@ def gpt_oss_coder_engine_options(total_rollouts, *, use_cuda_graphs=False):
     return options
 
 
+def rollout_engine_options(cfg):
+    return dict(
+        vllm_gpu_memory_utilization=float(cfg.vllm_gpu_memory_utilization),
+        vllm_enforce_eager=cfg.vllm_enforce_eager,
+        vllm_enable_prefix_caching=cfg.vllm_enable_prefix_caching,
+        vllm_quantization=cfg.vllm_quantization,
+        vllm_max_num_batched_tokens=cfg.vllm_max_num_batched_tokens,
+        vllm_enable_expert_parallel=cfg.vllm_enable_expert_parallel,
+        vllm_runtime_reserve_gib=float(cfg.vllm_runtime_reserve_gib),
+        hardware_profile=cfg.hardware_profile,
+    )
+
+
 def _vllm_engine_kwargs(model_name, max_seq_length, load_in_4bit,
                         lora_rank, gpu_memory_utilization,
                         enforce_eager=False, enable_prefix_caching=True,

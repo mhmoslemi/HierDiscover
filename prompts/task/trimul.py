@@ -1,7 +1,7 @@
 """Upstream TTT-Discover task for trimul."""
 
 
-TARGET = 500
+TARGET = 1000
 
 
 TASK_PROMPT = """{description}

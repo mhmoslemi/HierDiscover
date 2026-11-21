@@ -715,6 +715,11 @@ def load_config():
         _isolated_evaluation_cpu_ids()
     training_gpu_id = roles.training
     gpu_ids = roles.generation
+    if advantage_mode == LLM_CRITIC_MODE:
+        from training.critic_step import CRITIC_WORKERS
+
+        if len(gpu_ids) < CRITIC_WORKERS:
+            raise ValueError(f"llm-critic requires {CRITIC_WORKERS} rollout GPUs, one per worker")
     # Training and rollout phases alternate residency, so every rollout card
     # can also hold a shard of the trainable model. In gpu_mode the exclusive
     # evaluation card is absent from roles.generation and remains untouched.

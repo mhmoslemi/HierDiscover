@@ -1,8 +1,8 @@
 """Durable evaluated batches and the GPU handoff for LLM credit assignment."""
 
-from contextlib import nullcontext
 import json
 import math
+import multiprocessing
 import os
 from pathlib import Path
 import subprocess
@@ -13,6 +13,8 @@ from experiment_io import _atomic_write_text
 
 CRITIC_MODEL = "openai/gpt-oss-120b"
 CRITIC_CONTEXT = 131_072
+CRITIC_WORKERS = 2
+CRITIC_RESPONSES = 8
 
 
 def rollout_id(step, group, rollout):
@@ -42,7 +44,7 @@ def step_context(problem, seeds, adapter_path):
 
 
 def batch_path(root, step):
-    return Path(root) / f"step{step:02d}" / "critic.json"
+    return Path(root) / "critic" / f"step{step:02d}" / "critic.json"
 
 
 def save_batch(path, batch):
@@ -52,7 +54,9 @@ def save_batch(path, batch):
 def load_batch(root, step):
     path = batch_path(root, step)
     if not path.is_file():
-        return None
+        path = Path(root) / f"step{step:02d}" / "critic.json"
+        if not path.is_file():
+            return None
     batch = json.loads(path.read_text(encoding="utf-8"))
     if batch["step"] != step:
         raise ValueError(f"critic batch step differs from {path}")
@@ -68,8 +72,7 @@ def prepare_batch(root, step, context, rows):
         raise ValueError(f"evaluated rollouts changed for the saved critic batch at step {step}")
 
 
-def load_tree(path, batch):
-    root = Path(path).parent.parent
+def load_tree(root, batch):
     step = batch["step"]
     tree = list(batch["seeds"])
     for previous_step in range(step):
@@ -82,69 +85,72 @@ def load_tree(path, batch):
 
 
 def score_batch(root, step, cfg, host_admission=None):
-    """Start one transient critic after its GPUs have been released."""
+    """Score an evaluated batch on two ordinary rollout workers."""
     from generation.gen_workers import (
-        VLLM_WRAPPER_SHUTDOWN_TIMEOUT_S, _cap_vllm_utilization_for_gpus,
-        _terminate_vllm_process_group, _vllm_engine_kwargs,
+        _terminate_vllm_process_group, gpt_oss_coder_engine_options, rollout_engine_options,
     )
-    from runtime.gpu_runtime import (
-        allocate_gpu_roles, derive_vllm_parallel_layout, known_attention_heads,
-        parse_gpu_ids, query_gpu_memory,
-    )
+    from runtime.gpu_runtime import _estimated_weight_gib, parse_gpu_ids
     from runtime.hardware_profiles import local_checkpoint
+    from runtime.host_memory import GIB, HostMemoryAdmission
 
+    path = batch_path(root, step).resolve()
     batch = load_batch(root, step)
+    if batch is None:
+        raise FileNotFoundError(path)
     if "advantages" in batch:
         return batch
+    if not path.is_file():
+        save_batch(path, batch)
 
     model = (cfg.coder_model_name if Path(cfg.coder_model_name).name.lower() == "gpt-oss-120b"
              else local_checkpoint(CRITIC_MODEL, cfg.hardware_profile))
-    available = parse_gpu_ids(cfg.gpu_ids)
-    roles = allocate_gpu_roles(available, "critic")
-    memory = query_gpu_memory()
-    layout = derive_vllm_parallel_layout(
-        {"max_seq_length": CRITIC_CONTEXT, "vllm_gpu_memory_utilization": 0.96,
-         "vllm_runtime_reserve_gib": 5.0, "hardware_profile": cfg.hardware_profile},
-        roles, memory, known_attention_heads(model), model_name=model)
-    tp, pp = layout.tensor_parallel_size, layout.pipeline_parallel_size
-    gpu_ids = available[:tp * pp]
-    utilization = _cap_vllm_utilization_for_gpus(
-        0.96, gpu_ids, reserve_gib=5.0, reserve_from_free=True)
-    options = _vllm_engine_kwargs(
-        model_name=model, max_seq_length=CRITIC_CONTEXT, load_in_4bit=False, lora_rank=1,
-        gpu_memory_utilization=utilization, enforce_eager=True, max_num_seqs=1,
-        tensor_parallel_size=tp, pipeline_parallel_size=pp, max_num_batched_tokens=4096,
-        engine_options={"enable_lora": False, "moe_backend": "marlin", "generation_config": "vllm"},
-        hardware_profile=cfg.hardware_profile)
+    gpu_ids = parse_gpu_ids(cfg.gpu_ids)[:CRITIC_WORKERS]
+    if len(gpu_ids) != CRITIC_WORKERS:
+        raise ValueError(f"llm-critic requires {CRITIC_WORKERS} rollout GPUs, one per worker")
+    log_path = path.parent.parent / "critic.log"
+    seed = batch.get("seed")
+    if seed is not None:
+        seed = (seed * 1_000_003 + step * 1009) % (2**31 - 1)
+    per_worker = CRITIC_RESPONSES // CRITIC_WORKERS
+    b200 = cfg.hardware_profile == "B200_full_ram"
+    options = rollout_engine_options(cfg)
+    options.update(
+        model_name=model, backend="vllm", max_seq_length=CRITIC_CONTEXT,
+        seed=seed, num_workers=CRITIC_WORKERS, gpu_ids=gpu_ids, gen_micro_batch=per_worker,
+        vllm_tensor_parallel_size=1, vllm_pipeline_parallel_size=1, vllm_staged_loading=False,
+        vllm_base_policy_only=True, vllm_log_path=str(log_path),
+        vllm_engine_options=gpt_oss_coder_engine_options(per_worker, use_cuda_graphs=b200),
+    )
+    if model != cfg.coder_model_name:
+        options["vllm_quantization"] = None
     script = Path(__file__).resolve().parents[1] / "llm-critic.py"
-    path = batch_path(root, step).resolve()
     env = dict(os.environ, CUDA_VISIBLE_DEVICES=",".join(map(str, gpu_ids)),
                TTT_CRITIC_PARENT_PID=str(os.getpid()))
     env.setdefault("CUDA_DEVICE_ORDER", "PCI_BUS_ID")
-    reservation = (nullcontext() if host_admission is None else host_admission.reservation(
-        int(4 * len(gpu_ids) * 2**30 * 1.05), stage="critic worker initialization", priority=True))
-    print(f"[step {step}] launching one GPT-OSS critic on GPUs {gpu_ids} (TP={tp}, PP={pp})", flush=True)
-    with reservation:
+    if host_admission is None:
+        host_admission = HostMemoryAdmission(multiprocessing.get_context("spawn"),
+                                             hardware_profile=cfg.hardware_profile)
+    staging_bytes = int(4 * CRITIC_WORKERS * GIB * 1.05)
+    if b200:
+        staging_bytes += int(CRITIC_WORKERS * _estimated_weight_gib(model, "auto") * GIB)
+    reservation = host_admission.reservation(
+        staging_bytes, stage="parallel critic loading", priority=True, wait_for_external=False)
+    print(f"[step {step}] critic: {CRITIC_WORKERS} workers on GPUs {gpu_ids}, "
+          f"{CRITIC_RESPONSES} replies per batch. Log: {log_path}", flush=True)
+    with reservation, log_path.open("a", encoding="utf-8", buffering=1) as log:
+        log.write(f"\n=== critic step {step}, GPUs {gpu_ids}, {model} ===\n")
         worker = subprocess.Popen(
             [sys.executable, str(script), "--score-step", str(path), json.dumps(options)],
-            env=env, start_new_session=True)
+            env=env, start_new_session=True, stdout=log, stderr=subprocess.STDOUT)
         try:
-            while worker.poll() is None:
-                try:
-                    worker.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    if "advantages" not in load_batch(root, step):
-                        continue
-                    try:
-                        worker.wait(timeout=VLLM_WRAPPER_SHUTDOWN_TIMEOUT_S)
-                    except subprocess.TimeoutExpired:
-                        print("[llm-critic] reaping the worker after its shutdown deadline", flush=True)
-                    break
+            returncode = worker.wait()
         finally:
             _terminate_vllm_process_group(worker.pid)
             if worker.poll() is None:
                 worker.wait(timeout=5)
     batch = load_batch(root, step)
-    if "advantages" not in batch:
-        raise RuntimeError(f"critic worker exited with status {worker.returncode} without accepting step {step}")
+    if returncode or batch is None or "advantages" not in batch:
+        raise RuntimeError(f"critic step {step} failed (exit {returncode}); see {log_path}")
+    print(f"[step {step}] critic accepted batch {batch['selected_batch']}, "
+          f"rollout {batch['selected_rollout']:03d}, after {batch['attempts']} replies", flush=True)
     return batch
