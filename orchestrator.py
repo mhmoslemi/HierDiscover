@@ -36,6 +36,7 @@ from diagnostics.console import (
     _TimestampedLineStream as _TimestampedLineStream, _install_console_timestamps, _install_terminal_log,
     _route_dependency_notices, bind_setting_log, setting_log_only,
 )
+from diagnostics.evaluation_progress import CpuEvaluationProgress, write_progress_line
 from models.coder_profiles import (
     _coder_model_profile as _coder_model_profile,
     _coder_vllm_persistent_workers, _model_basename as _model_basename,
@@ -1035,6 +1036,8 @@ def _finalize_pending_spo_rs_artifacts(
         for parent in parents
     ]
 
+    cpu_eval_progress = (CpuEvaluationProgress(step_idx, len(artifacts))
+                         if cfg.evaluation_gpu_id is None else None)
     isolated_eval = bool(getattr(cfg, "isolate_eval", False))
     isolated_slots = None
     isolated_memory_limit = None
@@ -1055,7 +1058,7 @@ def _finalize_pending_spo_rs_artifacts(
     host_admission = (getattr(gen_pool, "host_memory_admission", None)
                       or HostMemoryAdmission(multiprocessing.get_context("spawn"), hardware_profile=getattr(cfg, "hardware_profile", "RTX6000")))
 
-    def evaluate(item):
+    def evaluate(item, *, on_sandbox_deadline=None):
         meta = item["meta"]
         response_text = item["response_path"].read_text(encoding="utf-8", errors="replace")
         final_text = native_final_answer_scope(
@@ -1066,6 +1069,8 @@ def _finalize_pending_spo_rs_artifacts(
         if issue:
             return RewardResult(reward=float(problem.fail_score), msg=str(issue), failure_kind="code")
         answer_options = {} if final_text is None else {"final_answer_text": final_text}
+        if on_sandbox_deadline is not None:
+            answer_options["on_sandbox_deadline"] = on_sandbox_deadline
         parent_context = parent_contexts[int(meta["parent_group"])]
         if not isolated_eval:
             return problem.compute_reward(response_text, parent_context, cfg.sandbox_timeout_s, **answer_options)
@@ -1089,24 +1094,23 @@ def _finalize_pending_spo_rs_artifacts(
     def evaluation_completed(future):
         nonlocal eval_bar, live_best_raw
         with eval_progress_lock:
-            if eval_bar is None:
-                eval_bar = make_progress_bar(len(artifacts), desc="recovering evaluations", initial=1)
-            else:
+            if eval_bar is not None:
                 eval_bar.update(1)
+            elif cpu_eval_progress is None:
+                eval_bar = make_progress_bar(len(artifacts), desc="recovering evaluations", initial=1)
             if not future.cancelled() and future.exception() is None:
                 live_best_raw, best_line = _advance_live_best_raw(future.result(), live_best_raw, problem)
                 if best_line:
-                    writer = getattr(eval_bar, "write", None)
-                    if callable(writer):
-                        writer(f"[step {step_idx}] {best_line}")
-                    else:
-                        print(f"[step {step_idx}] {best_line}", flush=True)
+                    write_progress_line(f"[step {step_idx}] {best_line}")
 
     results = [None] * len(artifacts)
     try:
         evaluation_futures = {}
         for index, item in enumerate(artifacts):
-            future = evaluation_pool.submit(evaluate, item)
+            if cpu_eval_progress is None:
+                future = evaluation_pool.submit(evaluate, item)
+            else:
+                future = cpu_eval_progress.submit(evaluation_pool, evaluate, item)
             evaluation_futures[future] = index
             future.add_done_callback(evaluation_completed)
 
@@ -1184,6 +1188,8 @@ def _finalize_pending_spo_rs_artifacts(
             item["meta"] = evaluated_meta
     finally:
         evaluation_pool.shutdown(wait=True, cancel_futures=False)
+        if cpu_eval_progress is not None:
+            cpu_eval_progress.close()
         if eval_bar is not None:
             eval_bar.close()
 
@@ -1828,7 +1834,7 @@ def _automatic_sandbox_memory_limit_bytes(concurrent_sandboxes: int) -> int:
 
 
 def _open_reward_pool(cfg, problem, rollout_count, step_idx, gen_pool,
-                      parallel_trainer):
+                      parallel_trainer, *, cpu_eval_progress=None):
     from concurrent.futures import Future, ThreadPoolExecutor
     from queue import Queue
     from problems.base import RewardResult
@@ -1876,7 +1882,9 @@ def _open_reward_pool(cfg, problem, rollout_count, step_idx, gen_pool,
                          f"{getattr(problem, 'eval_cpus', 1)} CPU(s) per candidate")
     reward_pool = ThreadPoolExecutor(max_workers=n_reward_workers)
 
-    def run_isolated(text, parent_ctx, **answer_options):
+    def evaluate(text, parent_ctx, **answer_options):
+        if not isolated_eval:
+            return problem.compute_reward(text, parent_ctx, cfg.sandbox_timeout_s, **answer_options)
         with host_admission.reservation(min(1024**3, isolated_memory_limit_bytes)):
             cpu_id = isolated_cpu_slots.get()
             try:
@@ -1891,12 +1899,13 @@ def _open_reward_pool(cfg, problem, rollout_count, step_idx, gen_pool,
             future = Future()
             future.set_result(RewardResult(
                 reward=float(problem.fail_score), msg=format_issue, failure_kind="code"))
+            if cpu_eval_progress is not None:
+                cpu_eval_progress.complete_without_worker()
             return future
         answer_options = {} if final_text is None else {"final_answer_text": final_text}
-        if isolated_eval:
-            return reward_pool.submit(run_isolated, text, parent_ctx, **answer_options)
-        return reward_pool.submit(
-            problem.compute_reward, text, parent_ctx, cfg.sandbox_timeout_s, **answer_options)
+        if cpu_eval_progress is not None:
+            return cpu_eval_progress.submit(reward_pool, evaluate, text, parent_ctx, **answer_options)
+        return reward_pool.submit(evaluate, text, parent_ctx, **answer_options)
 
     return reward_pool, submit, {
         "evaluation_isolated": isolated_eval,
@@ -2185,8 +2194,11 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
     # parallel across cores. THREAD-SAFETY REQUIREMENT: each compute_reward call
     # must use a unique temp file/dir and must not os.chdir or mutate shared
     # state; otherwise concurrent runs corrupt each other's rewards.
+    cpu_eval_progress = (CpuEvaluationProgress(step_idx, total_rollouts)
+                         if cfg.evaluation_gpu_id is None else None)
     reward_pool, submit_reward, evaluation_stats = _open_reward_pool(
-        cfg, problem, total_rollouts, step_idx, gen_pool, parallel_trainer)
+        cfg, problem, total_rollouts, step_idx, gen_pool, parallel_trainer,
+        cpu_eval_progress=cpu_eval_progress)
     # Large response/prompt files are persisted as soon as generation returns,
     # on a dedicated thread so disk I/O never blocks the generation scheduler.
     # The complete reward/advantage metadata replaces the provisional metadata
@@ -2194,7 +2206,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
     rollout_io_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix=f"rollout-save-step{step_idx}")
     rollout_io_futures = []
 
-    # Show the first completed evaluation instead of drawing an empty bar.
+    # GPU evaluation shows a bar once a result arrives. CPU jobs report activity independently.
     eval_bar = None
     eval_progress_condition = threading.Condition()
     eval_progress_completed = 0
@@ -2228,17 +2240,13 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
             try:
                 if eval_bar is not None:
                     eval_bar.update(1)
-                elif record is not None:
+                elif cpu_eval_progress is None and record is not None:
                     eval_bar = make_progress_bar(
                         total_rollouts, desc="evaluating", initial=eval_progress_completed)
             finally:
                 eval_progress_condition.notify_all()
             if best_line:
-                writer = getattr(eval_bar, "write", None)
-                if callable(writer):
-                    writer(f"[step {step_idx}] {best_line}")
-                else:
-                    print(f"[step {step_idx}] {best_line}", flush=True)
+                write_progress_line(f"[step {step_idx}] {best_line}")
 
     # Mutable records preserve streamed arrival order while vLLM reference
     # scoring fills its result concurrently with the CPU reward futures.
@@ -2841,6 +2849,8 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                 eval_bar_closed = True
     finally:
         reward_pool.shutdown(wait=True)
+        if cpu_eval_progress is not None:
+            cpu_eval_progress.close()
         rollout_io_pool.shutdown(wait=True)
         if eval_bar is not None and not eval_bar_closed:
             eval_bar.close()

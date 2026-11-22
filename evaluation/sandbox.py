@@ -19,6 +19,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 
 
 # Generated programs are untrusted with respect to output volume.  A single
@@ -209,10 +210,13 @@ def _kill_tree(proc, pgid, hard=False):
 
 
 def run_code(code: str, entrypoint: str, timeout_s: float, max_cpus: int = 1,
-             *, cpu_id=None, memory_limit_bytes=None):
+             *, cpu_id=None, memory_limit_bytes=None, on_sandbox_deadline=None):
     """
     Execute `code` (Python source) in a subprocess. Calls `entrypoint()`
     and returns whatever it returns.
+
+    The optional callback receives the monotonic timeout deadline when the
+    process launches and None when the sandbox has exited or been stopped.
 
     Returns a dict:
       {"ok": True,  "value": <return value>, "stdout": "..."}
@@ -304,9 +308,14 @@ def run_code(code: str, entrypoint: str, timeout_s: float, max_cpus: int = 1,
         except Exception:
             pgid = None
 
+        deadline = None
+        if on_sandbox_deadline is not None:
+            deadline = time.monotonic() + timeout_s
+            on_sandbox_deadline(deadline)
         timed_out = False
         try:
-            proc.wait(timeout=timeout_s)
+            wait_timeout = timeout_s if deadline is None else max(0, deadline - time.monotonic())
+            proc.wait(timeout=wait_timeout)
         except subprocess.TimeoutExpired:
             timed_out = True
             _kill_tree(proc, pgid, hard=False)
@@ -318,6 +327,9 @@ def run_code(code: str, entrypoint: str, timeout_s: float, max_cpus: int = 1,
                     proc.wait(timeout=1.0)
                 except subprocess.TimeoutExpired:
                     pass
+        finally:
+            if on_sandbox_deadline is not None:
+                on_sandbox_deadline(None)
 
         # Belt-and-suspenders: make sure no descendant outlives evaluation.
         _kill_tree(proc, pgid, hard=True)

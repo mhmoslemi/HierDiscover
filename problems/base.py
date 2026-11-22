@@ -146,7 +146,8 @@ class Problem(ABC):
     def compute_reward(self, response_text: str, parent: ParentContext,
                        timeout_s: float, *, cpu_id: Optional[int] = None,
                        memory_limit_bytes: Optional[int] = None,
-                       final_answer_text: Optional[str] = None
+                       final_answer_text: Optional[str] = None,
+                       on_sandbox_deadline=None,
                        ) -> RewardResult:
         res = RewardResult(reward=self.fail_score)
         code = extract_python_code(
@@ -168,6 +169,7 @@ class Problem(ABC):
             max_cpus=(1 if cpu_id is not None else self.eval_cpus),
             cpu_id=cpu_id,
             memory_limit_bytes=memory_limit_bytes,
+            on_sandbox_deadline=on_sandbox_deadline,
         )
         diagnostics = [out.get("stdout", ""), out.get("traceback", ""),
                        out.get("stderr", "")]
