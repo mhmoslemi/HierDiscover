@@ -1,0 +1,1165 @@
+analysisWe need to provide a final answer: a Python code block containing the implementation of the custom kernel, with Triton kernels as needed, with optimizations perhaps to achieve runtime less than 500us for test shapes. The given code already implements a fairly optimized version. But the problem is to iterate further, but we as ChatGPT need to propose an improved implementation. However, it might be enough to provide the same code with some optimizations: better block sizes, reduce number of kernel launches perhaps.
+
+Goal: produce code that works correctly and performs well.
+
+We need to implement the "outgoing" TriMul operator with forward only.
+
+Constraints: The code should compile and run with Triton version 3.3.1 on H100.
+
+We can incorporate the following improvements:
+
+- Merge Row-wise stats and final output kernel: we can compute normalization and final projection in one kernel to reduce memory traffic: Instead of separate rowwise_stats_kernel, we can compute mu/rstd on the fly within final_output_kernel. However, the current kernels compute lightweight rowwise stats in float32 then use in final kernel: Might be okay.
+
+But we can think of merging steps 5 and 6: final_output_kernel can compute per-row mean and variance on the fly, but we need to compute them from out (the result of batched GEMM) and also apply normalization with gate, then final projection. However, computing mean and variance while also doing dot product with final projection weights is tricky because we need the normalized values for each hidden dimension. But we could compute mu/rstd first and then compute new kernel that loads mu and rstd from memory, but we can reduce memory load again.
+
+Maybe we can avoid storing out and out_gate from memory by directly computing final projection in the GEMM of left-right, but that seems complicated.
+
+Alternatively, we can reduce number of memory reads/writes: combine left/right/out_gate compute and mask in one kernel reading x_norm and weights to produce left/right/out_gate directly, eliminating fused projection intermediate. However, we are allowed to use torch.nn.functional.linear which uses cuBLAS but may be heavy. But grouping them into a single GEMM for all 5 projections is beneficial as already done. Could we also fuse the final projection into a single GEMM using the out after left-right contraction? That would be large; out shape B*H*N*N and final projection weight H x dim; we need to multiply each hidden dim vector (size H) by weight to get dim output. That is like a 2D matrix multiplication: we have out shape (R, H) and weight shape (H, dim) => produce (R, dim). However, we need to incorporate the second LN (to_out_norm) and out_gate before final weight. Actually the pipeline: out (B,H,N,N) after core einsum, then LN over hidden dimension (dim H), then multiply by out_gate (same shape), then linear to dim. The out_gate is per hidden, and LN is also per hidden. So final step: result = (norm(out)*(out_gate)) * to_out.T (H x dim). So we can compute this using a matrix multiplication of shape (R, H) x (H, dim) => (R, dim). So after LN and gate multiplication, we can fuse them before GEMM. So we can avoid looping over dim chunk in final_output_kernel. We can compute the normalized out and gated result and then compute GEMM using torch.bmm or torch matmul by flattening dims.
+
+Specifically:
+
+- after computing out (B*H,N,N), we can reshape out to (R, H). The out_gate also (R, H). Then compute LN: for each row r: normalized = (out[r] - mu[r]) * rstd[r] * gamma + beta. Where gamma, beta size H. Then multiply by out_gate: gated = normalized * out_gate[r]. Then final projection: final[r] = gated @ w_out_T (size dim). So we can implement a kernel to compute normalized * out_gate and then BLAS matmul. But we also need to compute mu/rstd: we can compute them with a rowwise reduction kernel, storing in array of shape (R). That's same as before; we could reuse.
+
+But we could fuse LN and gating into a kernel that writes out_gated_buffer (R, H) FP16. Then do GEMM: (R,H) x (H,dim) => (R,dim) via torch.nn.functional.linear (or torch.matmul). This would reduce kernel count from final_output_kernel (with dot loops) to just one kernel for LN+gate. That may improve performance.
+
+Thus pipeline:
+
+1. LN on input x (R, dim) -> fp16 x_norm (done already).
+2. fused linear to compute left * mask, right * mask, left_gate, right_gate, out_gate (5*H). This is already fused. But we can also incorporate mask multiplication in fused kernel: we had split_fuse_gate_kernel that applies mask and gates. That's okay.
+
+3. Compute left/right/out_gate as separate FP16 tensors.
+
+4. Compute out = bmm(left_mat, right_mat^T) -> (B*H,N,N). Already done.
+
+5. Compute rowwise mean & rstd for out (R, H) (R = B*N*N). That remains.
+
+6. Apply LN and gate: produce gated_out (R, H) = ((out - mu) * rstd * ln_w + ln_b) * out_gate.
+
+But note: LN has gamma and beta also per hidden dimension (size H). In the code given, they have to_out_norm.weight and bias with shape hidden_dim (H). So we need to apply them.
+
+Thus we need a kernel that loads for each row r (size H) the out[r,k] values, as well as mu[r], rstd[r], out_gate[r,k], gamma[k], beta[k], compute: ((out_val - mu) * rstd) * gamma + beta => then multiply by out_gate => store into buffer named gated_out (R, H) as fp16. Use FP32 for the arithmetic to preserve precision. The shape (R, H) with H max 128, R up to B*N*N with N=1024 -> up to 1*1024*1024 = about 1,048,576 rows, each of size 128 => ~128M elements. That's large but okay.
+
+Then final projection: linear (R, H) to (R, dim). Use torch.nn.functional.linear for efficiency (cuBLAS). That will use fp16 input (or fp32). We need to feed gated_out FP16 and weight FP16, produce output FP16 maybe. Then cast to float32.
+
+Implementation details:
+
+- We'll allocate gated_out as torch.empty(R, H, dtype=torch.float16, device=device). Kernel to compute LN+gate. Use BLOCK_R = 128 rows maybe, BLOCK_H = 64? Actually we need to tile over H dimension too. Each program may process a tile of rows (R) and a tile of hidden dims (H). Perfect.
+
+Design LN+gate kernel:
+
+```
+@triton.jit
+def ln_gate_kernel(
+    out_ptr,      # [R, H] FP16 (output of bmm)
+    gate_ptr,     # [R, H] FP16 (out_gate)
+    mu_ptr,       # [R] FP32
+    rstd_ptr,     # [R] FP32
+    ln_w_ptr,     # [H] FP32
+    ln_b_ptr,     # [H] FP32
+    out_gated_ptr, # [R, H] FP16 result
+    R, H,
+    BLOCK_R: tl.constexpr, BLOCK_H: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    row_start = pid * BLOCK_R
+    offs_r = row_start + tl.arange(0, BLOCK_R)
+    mask_r = offs_r < R
+
+    # tile hidden
+    # we can loop over hidden dimension in chunks
+    for h_start in range(0, H, BLOCK_H):
+        offs_h = h_start + tl.arange(0, BLOCK_H)
+        mask_h = offs_h < H
+
+        # load out values
+        out_val = tl.load(out_ptr + offs_r[:, None] * H + offs_h[None, :],
+                          mask=mask_r[:, None] & mask_h[None, :],
+                          other=0.0).to(tl.float32)
+        gate_val = tl.load(gate_ptr + offs_r[:, None] * H + offs_h[None, :],
+                           mask=mask_r[:, None] & mask_h[None, :],
+                           other=0.0).to(tl.float32)
+        mu = tl.load(mu_ptr + offs_r, mask=mask_r, other=0.0)[:, None]  # [BLOCK_R, 1]
+        rstd = tl.load(rstd_ptr + offs_r, mask=mask_r, other=0.0)[:, None]
+
+        gamma = tl.load(ln_w_ptr + offs_h, mask=mask_h, other=0.0)[None, :] # [1, BLOCK_H]
+        beta  = tl.load(ln_b_ptr + offs_h, mask=mask_h, other=0.0)[None, :]
+
+        # Normalize
+        norm = (out_val - mu) * rstd   # [BLOCK_R, BLOCK_H]
+        norm = norm * gamma + beta    # apply LN weight/bias
+        gated = norm * gate_val
+
+        # store as fp16
+        tl.store(out_gated_ptr + offs_r[:, None] * H + offs_h[None, :],
+                 gated.to(tl.float16),
+                 mask=mask_r[:, None] & mask_h[None, :])
+```
+
+But we also need to handle the case where we compute in-place or only store result.
+
+However, we need to note that for each r, we have a row of H hidden dims, mu and rstd are scalars for that row, same for each hidden dimension. So we can broadcast as shown.
+
+Thus we need kernel grid: number of rows / BLOCK_R.
+
+Potential performance: each thread block loads out and gate values for multiple rows and hidden dims. This will be bandwidth bound but may be okay.
+
+Then final projection: gated_out (R, H) -> w_out_T (H, dim) => (R, dim) using torch.nn.functional.linear. The weight shape (H, dim) used as input_features=H, output_features=dim. We'll convert weight to fp16 and compute via torch.nn.functional.linear (or torch.matmul). This will use cuBLAS for batched GEMM between (R, H) and (H, dim). The input is fp16 and weight fp16, the output FP16. We'll then convert to float32.
+
+Thus we reduce the number of kernels: we still have 1 for input LN, 1 for fused projection split, 1 for rowwise stats, 1 for LN+gate, and the final linear for projection. Actually we also have the core einsum/fused left/right multiplication via torch.bmm (cuBLAS). That remains.
+
+Thus we have 5 kernel launches vs previous 6? Actually previous code had:
+
+- layernorm_kernel (input)
+- split_fuse_gate_kernel
+- rowwise_stats_kernel
+- final_output_kernel (which performed LN+gate+proj)
+Also need kernel for fused linear projection before split? That's using torch.nn.functional.linear.
+
+Thus we have 4 kernel launches now (plus gemms). The final_output_kernel previously used dot loops performing multi-kernel inside each thread block with multiple loads of w_out_T; this might be slower.
+
+Thus new implementation likely faster.
+
+We must adjust code accordingly.
+
+Potential issues: To compute out (i.e., left @ right^T), we need left and right shapes correct.
+
+In original code: left shape B, H, N, N; right shape B, H, N, N.
+
+Bmm on left_mat of shape (B*H,N,N) and right_mat.transpose(1,2) shape (B*H,N,N) yields shape (B*H,N,N). This is essentially computing sum over last dimension K (for each pair of rows i,j). That matches the einsum left[i,k] * right[j,k] (k over N). Actually left shape (B,H,N,N) and right shape (B,H,N,N). The einsum is: out[b,i,j,:] = sum_k left[b,i,k,:] * right[b,j,k,:]. In our case, hidden dimension is a channel dimension (d). But previously left and right dims are H hidden dimension. Wait: in reference code, left = self.left_proj(x): shape [B,N,N,H] (if hidden_dim=H) because x shape [B,N,N,C] and linear projects C->H. right same shape. left_gate etc shape [B,N,N,H]. The einsum '... i k d, ... j k d -> ... i j d' results in shape [B,N,N,H], summing over k dimension (size N). So left and right are 5D shaped (B,N,N,H). The contraction is over k (the second N). So the core product is basically for each hidden dim d (channel), do Bmm (N,N) where left[:,:,k,d], right[:,:,k,d], but thanks to broadcasting we can treat each channel and batch as independent.
+
+But left and right are shaped [B, H, N, N] after our transposition: we had left = torch.empty(B, H, N, N). How are these arranged? The split_fuse_gate_kernel wrote left & right with layout [B, H, N, N] based on indices b,i,k (i row, k column) but we need to check ordering.
+
+We need to confirm that left[i,k,d] in reference eq means left tensor shape [B,N,N,H]; index ordering: i along first N dimension (source node?), k along second N dimension (target?). In split_fuse_gate_kernel, they decode R = B * N * N elements flattened: each r corresponds to (b,i,k). Then they use base_offset = b * (H * N * N) + i * N + k. Then for each hidden h offset + hidden_stride (N*N). They store left, right, etc at offset = base_offset + h*hidden_stride. This yields layout where hidden dimension as leading? Actually hidden_stride = N*N, and they compute offset = base_offset + h*hidden_stride. So for a given (b,i,k) and hidden h, the address offset = b*(H*NN) + i*NN + k + h*NN. This corresponds to shape [B, H, N, N] with ordering such that the memory layout for torch is contiguous if we allocate tensor of shape (B, H, N, N). In PyTorch, default stride for a tensor (B, H, N, N) is (H*N*N, N*N, N, 1). So offset for indices (b,h,i,k) = b*H*N*N + h*N*N + i*N + k. In our kernel offset we used b*H*NN + i*NN + k + h*NN = b*H*NN + (i+h)*NN + k. But that's not the same pattern. Wait, careful:
+
+Given a tensor T shape (B, H, N, N). The offset formula: offset = b * stride_b + h * stride_h + i * stride_i + k * stride_k. Strides: stride_b = H * N * N; stride_h = N * N; stride_i = N; stride_k = 1. So offset = b*H*NN + h*NN + i*N + k.
+
+Our base_offset defined as b*(H*NN) + i*NN + k. Then we added `offs_h * hidden_stride` where hidden_stride = NN (N*N). So offset = b*H*NN + i*NN + k + h*NN = b*H*NN + (i+h)*NN + k. This is not correct: we incorrectly combined i*NN + h*NN. Should be i*N + k after h*NN.
+
+Thus the existing kernel's layout appears wrong? Let's examine the original code in the problem statement. It matches the layout of a 4D tensor flattened to (B, N, N, H) but they choose to store as (B, H, N, N). Let's examine the index mapping in split_fuse_gate_kernel:
+
+They decode the flat index r = b·N·N + i·N + k (since flatten over B,N,N). The mask applied to all hidden dims. base_offset = b * (H * hidden_stride) + i * N + k   # offset for h = 0
+
+Then inside loop over h, they store to left_ptr+dst_offset where dst_offset = base_offset[:, None] + offs_h[None,:] * hidden_stride.
+
+Given hidden_stride = N * N. So base_offset corresponds to the position of (b, h=0, i, k) because it's b*H*NN + i*N + k? No, because the stride for hidden dimension is NN, but they are storing at i*N + k (not i* N + k?). Wait hidden_stride = N * N. The offset for (b, h, i, k) according to shape (B, H, N, N) is b*H*NN + h*NN + i*N + k, where i*N is offset within the row dimension (N). But they have base_offset = b * (H * NN) + i * N + k. That's missing the factor of N? Actually i*N is consistent with stride_i = N? For shape (B, H, N, N) we have stride_i = N. That is correct because after the hidden dimension we have N x N matrix; each row i has N columns. So i*N + k gives the offset within the innermost N dimension after the hidden dimension. So base_offset = b*H*NN + i*N + k. Then when we add h*NN, we get b*H*NN + i*N + k + h*NN = b*H*NN + h*NN + i*N + k, which matches the proper offset. So base_offset is defined as the offset for given b,i,k but with h=0, then adding hidden offset.
+
+Thus the mapping is correct.
+
+Now, left/right/out_gate stored in shape (B, H, N, N) with contiguous memory ensuring the i*N + k offset after hidden dimension. So left[i,k] is a matrix slice across hidden dimension.
+
+Thus the bmm approach: left_mat = left.view(B*H,N,N). This view reorganizes memory such that hidden dimension is first within batch dimension but not within each row. Let's check: left shape (B, H, N, N) with stride for dimension H after B: stride_h = NN (N*N). Stride_i = N, stride_k = 1.
+
+When we view left as shape (B*H, N, N) by calling left.view(B*H,N,N), we are merging B and H dims. The memory layout for new shape: first dimension (B*H) uses stride = N*N (since previously hidden dimension stride is NN). So each sub-matrix (N,N) corresponds to a specific (b, h). The i*N + k ordering stays same. Good.
+
+Now left_mat @ right_mat.transpose(1,2) yields for each (b,h) a matrix of shape N,N: each out[b,h,i,j] = sum_k left[b,h,i,k] * right[b,h,j,k]. That's exactly the required einsum.
+
+Thus our pipeline matches.
+
+OK.
+
+Now we need to compute LN+gate over out shape (B, H, N, N). For each row (b,i,j) we need to compute mean across hidden dimension (H) across H. The rowwise stats computed in rowwise_stats_kernel treat out as shape [B,H,N,N] flattened to rows R = B*N*N with hidden dimension H. It uses hidden_stride = N*N to index hidden dims correctly: base_offset = b*(H*hidden_stride) + i*N + j. Then loops over hidden dimension offsets for each row.
+
+This matches.
+
+Thus we can keep rowwise_stats_kernel unchanged. Could merge LN+gate into final_output_kernel as earlier attempt, but we will instead implement a separate kernel as discussed. However we also have to incorporate to_out_norm weight and bias (gamma, beta). It's included.
+
+Thus new code:
+
+- custom_kernel function: same structure but replace final_output_kernel with new kernels: rowwise_stats (as before) then ln_gate_kernel. Then final linear projection via torch.nn.functional.linear.
+
+Potential improvements: We should also try to fuse rowwise_stats into ln_gate kernel to avoid storing mu/rstd. However, computing mean and variance for each row before normalization with LN is necessary. We could compute them on-the-fly inside ln_gate kernel by doing a two-pass reduction ironically inside same kernel: first pass accumulates sum and sumsq into registers, second pass produces normalized values. But that would increase compute per thread but reduce memory read/writes of mu/rstd. However, that would also increase complexity. But possibly the memory footprint of mu and rstd is moderate (4 bytes each per row). For R up to 1 million, that's 4MB each, fine.
+
+Important to note to compute LN+gate we need mu and rstd available. We'll keep rowwise_stats as an extra kernel.
+
+Now, in the split_fuse_gate_kernel we broadcast mask, do gate computations and store left, right, out_gate. That kernel uses reads from proj (R,5H). Might need to be tuned for coalescing. We can improve by using BLOCK_R = 128, BLOCK_H = 256? But H is max 128, so BLOCK_H=128.
+
+But also we can adjust to eliminate extra loads by using unroll loops.
+
+We need to recall that the test shapes include dim = 384 (i.e., "c_z"?). Input dim can be 384. Hidden dim always 128. So input dimension for left_proj is [dim, hidden_dim]? Actually left_proj weight shape [hidden_dim, dim] (since linear mapping from dim to hidden_dim). In PyTorch linear: output = x @ weight.T. So weight shape (hidden_dim, dim). That's okay.
+
+We need to compute fused_w = torch.cat([...], dim=0) -> shape (5*hidden_dim, dim) (so 5*H rows, dim columns). That matches the weight shape for linear.
+
+Thus fused linear yields (R,5H) output.
+
+Now, gating: left_gate = self.left_gate(x).sigmoid() yields shape [R, H]. Actually left_gate weight shape (H, dim), same as left_proj. So left_gate_raw is same shape as left_raw? In split_fuse_gate_kernel we compute left_gate_raw from fused projection (the third block). Then apply sigmoid.
+
+Potential improvements: compute sigmoid using approximate functions like tl.sigmoid? But there's no built-in, but we can compute with math functions.
+
+Potential improvement: we can fuse left and right gate normalization to reduce loads of projection and gates? But already done.
+
+Potential improvement: reduce memory stride by transposing projection output? Not needed.
+
+Now we need to think about whether final linear projection (gate-norm output) is using weighting to_out.norm? It uses to_out_norm (LayerNorm) weight (size hidden_dim). Then we multiply with out_gate (i.e., gating). Actually out_gate is applied after LN. But reference code multiplies normalized out * out_gate (elementwise across hidden dim), then final linear mapping from hidden_dim -> dim. Our pipeline exactly matches.
+
+Now the final linear for projection: we do torch.nn.functional.linear with gated_out and w_out_T (H, dim). Should we apply bias? There's no bias (bias=False). So it's just a matmul.
+
+Alternatively, we can move to torch.matmul(gated_out, w_out_T) where w_out_T is H x dim. Should be similar.
+
+We must ensure the dtype; w_out_T is FP16, gated_out FP16 produce FP16 result; final conversion to float32.
+
+Now memory usage: left/right/out_gate may be large, but fine.
+
+Potential gating: mask application: mask is bool or float: shape [B,N,N]. In split_fuse_gate_kernel we load mask value and multiply to left & right raw after mask. That replicates left = left_raw*mask*left_gate. Actually reference code does left = left * mask and left = left * left_gate, but mask broadcast across hidden dimension. This matches.
+
+Edge case: mask may be missing (nomask=True), or mask is none. We supply dummy mask of 1 values.
+
+Now shape dims: The code uses some constants like BLOCK_R, BLOCK_H etc.
+
+Potential improvements to runtime:
+
+- Use larger block sizes for layernorm: BLOCK_M=256, BLOCK_D=64.
+
+- Use torch.nn.functional.linear for projection of (R,5H) based on fused weight.
+
+- Use torch.bmm for left-right multiplication.
+
+- Use rowwise_stats kernel with BLOCK_M_STATS = 256, BLOCK_K_STATS = maybe 128.
+
+- Use LN+gate kernel: choose BLOCK_R = 256 (rows per thread block) and BLOCK_H = 64.
+
+- Use grid: triton.cdiv(R, BLOCK_R). Additional loops inside for hidden dimension.
+
+Potential improvements: Use fp32 accumulation for dot in LNs. Already using fp32 arithmetic for LN.
+
+Potential improvement: Use fewer warps per kernel: 4 warps may be enough for simple ops.
+
+Now, benchmark: Hard to know, but early runtime was 806 microseconds. Cutting down final kernel heavy loops may reduce to target 500. With my modifications we will reduce compute overhead of final_output_kernel which used loops over hidden dimension and dot products each iteration per tile; it may be slower. Using torch.nn.functional.linear for final projection likely faster, as cuBLAS can handle large matrix-matrix multiplication more efficiently.
+
+Thus final pipeline should improve runtime.
+
+Now we also need to include docstring.
+
+We'll produce final answer: a single python block containing imports, triton kernels, and custom_kernel function.
+
+We need to ensure that custom_kernel returns torch.float32 tensor.
+
+Note: In rowwise_stats_kernel current code reads out_ptr which is FP16 and computes sum and sum of squares in FP32 accumulators (tilde). That's fine.
+
+Now, implement LN+gate kernel as described.
+
+Potential bug: For each row, mu and rstd need to be broadcast to hidden dim. We must ensure correct broadcast shape for tl.load of mu/rstd. Use:
+
+mu = tl.load(mu_ptr + offs_r, mask=mask_r, other=0.0)  # shape [BLOCK_R]
+rstd = tl.load(... ) # shape [BLOCK_R]
+Then reshape to column vector: mu[:, None], rstd[:, None] for broadcasting.
+
+Implementation: 
+mu = tl.load(mu_ptr + offs_r, mask=mask_r, other=0.0)
+rstd = tl.load(rstd_ptr + offs_r, mask=mask_r, other=0.0)
+mu = mu[:, None]   # through tl.broadcast maybe? Use tl.expand_dims? In Triton, you can simply do mu[:, None] after converting to a shaped [BLOCK_R,1]? Actually mu is a vector of shape [BLOCK_R]; you can use mu[:, None] to broadcast? Not exactly. But we can define mu = mu[:, None]; or compute via broadcasting in later operations.
+
+But we can broadcast by using tl.reshape or "mu[:, None]" after we convert to a 2D shape using tl.broadcast like:
+
+mu = mu[:, None]
+rstd = rstd[:, None]
+
+Now out_val and gate_val shape is [BLOCK_R, BLOCK_H] after load.
+
+Now compute:
+
+norm = (out_val - mu) * rstd   # broadcast automatically
+norm = norm * gamma + beta   # gamma and beta shape [1,BLOCK_H] via broadcast.
+
+Alternatively, after loading gamma, we cast to tl.float32: gamma = tl.load(ln_w_ptr + offs_h, mask=mask_h, other=0.0)[None,:] . Actually load returns shape [BLOCK_H]; we then use broadcast via new axis.
+
+We need to be careful with tl's broadcasting rules. In Triton, broadcasting is like on torch; you can use tl.expand or simple broadcasting of shape mismatches with trailing dimensions. For instance, out_val is [BLOCK_R, BLOCK_H], mu is [BLOCK_R], rstd same: they broadcast across hidden dimension if we do out_val - mu etc. So likely fine.
+
+Similarly gamma: shape [BLOCK_H] broadcast to [BLOCK_R, BLOCK_H] in multiplication.
+
+Thus code should compile.
+
+Now final projection: we need to accelerate with torch.nn.functional.linear. Have w_out_T in shape [H, dim] FP16. We'll compute final = torch.nn.functional.linear(gated_out, w_out_T) => output shape (R, dim), dtype FP16? Actually torch.nn.functional.linear expects input (N, *, in_features) maybe? Actually we can use torch.nn.functional.linear(gated_out, w_out_T.t())? Wait torch.nn.functional.linear expects input (N, *, in_features) and weight shape (out_features, in_features). To compute output = input @ weight.T + bias. So we need weight shape (dim, H). We have w_out_T shape (H, dim). So we need to either transpose it to shape (dim, H) as weight. So we could get w_out = w_out_T.t().contiguous() shape (dim, H). Then call torch.nn.functional.linear(gated_out, w_out) => output shape (R, dim). Use bias=None.
+
+Thus code:
+
+```
+w_out = w["to_out.weight"].to(torch.float16)  # shape [dim, H]
+final_fp16 = torch.nn.functional.linear(gated_out, w_out)  # shape [R, dim] FP16
+final = final_fp16.to(torch.float32).view(B, N, N, dim)
+```
+
+We should ensure memory contiguity.
+
+Let's incorporate that.
+
+Potential memory usage: gated_out shape (R, H) can be large, but okay.
+
+Now we can modify custom_kernel accordingly.
+
+We also need to ensure correct handling of mask presence.
+
+Also ensure any weight/bias tensors for layernorm are read as contiguous and perhaps avoid extra copy.
+
+Now, include docstring summarizing algorithm.
+
+Now I need to consider potential issues with the fused linear projection using torch.nn.functional.linear for large R (maybe up to 1M) and weight 5*H x dim (max 5*128=640 x 384). That's fine.
+
+Now we need to produce final answer: entire code block that defines kernels and custom_kernel.
+
+We'll include necessary imports: torch, torch.nn.functional as F, triton, triton.language as tl.
+
+Now add function and docstring.
+
+Now sample usage: data = (input_tensor, mask_tensor, weights, config). The config contains keys "dim", "hidden_dim", "nomask" as said.
+
+Potential missing: weights dictionary also contains "norm.weight", "norm.bias", "to_out_norm.weight", "to_out_norm.bias". All are float32. Convert to appropriate dtype for kernels.
+
+Implement layernorm_kernel: same as earlier.
+
+Implement split_fuse_gate_kernel: same as earlier.
+
+Implement rowwise_stats_kernel: same as earlier.
+
+Implement ln_gate_kernel: new.
+
+Now call kernels with appropriate block sizes:
+
+- For layernorm: BLOCK_M=128, BLOCK_D=64.
+
+- For split_fuse_gate: BLOCK_R=64, BLOCK_H=64 (H <=128). Possibly increase BLOCK_R.
+
+- For rowwise_stats: BLOCK_M_STATS=256, BLOCK_K_STATS=128.
+
+- For ln_gate_kernel: Choose BLOCK_R=128, BLOCK_H=64.
+
+Now do steps:
+
+```
+# step 1: input layernorm
+x_flat = x.reshape(R, dim)
+x_norm = torch.empty(R, dim, dtype=torch.float16, device=device)
+grid_ln = (triton.cdiv(R, BLOCK_M), )
+layernorm_kernel[grid_ln](x_flat, x_norm, w["norm.weight"], w["norm.bias"], R, dim, eps, BLOCK_M=..., BLOCK_D=..., num_warps=8)
+```
+
+Concern: we need to broadcast weights for layernorm weight and bias which are size dim; they are passed as torch tensors. Need to ensure they are contiguous and on device.
+
+- weight and bias are float32.
+
+Now step 2: fused projection:
+
+```
+fused_w = torch.cat([...], dim=0).to(torch.float16)
+proj = F.linear(x_norm, fused_w)  # shape (R, 5*H) FP16
+```
+
+Make sure x_norm dtype is fp16. F.linear expects input (N, *in_features). Input shape (R, dim) and weight shape (5H, dim). So it's fine.
+
+Now step 3: split_fuse_gate:
+
+```
+left = torch.empty(B, H, N, N, dtype=torch.float16, device=device)
+right = torch.empty_like(left)
+out_gate = torch.empty_like(left)
+...
+grid_split = (triton.cdiv(R, BLOCK_R), )
+split_fuse_gate_kernel[grid_split]...
+```
+
+Note that in kernel, we pass mask_ptr but maybe need to pass mask_ptr as torch.empty(0) for dummy.
+
+Now step 4: core multiplication:
+
+```
+left_mat = left.view(B * H, N, N)
+right_mat = right.view(B * H, N, N)
+out = torch.bmm(left_mat, right_mat.transpose(1,2))
+out = out.view(B, H, N, N)
+```
+
+Step 5: rowwise stats:
+
+```
+mu = torch.empty(R, dtype=torch.float32, device=device)
+rstd = torch.empty(R, dtype=torch.float32, device=device)
+grid_stats = (triton.cdiv(R, BLOCK_M_STATS), )
+rowwise_stats_kernel[grid_stats](out, mu, rstd, R, H, N, eps, BLOCK_M=..., BLOCK_K=..., num_warps=4)
+```
+
+Note: out has shape (B, H, N, N), we pass as pointer to kernel. The kernel expects out_ptr as pointer with stride such that it can compute base_offset as earlier. It uses hidden_stride = N*N. The pointer plus offsets using H dimension stride.
+
+Since out is contiguous in memory in shape (B, H, N, N), it's okay.
+
+Now step 6: LN+gate compute.
+
+```
+gated = torch.empty(R, H, dtype=torch.float16, device=device)
+grid_ln_gate = (triton.cdiv(R, BLOCK_R_GATE), )
+ln_gate_kernel[grid_ln_gate](
+    out,
+    out_gate,
+    mu,
+    rstd,
+    w["to_out_norm.weight"],
+    w["to_out_norm.bias"],
+    gated,
+    R,
+    H,
+    BLOCK_R=BLOCK_R_GATE,
+    BLOCK_H=BLOCK_H_GATE,
+    num_warps=4,
+)
+```
+
+But we need to ensure out and out_gate are as flattened [R, H] pointers. The kernel expects out_ptr shape [R,H] FP16. That's exactly out flattened as out.view(R, H). But we need to ensure row-major (plain) layout: out is (B, H, N, N). Flattening to R rows and H hidden dims treat each row = (b,i,j) and each column = hidden dimension. But out_ptr indexing in kernel uses `out_ptr + offs_r[:, None] * H + offs_h[None, :]`. That corresponds to row-major (contiguous) layout where stride for rows is H. However the actual memory layout of out when viewed as (B, H, N, N) and then flatten to (R, H) using .view(R, H) will have stride of rows = ??? Let's compute. out tensor shape (B, H, N, N). The stride in memory: stride_b = H*N*N, stride_h = N*N, stride_i = N, stride_k = 1. If we view as (R, H) where R = B*N*N, flatten the first three dims (B,N,N) to rows and keep H as columns? Actually to reshape to (R, H) we must permute axes because we want hidden dimension as column (contiguous in memory). But default .view will combine the first dimensions, but we need hidden dimension to be contiguous across columns? Let's test:
+
+Suppose we have a tensor T (B, H, N, N). Memory layout: T[b, h, i, k] = index = b*H*NN + h*NN + i*N + k.
+
+If we reshape to (B*N*N, H) using T.reshape(B*N*N, H), the new indexing would be based on the original order: the contiguous dimension for H is stride = NN (N*N). After flattening the first three dims, the stride for the new dimension 1 (H) would still be NN because H is not the fastest varying dimension originally; the fastest varying dimension is k (last), then i, then h, then b. So if we flatten across b,i,k first, the H dim will be next stride. But for a 2D view with shape (R, H), contiguous memory must have stride [H, 1] meaning rows contiguous, each row consists of H contiguous elements. However in our layout, the H block "h" is separated by stride = NN, which is not 1. So view(R, H) will not be contiguous across H dimension; the memory layout will have stride (H*N*N, N*N). Actually, if we do out.view(R, H), the resulting tensor will have stride (H, ????)? Wait, there are specific details.
+
+Let's manually see: out has shape (B, H, N, N). If we flatten to (B*N*N, H) using .reshape, we reorder axes? Actually .reshape uses the same storage and changes shape but doesn't reorder data; it just uses the same contiguous ordering. The new shape's dimensions are in stride order: original order is [b, h, i, k] at dims order. Flattening first three dims into one row dimension means row dimension has stride = hidden_stride *? Actually original stride order: dimension order: b (0) stride1 = H*NN, h stride2 = NN, i stride3 = N, k stride4 = 1. Flatten first three dims: new shape (B*NN, H). New stride for row = original stride of dimension i? Actually flatten across b, i, k? Let's think: flatten first dimension is (b,i,k) sorted? The new shape is (B*NN, H). We'll treat elements with index row = r = b*NN + i*N + k, col = h. The memory offset = b*H*NN + h*NN + i*N + k. This can be expressed as offset = (b*NN + i*N + k)*H + ??? Not exactly.
+
+Thus flatten to (R,H) does not give contiguous memory along H dimension. The stride for H dimension remains NN (N*N). The stride for row dimension is H.
+
+Thus using index `row * H + col` is not correct for memory layout of out view. Our kernel currently uses offset = base_offset + offs_h * hidden_stride, where hidden_stride = N*N. That matches layout for (R, H) where hidden dimension stride is NN (N*N). They compute base_offset = b * (H* NN) + i * N + k. This base_offset is start of hidden dim 0 for given row. Then they offset by offs_h * hidden_stride to index hidden dimension. This matches the memory layout of out as [B, H, N, N] in its contiguous arrangement.
+
+Thus to compute Ln and gate, we can pass out pointer as original out tensor and compute indices as in kernel. So we should not flatten out to (R,H) as contiguous. Instead we need to have kernel read out using the same indexing logic as rowwise_stats: base_offset = b * (H*NN) + i* N + k and hidden offset = offs_h * NN.
+
+Thus we need to pass out as pointer (or as 1D pointer) and we need to compute row offset inside the kernel similar to rowwise_stats. We can reuse rowwise_stats logic but performing the LN & multiplication in a single kernel.
+
+Thus we cannot simply flatten out and use row-major offsets, but we could restructure memory layout to make hidden dimension last for faster memory access: after we compute out = left @ right^T, we could permute dimensions to shape (B,N,N,H) i.e., reorder hidden dimension to last using `.permute(0,2,3,1).contiguous()` (turn shape to [B,N,N,H]). This would have stride for hidden dimension = 1, i.e., contiguous across hidden. Then flatten to (R, H) and use simple indexing row*H + col. That may be beneficial for memory locality.
+
+Performance wise, we might consider permuting out before rowwise stats and LN+gate. However, rowwise_stats will then need to compute across hidden dimension as contiguous, which is straightforward: sum over dim=H across each row. But we currently compute rowwise stats over hidden dimension; if hidden dimension is contiguous, each row is contiguous blocks, enabling easy vectorized reduction.
+
+Thus we could after out, do out = out.permute(0,2,3,1).contiguous() -> shape (B, N, N, H). Flatten to (R, H). Compute rowwise_stats and LN+gate using more straightforward kernels that treat each row's hidden dims contiguously. This may be more efficient.
+
+But we must also compute out_gate accordingly: out_gate currently shape (B, H, N, N). We can permute it similarly to (B,N,N,H). After we permute, we can flatten.
+
+Thus we can adjust after left/right multiplication:
+
+```
+out = out.permute(0,2,3,1).contiguous()  # shape (B, N, N, H)
+out_gate = out_gate.permute(0,2,3,1).contiguous()  # same
+```
+
+Now we have out shape (B,N,N,H) with hidden as last dimension; flatten to (R,H). This will cause memory layout stride for hidden=1, row stride = H.
+
+Now rowwise_stats can be simplified: out_ptr can be view as two-dimensional (R, H) contiguous row-major. The kernel can compute sum across hidden dimension via simple reduction axis.
+
+But we may also compute mean and variance using torch.mean and torch.var directly in PyTorch? Could be slower.
+
+Better to implement a kernel that calculates row-wise mean and variance for contiguous hidden dimension. Use block size for rows and for hidden dimension. That's similar to earlier rowwise_stats but using contiguous memory, reduce memory loads.
+
+But we can also reuse rowwise_stats_kernel by adjusting stride calculations accordingly. But perhaps better to implement a new kernel: rowwise_stats_contig.
+
+Potential performance improvement: we can compute mu and rstd using `torch.mean` and `torch.var` with dim=-1, but that will launch kernels overhead? But using Torch's built-in functions may be optimized with reduction kernels, possibly faster than custom Triton for such small hidden dim (128). But it's okay.
+
+But we can keep custom rowwise stats.
+
+Implementation details for contiguous layout:
+
+- After out = torch.bmm(...).view(B, H, N, N) we do out = out.permute(0,2,3,1).contiguous(); shape (B, N, N, H). Now flatten to shape (R, H). In code:
+
+```
+out = out.permute(0,2,3,1).contiguous()
+out_gate = out_gate.permute(0,2,3,1).contiguous()
+R, H = B*N*N, hidden_dim
+# but out shape is (B, N, N, H) so flatten:
+out_flat = out.view(R, H)
+out_gate_flat = out_gate.view(R, H)
+```
+
+Now rowwise_stats_kernel can treat out_flat as [R, H] contiguous. Implementation can be similar but simpler: sum across hidden dimension H within thread block. Already rowwise_stats_kernel loops over k stride; but we could simplify.
+
+But we may name the kernel "rowwise_stats_contig_kernel".
+
+Define:
+
+```
+@triton.jit
+def rowwise_stats_contig_kernel(
+    out_ptr, mu_ptr, rstd_ptr,
+    R, H, eps,
+    BLOCK_R: tl.constexpr, BLOCK_H: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    row_start = pid * BLOCK_R
+    offs_r = row_start + tl.arange(0, BLOCK_R)
+    mask_r = offs_r < R
+
+    # load block of rows
+    # accumulate sum and sumsq over hidden dimension in chunks.
+    sum_val = tl.zeros([BLOCK_R], dtype=tl.float32)
+    sum_sq = tl.zeros([BLOCK_R], dtype=tl.float32)
+
+    for h_start in range(0, H, BLOCK_H):
+        offs_h = h_start + tl.arange(0, BLOCK_H)
+        mask_h = offs_h < H
+
+        # Load [BLOCK_R, BLOCK_H] block
+        vals = tl.load(out_ptr + offs_r[:, None] * H + offs_h[None, :],
+                       mask=mask_r[:, None] & mask_h[None, :],
+                       other=0.0).to(tl.float32)
+
+        sum_val += tl.sum(vals, axis=1)
+        sum_sq += tl.sum(vals * vals, axis=1)
+
+    mean = sum_val / H
+    var = sum_sq / H - mean * mean
+    rstd = tl.rsqrt(var + eps)
+
+    tl.store(mu_ptr + offs_r, mean, mask=mask_r)
+    tl.store(rstd_ptr + offs_r, rstd, mask=mask_r)
+```
+
+Now, LN+gate kernel for contiguous: similar to earlier but using contiguous layout.
+
+Define:
+
+```
+@triton.jit
+def ln_gate_contig_kernel(
+    out_ptr, gate_ptr, mu_ptr, rstd_ptr,
+    ln_w_ptr, ln_b_ptr,
+    out_gated_ptr,
+    R, H,
+    BLOCK_R: tl.constexpr, BLOCK_H: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    row_start = pid * BLOCK_R
+    offs_r = row_start + tl.arange(0, BLOCK_R)
+    mask_r = offs_r < R
+
+    for h_start in range(0, H, BLOCK_H):
+        offs_h = h_start + tl.arange(0, BLOCK_H)
+        mask_h = offs_h < H
+
+        # Load out, gate
+        out_vals = tl.load(out_ptr + offs_r[:, None] * H + offs_h[None, :],
+                           mask=mask_r[:, None] & mask_h[None, :],
+                           other=0.0).to(tl.float32)
+        gate_vals = tl.load(gate_ptr + offs_r[:, None] * H + offs_h[None, :],
+                            mask=mask_r[:, None] & mask_h[None, :],
+                            other=0.0).to(tl.float32)
+
+        mu = tl.load(mu_ptr + offs_r, mask=mask_r, other=0.0)[:, None]
+        rstd = tl.load(rstd_ptr + offs_r, mask=mask_r, other=0.0)[:, None]
+
+        gamma = tl.load(ln_w_ptr + offs_h, mask=mask_h, other=0.0)[None, :]  # shape [1, BLOCK_H]
+        beta = tl.load(ln_b_ptr + offs_h, mask=mask_h, other=0.0)[None, :]
+
+        # Normalize
+        # out_norm = (out_vals - mu) * rstd
+        norm = (out_vals - mu) * rstd
+        norm = norm * gamma + beta
+
+        gated = norm * gate_vals
+
+        tl.store(out_gated_ptr + offs_r[:, None] * H + offs_h[None, :],
+                 gated.to(tl.float16),
+                 mask=mask_r[:, None] & mask_h[None, :])
+```
+
+Thus we only need one kernel for rowwise stats and another for LN+gate.
+
+In step 6, after LN+gate, we can compute final projected output using torch.nn.functional.linear with weight w_out (dim, H) FP16.
+
+Now final reshape to [B, N, N, dim].
+
+Now, check that gating: out_gate originally applied after normalization to hidden dimension. In our pipeline we first compute out_gate in split_fuse_gate_kernel. That's shape [B,H,N,N] we permute it to (B, N, N, H) like out. Ensure gating applied after rowwise LN with ln_w and ln_b.
+
+Thus LN+gate kernel uses ln_w and ln_b from to_out_norm.
+
+All other operations are correct.
+
+Now mask: In split_fuse_gate_kernel we need mask. For nomask True we skip mask, else we provide mask (float16). In split_fuse_gate_kernel we also compute left and right only in this step; however we also need left and right for core multiplication. We'll keep that.
+
+Time complexity: major time consumption likely from left-right multiplication (bmm) which is O(B*H*N^3) but must be done anyway. However, since H <=128, N up to 1024, B <=2: B*H approx <=256, N=1024 => 256*1024*1024 = ~268 million mul-add operations. In FP16, this is heavy. But using cuBLAS bmm is efficient.
+
+Potential improvement: Use scaled BMM with reduced precision (tensor cores). Provided we use fp16, torch.bmm will use tensor cores.
+
+But we can also use torch.einsum? Not needed.
+
+Thus overall runtime likely dominated by BMM ~80-200 microseconds for these shapes? The earlier runtime 806µs suggests BMM and other tasks are within that.
+
+Our changes removing expensive final_output_kernel may reduce runtime. We may also incorporate some minor micro-optimizations.
+
+Now we need to produce final code.
+
+One more thing: The rowwise_stats kernel and LN+gate need to be passed torch tensors of correct dtype and device.
+
+Now double-check that we didn't forget to import torch.nn.functional as F.
+
+Add docstring summarizing algorithm.
+
+Now we need to incorporate possibility that mask may be None or torch.bool with values 0/1. We'll convert to torch.float16.
+
+Now level of code correctness:
+
+- Must ensure all kernels compile; check syntax.
+
+- Use `tl.cdiv` for integer division rounding up.
+
+- In kernels compute `offs_r` and `offs_h` using `tl.arange`.
+
+- Ensure proper mask handling.
+
+- In split_fuse_gate_kernel decode i,k from flatten index. But after we've permuted left/right/out_gate to (B,H,N,N) as before, we must ensure indexing is correct.
+
+Potential memory issue: After split_fuse_gate_kernel loads mask and multiply with left_proj and right_proj, mask is broadcast over H dimension wise, but after permuting left/right/out_gate, the hidden dimension is last, but we don't actually need to permute left/right; later we will just convert left and right to shape (B*H,N,N) for BMM. That's fine.
+
+Now we also need to ensure that after permuting out back to shape (B,N,N,H), we need to reorder accordingly. But out after BMM currently shape (B, H, N, N). We need to permute to (B,N,N,H) for contiguous hidden dimension.
+
+Thus do:
+
+```
+out = out.permute(0,2,3,1).contiguous()  # shape (B,N,N,H)
+out_gate = out_gate.permute(0,2,3,1).contiguous()
+```
+
+Now flatten:
+
+```
+out_flat = out.view(R, H)
+out_gate_flat = out_gate.view(R, H)
+```
+
+But note out_gate must be same ordering as out; after permute, out_gate shape (B,N,N,H). Good.
+
+Now pass them to rowwise_stats and LN+gate.
+
+Now out_flat and out_gate_flat are contiguous memory and thus both can be used directly.
+
+After LN+gate, we get gated_out_flat shape (R, H). Will be contiguous.
+
+Now final projection:
+
+```
+w_out = w["to_out.weight"].to(torch.float16) # shape (dim, H)
+final_fp16 = torch.nn.functional.linear(gated_out_flat, w_out) # shape (R, dim)
+final = final_fp16.view(B, N, N, dim).to(torch.float32)
+```
+
+We need to ensure we pass bias=None.
+
+Now include after final return final.
+
+Now what's needed: after computing left and right and out_gate we used left and right for BMM; after that we can free left and right memory maybe.
+
+Now confirm all weight shapes:
+
+- w["norm.weight"] shape (dim)
+- w["norm.bias"] (dim)
+- w["left_proj.weight"], w["right_proj.weight"], w["left_gate.weight"], w["right_gate.weight"], w["out_gate.weight"]: all shape (hidden_dim, dim) (i.e., H x dim). Fused will combine rows.
+
+- w["to_out_norm.weight"] shape (hidden_dim)
+- w["to_out_norm.bias"] shape (hidden_dim)
+- w["to_out.weight"] shape (dim, hidden_dim). We will convert to float16.
+
+Now final sequence.
+
+Potential issue: The to_out_norm weight and bias are in FP32; we operate LN and gate using FP32 arithmetic. Our LN+gate kernel loads these as FP32 values using tl.load from pointer.
+
+Now shape of mu and rstd: they have size R (float32).
+
+Now final projection uses torch.nn.functional.linear (FP16 weight). It uses FP32 accumulation? Probably uses Tensor Cores.
+
+Now memory overhead: gating and out_gate need to be stored. This overhead is fine.
+
+Now finalize code with all kernels and custom_kernel.
+
+We'll test execution: Try typical shape (bs=1, seqlen=256, dim=128, hidden_dim=128). R = 65536. Manageable.
+
+Now implement code.
+
+Potential bug: The container of masks. In split_fuse_gate_kernel we compute mask_val = tl.load(mask_ptr + offs_r, mask=mask_r, other=1.0) and replicate across hidden dimension using broadcast: mask_val[:, None]. Then left = left_raw * mask_val * left_gate. So left and right are multiplied by mask and gate. That matches reference.
+
+Now we need to ensure proper broadcasting of mask for H dimension; left_raw shapes [BLOCK_R, BLOCK_H], mask_val shape [BLOCK_R, 1], left_gate shape [BLOCK_R, BLOCK_H], multiplication works.
+
+Now implement final code.
+
+We'll provide docstring at top of file summarizing algorithm.
+
+Add comments.
+
+One detail: The rowwise_stats kernel calculates mu and rstd from out_flat (R, H). For H small (max 128) total number of rows large. BLOCK_R = 128 or 256.
+
+Potential pitfalls: Kernel may use many registers if using large BLOCK_H. But H <= 128, we can set BLOCK_H=128 to use one iteration. Then inner loop to load all hidden dims in one go for each row. But we must handle hidden dimension > BLOCK_H maybe. Since H max=128 but may be <128, we can set BLOCK_H=128 to cover whole hidden at once. However, we need to compute sum across hidden dimension; loading full hidden dimension for each tile may be expensive because each thread block loads many values per row using vector loads. But okay.
+
+But in rowwise_stats we can have BLOCK_H=128 and loop over hidden dimension 0..H step 128. That's one iteration. That's fine.
+
+Similarly LN+gate kernel: we can set BLOCK_H = 128 and loop once.
+
+Thus we reduce loops overhead.
+
+Now finalize kernel definitions.
+
+Now think about possible errors: In rowwise_stats, sum of squares may overflow if fp16? It's cast to fp32 before squaring, then we do vals * vals in fp32, fine.
+
+But we must ensure load of out values returns fp16, then .to(tl.float32) for concurrency.
+
+Potential issues with mask: in rowwise_stats and LN+gate we don't need mask.
+
+Now check PyTorch dimension semantics: In torch.nn.functional.linear, input shape (R, H) and weight shape (dim, H) yields output shape (R, dim). Input features dimension is second dimension H. The output = input @ weight.t() + bias? Actually linear does: output = input @ weight.T + bias. weight shape = (out_features, in_features). So if we specify weight = w_out (dim, H), then output = input @ w_out.T -> shape (R, dim). That yields same shape. So we can use weight w_out_T (H, dim) to get output = input @ w_out_T.T? Wait w_out_T is H x dim. If we set weight = w_out_T.T? Let's derive: weight shape needed is (out_features, in_features) => (dim, H). w_out is already shape (dim, H). So weight = w_out. Then output = input (R, H) @ weight.T (H, dim) = (R, dim). So we can feed w_out directly: w_out = w["to_out.weight"].to(torch.float16). Then use torch.nn.functional.linear(gated_out_flat, w_out). That's fine.
+
+Now final reshape: final_fp16.view(B, N, N, dim). Check shape: gated_out_flat shape (R, H). final_fp16 shape (R, dim) where R = B*N*N. So final_fp16.view(B, N, N, dim) yields shape (B, N, N, dim). Good.
+
+Now ensure that we use correct dtype: final_fp16 is fp16; we cast to float32 at the end: .to(torch.float32).
+
+Now handle mask: If mask is None and nomask is True, we pass no mask. But we need to handle case where mask is None but nomask=False? Actually config "nomask" boolean indicates there will be mask or not. If nomask=False, mask is provided, else mask may be None. So we can detect "if mask is not None and not nomask". We'll just treat mask if provided.
+
+Now addressing potential cross-simultaneous allocation: The kernel for split_fuse_gate reads mask_ptr and multiplies.
+
+Now implement code.
+
+Now verifying kernel arguments:
+
+- split_fuse_gate_kernel expects HAS_MASK as tl.constexpr. If HAS_MASK=0 we pass mask_ptr as dummy.
+
+- We'll compute R, H, N and pass scalar ints.
+
+Now we need to ensure we compute H as hidden_dim.
+
+Now show final code.
+
+Potential improvements: Use `torch.adaptive_avg_pool1d`? Not needed.
+
+Now for simplicity, we will define kernels inside final code block.
+
+Now produce answer.
+
+assistantfinal```python
+"""
+TriMul (outgoing) – fast forward‑only Triton implementation
+================================================================
+Algorithm
+---------
+1️⃣  Row‑wise LayerNorm over the input tensor  (FP32 → FP16).
+2️⃣  Fuse the five linear maps (left, right, left_gate, right_gate, out_gate)
+    into a single GEMM (cuBLAS) producing a tensor of shape (R, 5·H) where
+    R = B·N·N and H = hidden_dim.
+3️⃣  Split the fused projection, apply the optional pairwise mask,
+    compute sigmoid gates and store three tensors *left*, *right*,
+    *out_gate* in layout [B, H, N, N] (FP16) – Triton kernel.
+4️⃣  Batched GEMM (cuBLAS) over the hidden dimension:
+        out = left · rightᵀ      → shape [B, H, N, N] (FP16).
+5️⃣  Permute *out* and *out_gate* to [B, N, N, H] and flatten to (R, H)
+    – this makes the hidden dimension contiguous.
+6️⃣  Row‑wise mean / rsqrt‑variance of *out* → μ, rstd (FP32) – Triton kernel.
+7️⃣  Fuse the second LayerNorm, the *out_gate* multiplication and the
+    final projection into two kernels:
+        • row‑wise stats (step 6)
+        • LN + gate (FP32 arithmetic, write FP16)
+   The gated hidden representation is then projected to the model dimension
+   with a single cuBLAS GEMM (FP16 × FP16 → FP16) and cast back to FP32.
+All kernels target Triton 3.3.1 on an H100 and use mixed precision.
+"""
+
+import torch
+import torch.nn.functional as F
+import triton
+import triton.language as tl
+
+# ----------------------------------------------------------------------
+# 1️⃣ Row‑wise LayerNorm (FP32 → FP16)
+# ----------------------------------------------------------------------
+@triton.jit
+def layernorm_kernel(
+    x_ptr,      # [R, dim] FP32 input
+    y_ptr,      # [R, dim] FP16 output
+    w_ptr,      # [dim]    LN weight (γ) FP32
+    b_ptr,      # [dim]    LN bias   (β) FP32
+    rows, dim, eps,
+    BLOCK_M: tl.constexpr, BLOCK_D: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    row_start = pid * BLOCK_M
+    offs_m = row_start + tl.arange(0, BLOCK_M)            # [BLOCK_M]
+    mask_m = offs_m < rows
+
+    # ---------- first pass : compute mean & variance ----------
+    sum_val = tl.zeros([BLOCK_M], dtype=tl.float32)
+    sum_sq  = tl.zeros([BLOCK_M], dtype=tl.float32)
+
+    for d_off in range(0, tl.cdiv(dim, BLOCK_D)):
+        offs_d = d_off * BLOCK_D + tl.arange(0, BLOCK_D)
+        mask_d = offs_d < dim
+
+        ptr = x_ptr + offs_m[:, None] * dim + offs_d[None, :]
+        vals = tl.load(ptr,
+                       mask=mask_m[:, None] & mask_d[None, :],
+                       other=0.0).to(tl.float32)          # [BLOCK_M, BLOCK_D]
+
+        sum_val += tl.sum(vals, axis=1)                   # [BLOCK_M]
+        sum_sq  += tl.sum(vals * vals, axis=1)            # [BLOCK_M]
+
+    mean = sum_val / dim
+    var  = sum_sq / dim - mean * mean
+    rstd = tl.rsqrt(var + eps)
+
+    # ---------- second pass : write normalized values ----------
+    for d_off in range(0, tl.cdiv(dim, BLOCK_D)):
+        offs_d = d_off * BLOCK_D + tl.arange(0, BLOCK_D)
+        mask_d = offs_d < dim
+
+        ptr = x_ptr + offs_m[:, None] * dim + offs_d[None, :]
+        vals = tl.load(ptr,
+                       mask=mask_m[:, None] & mask_d[None, :],
+                       other=0.0).to(tl.float32)
+
+        norm = (vals - mean[:, None]) * rstd[:, None]
+
+        gamma = tl.load(w_ptr + offs_d, mask=mask_d, other=0.0)   # FP32
+        beta  = tl.load(b_ptr + offs_d, mask=mask_d, other=0.0)   # FP32
+
+        out = norm * gamma[None, :] + beta[None, :]
+        tl.store(y_ptr + offs_m[:, None] * dim + offs_d[None, :],
+                 out.to(tl.float16),
+                 mask=mask_m[:, None] & mask_d[None, :])
+
+# ----------------------------------------------------------------------
+# 2️⃣ Split fused projection, apply mask & sigmoid gates
+# ----------------------------------------------------------------------
+@triton.jit
+def split_fuse_gate_kernel(
+    proj_ptr,       # [R, 5·H] FP16 fused projection
+    left_ptr,       # [B, H, N, N] FP16
+    right_ptr,      # [B, H, N, N] FP16
+    out_gate_ptr,   # [B, H, N, N] FP16
+    mask_ptr,       # [R] FP16 (optional)
+    R, H, N,
+    HAS_MASK: tl.constexpr,
+    BLOCK_R: tl.constexpr, BLOCK_H: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    row_start = pid * BLOCK_R
+    offs_r = row_start + tl.arange(0, BLOCK_R)          # [BLOCK_R]
+    mask_r = offs_r < R
+
+    # decode flat index r = b·N·N + i·N + k
+    nn = N * N
+    b = offs_r // nn
+    rem = offs_r - b * nn
+    i = rem // N
+    k = rem - i * N
+
+    # optional mask (broadcast over H)
+    if HAS_MASK:
+        m = tl.load(mask_ptr + offs_r, mask=mask_r, other=1.0)
+        mask_val = m[:, None]    # [BLOCK_R,1]
+    else:
+        mask_val = tl.full([BLOCK_R, 1], 1.0, dtype=tl.float16)
+
+    hidden_stride = nn                       # offset between consecutive hidden planes
+    base_offset = b * (H * hidden_stride) + i * N + k     # offset for h = 0
+
+    for h_off in range(0, tl.cdiv(H, BLOCK_H)):
+        offs_h = h_off * BLOCK_H + tl.arange(0, BLOCK_H)
+        mask_h = offs_h < H
+
+        # view of the fused projection: [left | right | left_gate | right_gate | out_gate]
+        proj_base = offs_r[:, None] * (5 * H) + offs_h[None, :]   # [BLOCK_R, BLOCK_H]
+
+        left_raw = tl.load(proj_ptr + proj_base,
+                           mask=mask_r[:, None] & mask_h[None, :],
+                           other=0.0)
+        right_raw = tl.load(proj_ptr + proj_base + H,
+                            mask=mask_r[:, None] & mask_h[None, :],
+                            other=0.0)
+        left_gate_raw = tl.load(proj_ptr + proj_base + 2 * H,
+                                mask=mask_r[:, None] & mask_h[None, :],
+                                other=0.0)
+        right_gate_raw = tl.load(proj_ptr + proj_base + 3 * H,
+                                 mask=mask_r[:, None] & mask_h[None, :],
+                                 other=0.0)
+        out_gate_raw = tl.load(proj_ptr + proj_base + 4 * H,
+                               mask=mask_r[:, None] & mask_h[None, :],
+                               other=0.0)
+
+        # sigmoid in FP32 for stability, convert back to FP16
+        left_gate  = (1.0 / (1.0 + tl.exp(-left_gate_raw.to(tl.float32)))).to(tl.float16)
+        right_gate = (1.0 / (1.0 + tl.exp(-right_gate_raw.to(tl.float32)))).to(tl.float16)
+        out_gate   = (1.0 / (1.0 + tl.exp(-out_gate_raw.to(tl.float32)))).to(tl.float16)
+
+        left  = left_raw  * mask_val * left_gate
+        right = right_raw * mask_val * right_gate
+        outg  = out_gate
+
+        dst_offset = base_offset[:, None] + offs_h[None, :] * hidden_stride   # [BLOCK_R, BLOCK_H]
+
+        tl.store(left_ptr + dst_offset,
+                 left,
+                 mask=mask_r[:, None] & mask_h[None, :])
+        tl.store(right_ptr + dst_offset,
+                 right,
+                 mask=mask_r[:, None] & mask_h[None, :])
+        tl.store(out_gate_ptr + dst_offset,
+                 outg,
+                 mask=mask_r[:, None] & mask_h[None, :])
+
+# ----------------------------------------------------------------------
+# 3️⃣ Row‑wise mean & rsqrt‑variance (contiguous hidden dim)
+# ----------------------------------------------------------------------
+@triton.jit
+def rowwise_stats_contig_kernel(
+    out_ptr,         # [R, H] FP16
+    mu_ptr,          # [R] FP32
+    rstd_ptr,        # [R] FP32
+    R, H, eps,
+    BLOCK_R: tl.constexpr, BLOCK_H: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    row_start = pid * BLOCK_R
+    offs_r = row_start + tl.arange(0, BLOCK_R)
+    mask_r = offs_r < R
+
+    sum_val = tl.zeros([BLOCK_R], dtype=tl.float32)
+    sum_sq  = tl.zeros([BLOCK_R], dtype=tl.float32)
+
+    for h_off in range(0, tl.cdiv(H, BLOCK_H)):
+        offs_h = h_off * BLOCK_H + tl.arange(0, BLOCK_H)
+        mask_h = offs_h < H
+
+        vals = tl.load(out_ptr + offs_r[:, None] * H + offs_h[None, :],
+                       mask=mask_r[:, None] & mask_h[None, :],
+                       other=0.0).to(tl.float32)          # [BLOCK_R, BLOCK_H]
+
+        sum_val += tl.sum(vals, axis=1)                   # [BLOCK_R]
+        sum_sq  += tl.sum(vals * vals, axis=1)            # [BLOCK_R]
+
+    mean = sum_val / H
+    var  = sum_sq / H - mean * mean
+    rstd = tl.rsqrt(var + eps)
+
+    tl.store(mu_ptr   + offs_r, mean,  mask=mask_r)
+    tl.store(rstd_ptr + offs_r, rstd, mask=mask_r)
+
+# ----------------------------------------------------------------------
+# 4️⃣ Fuse second LayerNorm, out_gate and write gated hidden state
+# ----------------------------------------------------------------------
+@triton.jit
+def ln_gate_contig_kernel(
+    out_ptr,          # [R, H] FP16   (post‑BMM)
+    gate_ptr,         # [R, H] FP16   (out_gate)
+    mu_ptr,           # [R]    FP32
+    rstd_ptr,         # [R]    FP32
+    ln_w_ptr,         # [H]    FP32 (to_out_norm.weight)
+    ln_b_ptr,         # [H]    FP32 (to_out_norm.bias)
+    gated_ptr,        # [R, H] FP16  (output)
+    R, H,
+    BLOCK_R: tl.constexpr, BLOCK_H: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    row_start = pid * BLOCK_R
+    offs_r = row_start + tl.arange(0, BLOCK_R)
+    mask_r = offs_r < R
+
+    # load per‑row statistics once (broadcast later)
+    mu   = tl.load(mu_ptr   + offs_r, mask=mask_r, other=0.0)   # [BLOCK_R]
+    rstd = tl.load(rstd_ptr + offs_r, mask=mask_r, other=0.0)   # [BLOCK_R]
+    mu   = mu[:, None]      # [BLOCK_R,1]
+    rstd = rstd[:, None]    # [BLOCK_R,1]
+
+    for h_off in range(0, tl.cdiv(H, BLOCK_H)):
+        offs_h = h_off * BLOCK_H + tl.arange(0, BLOCK_H)
+        mask_h = offs_h < H
+
+        # load raw tensors
+        out_vals  = tl.load(out_ptr  + offs_r[:, None] * H + offs_h[None, :],
+                            mask=mask_r[:, None] & mask_h[None, :],
+                            other=0.0).to(tl.float32)   # [BLOCK_R, BLOCK_H]
+        gate_vals = tl.load(gate_ptr + offs_r[:, None] * H + offs_h[None, :],
+                            mask=mask_r[:, None] & mask_h[None, :],
+                            other=0.0).to(tl.float32)   # [BLOCK_R, BLOCK_H]
+
+        gamma = tl.load(ln_w_ptr + offs_h, mask=mask_h, other=0.0)[None, :]   # [1, BLOCK_H]
+        beta  = tl.load(ln_b_ptr + offs_h, mask=mask_h, other=0.0)[None, :]   # [1, BLOCK_H]
+
+        # LayerNorm over hidden dim → normalize → gate
+        norm = (out_vals - mu) * rstd          # [BLOCK_R, BLOCK_H]
+        norm = norm * gamma + beta            # apply LN weight & bias
+        gated = norm * gate_vals               # element‑wise gating
+
+        tl.store(gated_ptr + offs_r[:, None] * H + offs_h[None, :],
+                 gated.to(tl.float16),
+                 mask=mask_r[:, None] & mask_h[None, :])
+
+# ----------------------------------------------------------------------
+# Entry point – forward only
+# ----------------------------------------------------------------------
+def custom_kernel(data):
+    """
+    Forward pass of the **outgoing** TriMul operator (no gradient).
+
+    Args:
+        data (tuple): (input_tensor, mask_tensor, weights_dict, config_dict)
+            - input_tensor : torch.Tensor [B, N, N, dim] (float32)
+            - mask_tensor  : torch.Tensor [B, N, N] (bool/float) or None
+            - weights_dict : mapping with keys
+                "norm.weight", "norm.bias",
+                "left_proj.weight", "right_proj.weight",
+                "left_gate.weight", "right_gate.weight", "out_gate.weight",
+                "to_out_norm.weight", "to_out_norm.bias",
+                "to_out.weight"
+              (all float32)
+            - config_dict must contain "dim", "hidden_dim", "nomask" (bool)
+
+    Returns:
+        torch.Tensor: [B, N, N, dim] (float32)
+    """
+    # --------------------------------------------------------------
+    # unpack inputs
+    # --------------------------------------------------------------
+    x, mask, w, cfg = data
+    dim = cfg["dim"]
+    hidden_dim = cfg["hidden_dim"]
+    nomask = cfg.get("nomask", True)
+    eps = 1e-5
+    device = x.device
+
+    B, N, _, _ = x.shape
+    R = B * N * N          # number of pairwise tokens
+    H = hidden_dim
+
+    # --------------------------------------------------------------
+    # 1️⃣ Row‑wise LayerNorm (FP32 → FP16)
+    # --------------------------------------------------------------
+    x_flat = x.reshape(R, dim).contiguous()               # [R, dim] FP32
+    x_norm = torch.empty(R, dim, dtype=torch.float16, device=device)
+
+    BLOCK_M = 128
+    BLOCK_D = 64
+    grid_ln = (triton.cdiv(R, BLOCK_M),)
+    layernorm_kernel[grid_ln](
+        x_flat,
+        x_norm,
+        w["norm.weight"],
+        w["norm.bias"],
+        R,
+        dim,
+        eps,
+        BLOCK_M=BLOCK_M,
+        BLOCK_D=BLOCK_D,
+        num_warps=8,
+    )
+    del x_flat
+
+    # --------------------------------------------------------------
+    # 2️⃣ Fused linear projection (5·H)
+    # --------------------------------------------------------------
+    fused_w = torch.cat(
+        [
+            w["left_proj.weight"],
+            w["right_proj.weight"],
+            w["left_gate.weight"],
+            w["right_gate.weight"],
+            w["out_gate.weight"],
+        ],
+        dim=0,
+    ).to(torch.float16)                         # [5·H, dim]
+
+    proj = F.linear(x_norm, fused_w)            # (R, 5·H) FP16
+    del fused_w, x_norm
+
+    # --------------------------------------------------------------
+    # 3️⃣ Split, mask, sigmoid gates → left / right / out_gate
+    # --------------------------------------------------------------
+    left = torch.empty(B, H, N, N, dtype=torch.float16, device=device)
+    right = torch.empty_like(left)
+    out_gate = torch.empty_like(left)
+
+    if (not nomask) and (mask is not None):
+        mask_flat = mask.to(torch.float16).reshape(R).contiguous()
+        has_mask = 1
+        mask_ptr = mask_flat
+    else:
+        has_mask = 0
+        mask_ptr = torch.empty(0, dtype=torch.float16, device=device)   # dummy
+
+    BLOCK_R = 64
+    BLOCK_H = 64
+    grid_split = (triton.cdiv(R, BLOCK_R),)
+    split_fuse_gate_kernel[grid_split](
+        proj,
+        left,
+        right,
+        out_gate,
+        mask_ptr,
+        R,
+        H,
+        N,
+        HAS_MASK=has_mask,
+        BLOCK_R=BLOCK_R,
+        BLOCK_H=BLOCK_H,
+        num_warps=8,
+    )
+    del proj, mask_ptr
+
+    # --------------------------------------------------------------
+    # 4️⃣ Core einsum (batched GEMM over hidden dim)
+    # --------------------------------------------------------------
+    # left/right are [B, H, N, N]; view as [B·H, N, N] for bmm
+    left_mat = left.view(B * H, N, N)
+    right_mat = right.view(B * H, N, N)
+    out = torch.bmm(left_mat, right_mat.transpose(1, 2))   # [B·H, N, N] FP16
+    out = out.view(B, H, N, N)                             # [B, H, N, N] FP16
+    # No longer needed
+    del left_mat, right_mat, left, right
+
+    # --------------------------------------------------------------
+    # 5️⃣ Make hidden dimension contiguous (permute + flatten)
+    # --------------------------------------------------------------
+    out = out.permute(0, 2, 3, 1).contiguous()            # [B, N, N, H]
+    out_gate = out_gate.permute(0, 2, 3, 1).contiguous()  # [B, N, N, H]
+
+    out_flat = out.view(R, H)          # [R, H] FP16
+    out_gate_flat = out_gate.view(R, H)  # [R, H] FP16
+    del out, out_gate
+
+    # --------------------------------------------------------------
+    # 6️⃣ Row‑wise mean & rsqrt‑variance of `out`
+    # --------------------------------------------------------------
+    mu = torch.empty(R, dtype=torch.float32, device=device)
+    rstd = torch.empty(R, dtype=torch.float32, device=device)
+
+    BLOCK_R_STATS = 256
+    BLOCK_H_STATS = 128                      # H ≤ 128 ⇒ single iteration
+    grid_stats = (triton.cdiv(R, BLOCK_R_STATS),)
+    rowwise_stats_contig_kernel[grid_stats](
+        out_flat,
+        mu,
+        rstd,
+        R,
+        H,
+        eps,
+        BLOCK_R=BLOCK_R_STATS,
+        BLOCK_H=BLOCK_H_STATS,
+        num_warps=4,
+    )
+
+    # --------------------------------------------------------------
+    # 7️⃣ Fuse second LayerNorm, out_gate and final projection
+    # --------------------------------------------------------------
+    gated = torch.empty(R, H, dtype=torch.float16, device=device)
+
+    BLOCK_R_LN = 128
+    BLOCK_H_LN = 128
+    grid_ln_gate = (triton.cdiv(R, BLOCK_R_LN),)
+    ln_gate_contig_kernel[grid_ln_gate](
+        out_flat,
+        out_gate_flat,
+        mu,
+        rstd,
+        w["to_out_norm.weight"],   # γ, FP32
+        w["to_out_norm.bias"],     # β, FP32
+        gated,
+        R,
+        H,
+        BLOCK_R=BLOCK_R_LN,
+        BLOCK_H=BLOCK_H_LN,
+        num_warps=4,
+    )
+    # clean up intermediate tensors
+    del out_flat, out_gate_flat, mu, rstd
+
+    # --------------------------------------------------------------
+    # 8️⃣ Final projection (FP16 GEMM) → FP32 result
+    # --------------------------------------------------------------
+    # weight shape for torch.nn.functional.linear: (out_features, in_features) = (dim, H)
+    w_out = w["to_out.weight"].to(torch.float16).contiguous()  # [dim, H]
+
+    final_fp16 = torch.nn.functional.linear(gated, w_out)      # [R, dim] FP16
+    final = final_fp16.view(B, N, N, dim).to(torch.float32)
+
+    return final
+```
