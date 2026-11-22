@@ -303,7 +303,7 @@ def _rollout_advantage_fields(advantage, *, ttt_advantage, spo_rs_advantage,
     }
 
 
-def _advance_live_best_raw(result, current, maximize):
+def _advance_live_best_raw(result, current, problem):
     if not bool(getattr(result, "valid", False)):
         return current, None
     try:
@@ -313,10 +313,9 @@ def _advance_live_best_raw(result, current, maximize):
     if not math.isfinite(value):
         return current, None
     if current is not None and not (
-            value > current if maximize else value < current):
+            value > current if problem.maximize else value < current):
         return current, None
-    before = "unavailable" if current is None else f"{current:.9f}"
-    return value, f"best before: {before} --> best now: {value:.9f}"
+    return value, f"best {problem.metric_name}: {value:.9f}"
 
 
 def _adapter_dir(exp_dir, step_idx):
@@ -1083,19 +1082,27 @@ def _finalize_pending_spo_rs_artifacts(
     evaluation_pool = ThreadPoolExecutor(max_workers=workers)
     eval_bar = None
     eval_progress_lock = threading.Lock()
+    live_best_state = sampler.best_raw_state(maximize=bool(problem.maximize))
+    live_best_raw = (
+        float(live_best_state.raw_score) if live_best_state is not None else None)
 
-    def evaluation_completed(_future):
-        nonlocal eval_bar
+    def evaluation_completed(future):
+        nonlocal eval_bar, live_best_raw
         with eval_progress_lock:
             if eval_bar is None:
                 eval_bar = make_progress_bar(len(artifacts), desc="recovering evaluations", initial=1)
             else:
                 eval_bar.update(1)
+            if not future.cancelled() and future.exception() is None:
+                live_best_raw, best_line = _advance_live_best_raw(future.result(), live_best_raw, problem)
+                if best_line:
+                    writer = getattr(eval_bar, "write", None)
+                    if callable(writer):
+                        writer(f"[step {step_idx}] {best_line}")
+                    else:
+                        print(f"[step {step_idx}] {best_line}", flush=True)
 
     results = [None] * len(artifacts)
-    live_best_state = sampler.best_raw_state(maximize=bool(problem.maximize))
-    live_best_raw = (
-        float(live_best_state.raw_score) if live_best_state is not None else None)
     try:
         evaluation_futures = {}
         for index, item in enumerate(artifacts):
@@ -1168,8 +1175,6 @@ def _finalize_pending_spo_rs_artifacts(
             index = evaluation_futures[future]
             result = future.result()
             results[index] = result
-            live_best_raw, best_line = _advance_live_best_raw(
-                result, live_best_raw, bool(problem.maximize))
             item = artifacts[index]
             evaluated_meta = _evaluated_rollout_meta(item["meta"], result)
             save_rollout(
@@ -1177,12 +1182,6 @@ def _finalize_pending_spo_rs_artifacts(
                 int(item["meta"]["rollout"]), "", evaluated_meta,
                 artifacts_already_saved=True)
             item["meta"] = evaluated_meta
-            if best_line:
-                writer = getattr(eval_bar, "write", None)
-                if callable(writer):
-                    writer(f"[step {step_idx}] {best_line}")
-                else:
-                    print(f"[step {step_idx}] {best_line}", flush=True)
     finally:
         evaluation_pool.shutdown(wait=True, cancel_futures=False)
         if eval_bar is not None:
@@ -2211,8 +2210,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
             if (record is not None and not _future.cancelled()
                     and _future.exception() is None):
                 result = _future.result()
-                live_best_raw, best_line = _advance_live_best_raw(
-                    result, live_best_raw, bool(problem.maximize))
+                live_best_raw, best_line = _advance_live_best_raw(result, live_best_raw, problem)
                 evaluated_meta = _evaluated_rollout_meta(record["_pending_meta"], result)
                 if critic_mode:
                     evaluated_meta["archive_eligible"] = bool(result.valid and result.code)
