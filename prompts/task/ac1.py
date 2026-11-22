@@ -1,7 +1,7 @@
 """Upstream TTT-Discover task for AC1."""
 
 
-TARGET = 1.5025
+TARGET = 1.5030
 
 
 TASK_PROMPT = '''Act as an expert software developer and inequality specialist specializing in creating step functions with certain properties.
