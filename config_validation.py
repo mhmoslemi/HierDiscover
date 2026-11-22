@@ -9,13 +9,16 @@ from pathlib import Path
 
 
 LLM_CRITIC_MODE = "llm-critic"
-ADVANTAGE_MODES = ("entropic", "spo-rs", "hybrid", LLM_CRITIC_MODE)
+SPO_RS_INVARIANT_MODE = "spo-rs-invariant"
+HYBRID_INVARIANT_MODE = "hybrid-invariant"
+INVARIANT_ADVANTAGE_MODES = (SPO_RS_INVARIANT_MODE, HYBRID_INVARIANT_MODE)
+ADVANTAGE_MODES = ("entropic", "spo-rs", "hybrid", *INVARIANT_ADVANTAGE_MODES, LLM_CRITIC_MODE)
 PARENT_SELECTION_MODES = ("puct", "uct")
 LEGACY_CODER_CAP_KEY = "coder_thinking_budget"
 
 
 def uses_hybrid_policy_loss(mode):
-    return mode in ("hybrid", LLM_CRITIC_MODE)
+    return mode in ("hybrid", HYBRID_INVARIANT_MODE, LLM_CRITIC_MODE)
 
 
 # These settings are consumed by the shared training, generation, search,
@@ -56,6 +59,7 @@ COMMON_OPTIONAL_KEYS = frozenset({
     "spo_rs_clip_epsilon", "spo_rs_clip_epsilon_low",
     "spo_rs_clip_epsilon_high",
     "hybrid_ttt_weight", "hybrid_spo_weight",
+    "hybrid_invariant_lambda", "hybrid_invariant_target_rms",
 })
 
 # Compatibility filter only: these keys cannot activate any runtime behavior.
@@ -174,6 +178,17 @@ def validate_hybrid_weight(key: str, value, *, source=None) -> None:
         raise ValueError(f"{_label(source)}: {key} must be a finite nonnegative number")
 
 
+def validate_hybrid_invariant_options(data, *, source=None) -> None:
+    if "hybrid_invariant_lambda" in data:
+        value = data["hybrid_invariant_lambda"]
+        if isinstance(value, bool) or not isinstance(value, Real) or not 0 <= value <= 1:
+            raise ValueError(f"{_label(source)}: hybrid_invariant_lambda must be in [0, 1]")
+    if "hybrid_invariant_target_rms" in data:
+        value = data["hybrid_invariant_target_rms"]
+        if isinstance(value, bool) or not isinstance(value, Real) or not isfinite(value) or value <= 0:
+            raise ValueError(f"{_label(source)}: hybrid_invariant_target_rms must be finite and positive")
+
+
 def validate_problem_config(
     data: Mapping, *, source: str | Path | None = None,
     require_complete: bool = True,
@@ -282,6 +297,7 @@ def validate_problem_config(
     for key in ("hybrid_ttt_weight", "hybrid_spo_weight"):
         if key in data:
             validate_hybrid_weight(key, data[key], source=source)
+    validate_hybrid_invariant_options(data, source=source)
     if "eval_cpus" in data:
         _positive_int(data, "eval_cpus", source)
     if "num_circles" in data:

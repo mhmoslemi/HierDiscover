@@ -11,9 +11,10 @@ from types import SimpleNamespace
 import yaml
 from config_validation import (
     ADVANTAGE_MODES, COMMON_OPTIONAL_KEYS, COMMON_REQUIRED_KEYS, LEGACY_CODER_CAP_KEY,
+    HYBRID_INVARIANT_MODE, INVARIANT_ADVANTAGE_MODES, SPO_RS_INVARIANT_MODE,
     LLM_CRITIC_MODE, PARENT_SELECTION_MODES, RETIRED_BATCH_GROWTH_KEYS, RETIRED_TRAINER_KEYS,
     reject_retired_coder_cap, retired_search_keys, uses_hybrid_policy_loss,
-    validate_hybrid_weight, validate_problem_config,
+    validate_hybrid_invariant_options, validate_hybrid_weight, validate_problem_config,
 )
 from runtime.hardware_profiles import generation_cpu_ids, local_checkpoint, restore_hardware_settings
 
@@ -38,7 +39,7 @@ SPO_RS_CLIP_EPSILON_HIGH_DEFAULT = 0.35
 
 
 def _is_spo_rs_mode(mode):
-    return str(mode).lower() == "spo-rs"
+    return str(mode).lower() in ("spo-rs", SPO_RS_INVARIANT_MODE)
 
 
 def _uses_clipped_policy_loss(mode):
@@ -46,7 +47,7 @@ def _uses_clipped_policy_loss(mode):
 
 
 def _uses_reward_history(mode):
-    return str(mode).lower() in {"spo-rs", "hybrid"}
+    return str(mode).lower() in ("spo-rs", "hybrid", *INVARIANT_ADVANTAGE_MODES)
 
 
 def _uses_replayable_policy_update(mode):
@@ -96,17 +97,19 @@ def _resolve_policy_options(merged):
 
 
 def _resolve_spo_rs_options(merged):
-    if not _uses_reward_history(merged.get("advantage_mode")):
+    mode = merged.get("advantage_mode")
+    if not _uses_reward_history(mode):
         return
 
-    clipped = _is_spo_rs_mode(merged.get("advantage_mode"))
+    clipped = _is_spo_rs_mode(mode)
     raw_clip_epsilon = merged.get("spo_rs_clip_epsilon")
     defaults = {
-        "spo_rs_beta": SPO_RS_BETA_DEFAULT,
         "spo_rs_d_half": SPO_RS_D_HALF_DEFAULT,
         "spo_rs_rho_min": SPO_RS_RHO_MIN_DEFAULT,
         "spo_rs_rho_max": SPO_RS_RHO_MAX_DEFAULT,
     }
+    if mode not in INVARIANT_ADVANTAGE_MODES:
+        defaults["spo_rs_beta"] = SPO_RS_BETA_DEFAULT
     if clipped:
         defaults["spo_rs_clip_epsilon"] = SPO_RS_CLIP_EPSILON_DEFAULT
     for name, default in defaults.items():
@@ -115,7 +118,7 @@ def _resolve_spo_rs_options(merged):
         if not math.isfinite(value):
             raise ValueError(f"{name} must be finite")
         merged[name] = value
-    if merged["spo_rs_beta"] <= 0.0:
+    if "spo_rs_beta" in defaults and merged["spo_rs_beta"] <= 0.0:
         raise ValueError("spo_rs_beta must be positive")
     if merged["spo_rs_d_half"] <= 0.0:
         raise ValueError("spo_rs_d_half must be positive")
@@ -218,12 +221,15 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--kl-penalty-coef", type=float, default=None)
     p.add_argument("--advantage-mode", type=str.lower,
                    choices=list(ADVANTAGE_MODES), default=None,
-                   help="Objective: entropic (adaptive beta), spo-rs (historical "
-                        "baseline), hybrid (sibling and historical credit), or "
-                        "llm-critic (GPT-OSS credit with the hybrid policy loss).")
+                   help="Rollout advantage and policy loss. The invariant modes use "
+                        "a weighted history with an adaptive KL tilt.")
     p.add_argument("--spo-rs-beta", type=float, default=None,
-                   help="Fixed exponential coefficient and advantage divisor for SPO-RS "
+                   help="Fixed coefficient and advantage divisor for spo-rs and hybrid "
                         f"(default {SPO_RS_BETA_DEFAULT}).")
+    p.add_argument("--hybrid-invariant-lambda", type=float, default=None,
+                   help="Weight on sibling advantages in hybrid-invariant (default 0.5).")
+    p.add_argument("--hybrid-invariant-target-rms", type=float, default=None,
+                   help="Target batch RMS for hybrid-invariant advantages (default 1.0).")
     p.add_argument("--spo-rs-d-half", type=float, default=None,
                    help="SPO-RS: policy-KL half-life D_half "
                         f"(default {SPO_RS_D_HALF_DEFAULT}).")
@@ -634,7 +640,9 @@ def load_config():
     merged["advantage_mode"] = advantage_mode
     saved_mode = str(saved.get("advantage_mode") or "entropic").lower()
     hybrid_loss = uses_hybrid_policy_loss(advantage_mode)
-    if saved and advantage_mode != saved_mode and (hybrid_loss or uses_hybrid_policy_loss(saved_mode)):
+    if saved and advantage_mode != saved_mode and (
+            hybrid_loss or uses_hybrid_policy_loss(saved_mode)
+            or advantage_mode in INVARIANT_ADVANTAGE_MODES or saved_mode in INVARIANT_ADVANTAGE_MODES):
         raise ValueError(f"Resume this run with its saved advantage mode ({saved_mode}) and reward scale")
     if advantage_mode == "hybrid":
         if saved and "hybrid_spo_weight" not in saved:
@@ -645,6 +653,16 @@ def load_config():
             weight = (saved or merged).get(key, default)
             validate_hybrid_weight(key, weight, source=weight_source)
             merged[key] = float(weight)
+    elif advantage_mode == HYBRID_INVARIANT_MODE:
+        defaults = {"hybrid_invariant_lambda": 0.5, "hybrid_invariant_target_rms": 1.0}
+        for key, default in defaults.items():
+            merged.setdefault(key, default)
+        validate_hybrid_invariant_options(merged, source=saved_config_path if saved else cfg_path)
+        for key, default in defaults.items():
+            value = float(merged[key])
+            if saved and value != float(saved.get(key, default)):
+                raise ValueError(f"{advantage_mode} resume requires the saved {key}")
+            merged[key] = value
     if hybrid_loss:
         merged["grad_clip"] = 0.0
         if not saved and args.kl_penalty_coef is None:

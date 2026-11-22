@@ -1,12 +1,29 @@
-"""Fixed-beta SPO-RS with a historical run-wide baseline."""
+"""Run-wide reward history for fixed and adaptive SPO-RS advantages."""
 
 from __future__ import annotations
 
 import math
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Sequence
 
 import numpy as np
+
+from training.advantage import capped_weighted_tilt, invariant_group_advantages
+
+
+def _validate_history_decay(d_half, rho_min, rho_max):
+    if not math.isfinite(d_half) or d_half <= 0.0:
+        raise ValueError("SPO-RS D_half must be finite and positive")
+    if not 0.0 < rho_min <= rho_max < 1.0:
+        raise ValueError("SPO-RS rho bounds must satisfy 0 < min <= max < 1")
+
+
+def _history_retention(divergence, d_half, rho_min, rho_max):
+    if math.isnan(divergence) or divergence < 0.0:
+        raise ValueError("SPO-RS policy divergence must be nonnegative")
+    raw_rho = 0.0 if math.isinf(divergence) else 2.0 ** (-divergence / d_half)
+    return min(rho_max, max(rho_min, raw_rho))
 
 
 class SPORSTracker:
@@ -30,12 +47,7 @@ class SPORSTracker:
     def _validate_options(self) -> None:
         if not math.isfinite(self.entropic_beta) or self.entropic_beta <= 0.0:
             raise ValueError("SPO-RS entropic beta must be finite and positive")
-        if not math.isfinite(self.d_half) or self.d_half <= 0.0:
-            raise ValueError("SPO-RS D_half must be finite and positive")
-        if (not math.isfinite(self.rho_min)
-                or not math.isfinite(self.rho_max)
-                or not 0.0 < self.rho_min <= self.rho_max < 1.0):
-            raise ValueError("SPO-RS rho bounds must satisfy 0 < min <= max < 1")
+        _validate_history_decay(self.d_half, self.rho_min, self.rho_max)
 
     def __len__(self) -> int:
         return int(self._value is not None)
@@ -158,11 +170,7 @@ class SPORSTracker:
             count_after = current_count / (1.0 - self.rho_min)
         else:
             divergence = float(divergence)
-            if math.isnan(divergence) or divergence < 0.0:
-                raise ValueError("SPO-RS policy divergence must be nonnegative")
-            raw_rho = (0.0 if math.isinf(divergence)
-                       else 2.0 ** (-divergence / self.d_half))
-            rho = min(self.rho_max, max(self.rho_min, raw_rho))
+            rho = _history_retention(divergence, self.d_half, self.rho_min, self.rho_max)
             retained_count = rho * count_before
             count_after = retained_count + current_count
             value_after = (
@@ -246,3 +254,196 @@ class SPORSTracker:
         self._last_policy_adapter = None if adapter is None else Path(adapter).name
         self._last_step = int(state.get("last_step", -1))
         self._updates = int(state.get("updates", int(self._value is not None)))
+
+
+def _reward_beta(theta, span):
+    beta = theta / span if span else 0.0
+    return beta if math.isfinite(beta) else None
+
+
+@dataclass(frozen=True)
+class InvariantBatch:
+    effective_rewards: np.ndarray | None
+    valid: np.ndarray
+    historical: np.ndarray
+    sibling: np.ndarray
+    sibling_betas: list[float | None]
+    applied: np.ndarray
+    info: dict
+
+
+class InvariantSPORSTracker:
+    """Retain the effective rewards and weights needed to refit the tilt."""
+
+    VERSION = 3
+    consecutive_policy_divergence = staticmethod(SPORSTracker.consecutive_policy_divergence)
+
+    def __init__(self, *, d_half, rho_min, rho_max, policy_adapter):
+        _validate_history_decay(d_half, rho_min, rho_max)
+        self.d_half = d_half
+        self.rho_min = rho_min
+        self.rho_max = rho_max
+        self.last_policy_adapter = Path(policy_adapter).name
+        self.last_step = -1
+        self._rewards = np.empty(0, dtype=np.float64)
+        self._weights = np.empty(0, dtype=np.float64)
+        self._valid = np.empty(0, dtype=bool)
+
+    @property
+    def initialized(self):
+        # Policy KL bookkeeping starts before the first valid reward.
+        return bool(self.last_policy_adapter)
+
+    def __len__(self):
+        return self._rewards.size
+
+    def _impute_failures(self, rewards, valid):
+        if valid.all():
+            return rewards
+        current = rewards[valid]
+        history = self._rewards[self._valid]
+        if not (history.size or current.size):
+            return None
+
+        minimum = min(float(values.min()) for values in (history, current) if values.size)
+        reference = history if history.size else current
+        weights = self._weights[self._valid] if history.size else None
+        if weights is not None:
+            weights = weights / weights.sum()
+        low = float(reference.min())
+        span = float(reference.max()) - low
+        if not math.isfinite(span):
+            raise FloatingPointError("nonfinite valid reward range")
+        std = 0.0
+        if span:
+            scaled = (reference - low) / span
+            mean = np.average(scaled, weights=weights)
+            std = span * math.sqrt(np.average((scaled - mean) ** 2, weights=weights))
+        failure_reward = minimum - std
+        if not math.isfinite(failure_reward):
+            raise FloatingPointError("nonfinite imputed failure reward")
+        rewards[~valid] = failure_reward
+        return rewards
+
+    def calculate(self, rewards, valid, *, group_size, mixing_weight=None, target_rms=1.0):
+        """Calculate one complete batch against the history entering its step."""
+        rewards = np.array(rewards, dtype=np.float64, copy=True)
+        valid = np.asarray(valid, dtype=bool)
+        if (rewards.ndim != 1 or rewards.shape != valid.shape or not rewards.size
+                or group_size < 1 or rewards.size % group_size):
+            raise ValueError("invariant SPO-RS needs an ordered batch of complete groups")
+        if not np.isfinite(rewards[valid]).all():
+            raise ValueError("invariant SPO-RS requires finite valid rewards")
+        effective = self._impute_failures(rewards, valid)
+        historical = np.zeros_like(rewards)
+        theta = span = kl = 0.0
+        log_partition = None
+        if effective is not None:
+            if not self._rewards.size:
+                historical, theta, span, kl = invariant_group_advantages(effective)
+            else:
+                center = float(self._rewards.max())
+                span = max(center, float(effective.max())) - min(
+                    float(self._rewards.min()), float(effective.min()))
+                if not math.isfinite(span):
+                    raise FloatingPointError("nonfinite invariant reward range")
+                log_partition = 0.0
+                if span:
+                    probabilities = self._weights / self._weights.sum()
+                    theta, log_partition, kl = capped_weighted_tilt(
+                        (self._rewards - center) / span, probabilities)
+                    historical = np.expm1(theta * ((effective - center) / span) - log_partition)
+
+        sibling = np.zeros_like(rewards)
+        sibling_betas = [0.0] * (rewards.size // group_size)
+        if effective is not None:
+            for group, start in enumerate(range(0, rewards.size, group_size)):
+                group_slice = slice(start, start + group_size)
+                sibling[group_slice], sibling_theta, sibling_span, _ = (
+                    invariant_group_advantages(effective[group_slice]))
+                sibling_betas[group] = _reward_beta(sibling_theta, sibling_span)
+        info = {
+            "theta": theta, "reward_span": span, "tilt_kl": kl,
+            "beta": _reward_beta(theta, span), "log_partition": log_partition,
+            "pooled_start": not self._rewards.size,
+        }
+        applied = historical
+        if mixing_weight is not None:
+            mixed = mixing_weight * sibling + (1.0 - mixing_weight) * historical
+            peak = float(np.max(np.abs(mixed)))
+            rms = 0.0
+            applied = mixed
+            if peak:
+                scaled = mixed / peak
+                scaled_rms = math.sqrt(np.mean(scaled ** 2))
+                rms = peak * scaled_rms
+                applied = (scaled / scaled_rms) * target_rms
+            if not np.isfinite(applied).all():
+                raise FloatingPointError("nonfinite invariant hybrid advantages")
+            info.update(hybrid_invariant_lambda=mixing_weight,
+                        hybrid_invariant_target_rms=target_rms, hybrid_invariant_mixture_rms=rms)
+        return InvariantBatch(effective, valid, historical, sibling, sibling_betas, applied, info)
+
+    def update(self, batch, *, divergence, policy_adapter, step):
+        """Decay and append once after the complete batch has been scored."""
+        if step != self.last_step + 1:
+            raise ValueError("invariant SPO-RS history must advance one step at a time")
+        divergence = float(divergence)
+        rho = _history_retention(divergence, self.d_half, self.rho_min, self.rho_max)
+        count_before = len(self)
+        retained = self._weights * rho
+        keep = retained > 0.0
+        new_rewards = batch.effective_rewards
+        if new_rewards is None:
+            new_rewards = np.empty(0, dtype=np.float64)
+        self._rewards = np.concatenate((self._rewards[keep], new_rewards))
+        self._weights = np.concatenate((retained[keep], np.ones(new_rewards.size)))
+        self._valid = np.concatenate((self._valid[keep], batch.valid[:new_rewards.size]))
+        self.last_step = step
+        self.last_policy_adapter = Path(policy_adapter).name
+        return {
+            **batch.info,
+            "history_size_before": count_before,
+            "history_size_after": len(self),
+            "group_size": batch.valid.size,
+            "divergence": divergence if math.isfinite(divergence) else None,
+            "divergence_missing": math.isinf(divergence),
+            "rho": rho,
+            "policy_adapter": self.last_policy_adapter,
+            "step": step,
+        }
+
+    def state_dict(self):
+        return {
+            "version": self.VERSION,
+            "d_half": self.d_half,
+            "rho_min": self.rho_min,
+            "rho_max": self.rho_max,
+            "rewards": self._rewards.tolist(),
+            "weights": self._weights.tolist(),
+            "valid": self._valid.tolist(),
+            "last_policy_adapter": self.last_policy_adapter,
+            "last_step": self.last_step,
+        }
+
+    def load_state_dict(self, state):
+        if not isinstance(state, dict) or state.get("version") != self.VERSION:
+            raise ValueError("invariant SPO-RS requires its weighted history checkpoint")
+        for key in ("d_half", "rho_min", "rho_max"):
+            if float(state[key]) != getattr(self, key):
+                raise ValueError(f"invariant SPO-RS checkpoint {key} differs from config")
+        rewards = np.asarray(state["rewards"], dtype=np.float64)
+        weights = np.asarray(state["weights"], dtype=np.float64)
+        valid = np.asarray(state["valid"])
+        adapter = state["last_policy_adapter"]
+        last_step = int(state["last_step"])
+        if (rewards.ndim != 1 or rewards.shape != weights.shape or rewards.shape != valid.shape
+                or not np.isfinite(rewards).all()
+                or not ((weights > 0.0) & (weights <= 1.0)).all()
+                or (valid.size and valid.dtype != bool)
+                or not isinstance(adapter, str) or not adapter or last_step < -1
+                or (last_step == -1 and rewards.size)):
+            raise ValueError("invalid invariant SPO-RS history checkpoint")
+        self._rewards, self._weights, self._valid = rewards, weights, valid.astype(bool, copy=False)
+        self.last_policy_adapter = Path(adapter).name
+        self.last_step = last_step
