@@ -325,7 +325,7 @@ class InvariantSPORSTracker:
         rewards[~valid] = failure_reward
         return rewards
 
-    def calculate(self, rewards, valid, *, group_size, mixing_weight=None, target_rms=1.0):
+    def calculate(self, rewards, valid, *, group_size, ttt_weight=None, spo_weight=1.0):
         """Calculate one complete batch against the history entering its step."""
         rewards = np.array(rewards, dtype=np.float64, copy=True)
         valid = np.asarray(valid, dtype=bool)
@@ -368,20 +368,10 @@ class InvariantSPORSTracker:
             "pooled_start": not self._rewards.size,
         }
         applied = historical
-        if mixing_weight is not None:
-            mixed = mixing_weight * sibling + (1.0 - mixing_weight) * historical
-            peak = float(np.max(np.abs(mixed)))
-            rms = 0.0
-            applied = mixed
-            if peak:
-                scaled = mixed / peak
-                scaled_rms = math.sqrt(np.mean(scaled ** 2))
-                rms = peak * scaled_rms
-                applied = (scaled / scaled_rms) * target_rms
+        if ttt_weight is not None:
+            applied = ttt_weight * sibling + spo_weight * historical
             if not np.isfinite(applied).all():
                 raise FloatingPointError("nonfinite invariant hybrid advantages")
-            info.update(hybrid_invariant_lambda=mixing_weight,
-                        hybrid_invariant_target_rms=target_rms, hybrid_invariant_mixture_rms=rms)
         return InvariantBatch(effective, valid, historical, sibling, sibling_betas, applied, info)
 
     def update(self, batch, *, divergence, policy_adapter, step):

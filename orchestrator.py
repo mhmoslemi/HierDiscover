@@ -26,7 +26,8 @@ from pathlib import Path
 from types import SimpleNamespace
 import numpy as np
 from config_validation import (
-    HYBRID_INVARIANT_MODE, INVARIANT_ADVANTAGE_MODES, LLM_CRITIC_MODE, PARENT_SELECTION_MODES,
+    DEFAULT_EVAL_PROGRESS_INTERVAL_S, HYBRID_INVARIANT_MODE, INVARIANT_ADVANTAGE_MODES,
+    LLM_CRITIC_MODE, PARENT_SELECTION_MODES,
     SPO_RS_INVARIANT_MODE, reject_retired_coder_cap, uses_hybrid_policy_loss,
 )
 from generation.output_validation import coder_output_issue
@@ -1038,8 +1039,10 @@ def _finalize_pending_spo_rs_artifacts(
         for parent in parents
     ]
 
-    cpu_eval_progress = (CpuEvaluationProgress(step_idx, len(artifacts))
-                         if cfg.evaluation_gpu_id is None else None)
+    cpu_eval_progress = None
+    if cfg.evaluation_gpu_id is None:
+        interval = getattr(cfg, "eval_progress_interval_s", DEFAULT_EVAL_PROGRESS_INTERVAL_S)
+        cpu_eval_progress = CpuEvaluationProgress(step_idx, len(artifacts), interval=interval)
     isolated_eval = bool(getattr(cfg, "isolate_eval", False))
     isolated_slots = None
     isolated_memory_limit = None
@@ -1369,12 +1372,12 @@ def _rebind_interrupted_step_zero_selection(sampler, exp_dir, parents):
         sampler.reassign_seed_id(parent, str(row["parent_id"]))
 
 
-def _invariant_batch(cfg, tracker, rows):
+def _invariant_batch(cfg, tracker, rows, *, combine=True):
     hybrid_options = {}
-    if cfg.advantage_mode == HYBRID_INVARIANT_MODE:
+    if combine and cfg.advantage_mode == HYBRID_INVARIANT_MODE:
         hybrid_options = {
-            "mixing_weight": cfg.hybrid_invariant_lambda,
-            "target_rms": cfg.hybrid_invariant_target_rms,
+            "ttt_weight": cfg.hybrid_ttt_weight,
+            "spo_weight": cfg.hybrid_spo_weight,
         }
     return tracker.calculate(
         [row["reward"] for row in rows], [row["valid"] for row in rows],
@@ -1405,8 +1408,20 @@ def _restore_saved_spo_rs_update(cfg, artifacts, spo_rs_tracker, sampling_adapte
         raise RuntimeError("evaluated-step recovery found an invalid SPO-RS divergence")
 
     if cfg.advantage_mode in INVARIANT_ADVANTAGE_MODES:
-        batch = _invariant_batch(cfg, spo_rs_tracker, rows)
-        if not np.allclose(batch.applied, saved_advantages, rtol=0.0, atol=1e-10):
+        legacy_rms = (cfg.advantage_mode == HYBRID_INVARIANT_MODE
+                      and "hybrid_invariant_mixture_rms" in spo_info)
+        batch = _invariant_batch(cfg, spo_rs_tracker, rows, combine=not legacy_rms)
+        expected = batch.applied
+        if legacy_rms:
+            # Reproduce steps whose labels were persisted with RMS normalization.
+            mix = float(spo_info["hybrid_invariant_lambda"])
+            expected = mix * batch.sibling + (1.0 - mix) * batch.historical
+            peak = float(np.max(np.abs(expected)))
+            if peak:
+                scaled = expected / peak
+                expected = (scaled / math.sqrt(np.mean(scaled ** 2))) * float(
+                    spo_info["hybrid_invariant_target_rms"])
+        if not np.allclose(expected, saved_advantages, rtol=0.0, atol=1e-10):
             raise RuntimeError("evaluated-step recovery advantages differ from the saved invariant batch")
         effective = batch.effective_rewards
         effective_rewards = [None] * len(rows) if effective is None else effective.tolist()
@@ -1414,6 +1429,9 @@ def _restore_saved_spo_rs_update(cfg, artifacts, spo_rs_tracker, sampling_adapte
             raise RuntimeError("evaluated-step recovery rewards differ from the saved invariant batch")
         tracker_update = spo_rs_tracker.update(
             batch, divergence=divergence, policy_adapter=sampling_adapter_path, step=step_idx)
+        if legacy_rms:
+            for key in ("hybrid_invariant_lambda", "hybrid_invariant_target_rms", "hybrid_invariant_mixture_rms"):
+                tracker_update[key] = spo_info[key]
         return spo_info, tracker_update, divergence
 
     rewards = [float(row["reward"]) for row in rows]
@@ -1465,7 +1483,8 @@ def _resume_spo_rs_step_from_artifacts(
         artifacts, evaluation_complete=None):
     """Finish one interrupted policy update from its durable evaluations."""
     import torch
-    from experiment_io import load_rollout_logprobs, save_best_state_snapshot, save_rollout
+    from experiment_io import (advantage_plot_rollout, load_rollout_logprobs,
+                               save_best_state_snapshot, save_rollout)
     from evaluation.reward import extract_python_code
     from generation.gen_workers import native_final_answer_scope
     from search.sampler import State
@@ -1479,7 +1498,7 @@ def _resume_spo_rs_step_from_artifacts(
         raise RuntimeError("evaluated-step recovery requires the pre-step SPO-RS tracker")
     if sampling_adapter_path is None or not Path(sampling_adapter_path).is_dir():
         raise FileNotFoundError(f'evaluated-step recovery cannot find the sampling adapter: {sampling_adapter_path}')
-    hybrid_mode = cfg.advantage_mode == "hybrid"
+    hybrid_mode = cfg.advantage_mode in ("hybrid", HYBRID_INVARIANT_MODE)
     hybrid_loss = uses_hybrid_policy_loss(cfg.advantage_mode)
     if critic_mode:
         judged = critic_step.load_batch(exp_dir, step_idx)
@@ -1773,6 +1792,7 @@ def _resume_spo_rs_step_from_artifacts(
         "best_seen_snapshot": (str(Path(best_snapshot_path).relative_to(exp_dir))
                                if best_snapshot_path is not None else None),
         "planned_rollouts": len(artifacts),
+        "advantage_plot_rollouts": [advantage_plot_rollout(item["meta"]) for item in artifacts],
         "result_metric_name": str(problem.metric_name),
         "result_maximize": bool(problem.maximize),
         "step_best_raw_score": (
@@ -1806,7 +1826,7 @@ def _resume_spo_rs_step_from_artifacts(
         stats["training_disabled"] = True
     if hybrid_loss:
         stats["hybrid_reference_kl_mean"] = hybrid_reference_mean
-    if hybrid_mode:
+    if hybrid_mode and "hybrid_invariant_mixture_rms" not in spo_info:
         stats["hybrid_ttt_weight"] = cfg.hybrid_ttt_weight
         stats["hybrid_spo_weight"] = cfg.hybrid_spo_weight
     if overflow_state is not None:
@@ -2101,7 +2121,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
     from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 
     from search.sampler import State
-    from experiment_io import (load_rollout_logprobs, load_rollout_token_ids,
+    from experiment_io import (advantage_plot_rollout, load_rollout_logprobs, load_rollout_token_ids,
                                save_best_state_snapshot, save_parent_selections,
                                save_rollout, save_rollout_artifacts, save_rollout_logprobs)
     from problems.base import is_code_failure
@@ -2171,6 +2191,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
 
     all_examples = []
     spo_rs_updates = []
+    advantage_plot_rollouts = []
     entropic_overlap_state = None
     spo_rs_overlap_state = None
     all_children = []
@@ -2225,8 +2246,10 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
     # parallel across cores. THREAD-SAFETY REQUIREMENT: each compute_reward call
     # must use a unique temp file/dir and must not os.chdir or mutate shared
     # state; otherwise concurrent runs corrupt each other's rewards.
-    cpu_eval_progress = (CpuEvaluationProgress(step_idx, total_rollouts)
-                         if cfg.evaluation_gpu_id is None else None)
+    cpu_eval_progress = None
+    if cfg.evaluation_gpu_id is None:
+        interval = getattr(cfg, "eval_progress_interval_s", DEFAULT_EVAL_PROGRESS_INTERVAL_S)
+        cpu_eval_progress = CpuEvaluationProgress(step_idx, total_rollouts, interval=interval)
     reward_pool, submit_reward, evaluation_stats = _open_reward_pool(
         cfg, problem, total_rollouts, step_idx, gen_pool, parallel_trainer,
         cpu_eval_progress=cpu_eval_progress)
@@ -3141,13 +3164,14 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                 meta["spo_rs"] = spo_rs_rollout_info[r_idx]
             if invariant_mode:
                 meta["status"] = "evaluated"
-            if hybrid_mode and not invariant_mode:
-                meta["hybrid_sibling_beta"] = float(ttt_adaptive_beta)
+            if hybrid_mode:
+                meta["hybrid_sibling_beta"] = ttt_adaptive_beta
                 meta["hybrid_spo_adjustment"] = float(cfg.hybrid_spo_weight * spo_rs_advantage)
             save_rollout(exp_dir, step_idx, g, artifact_rollout_index,
                          text, meta,
                          prompt_text=job["prompt_text"],
                          artifacts_already_saved=True)
+            advantage_plot_rollouts.append(advantage_plot_rollout(meta))
             saved_rollouts += 1
 
         # Entropic training skips constant groups. SPO-RS compares every
@@ -3344,6 +3368,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
         "best_seen_snapshot": (str(Path(best_snapshot_path).relative_to(exp_dir))
                                if best_snapshot_path is not None else None),
         "planned_rollouts": total_rollouts,
+        "advantage_plot_rollouts": advantage_plot_rollouts,
         "result_metric_name": str(problem.metric_name),
         "result_maximize": bool(problem.maximize),
         "step_best_raw_score": step_best_raw_score,
@@ -3373,7 +3398,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
         step_stats["spo_rs_policy_updated"] = False
     if hybrid_loss:
         step_stats["hybrid_reference_kl_mean"] = hybrid_reference_mean
-    if hybrid_mode and not invariant_mode:
+    if hybrid_mode:
         step_stats["hybrid_ttt_weight"] = cfg.hybrid_ttt_weight
         step_stats["hybrid_spo_weight"] = cfg.hybrid_spo_weight
     if critic_mode:
@@ -3589,7 +3614,7 @@ def _main(trainer_startup):
     selection_detail = f"c={cfg.puct_c}"
     print(f"Search selection:   {selection.upper()} ({selection_detail})")
     configured_advantage_mode = getattr(cfg, "advantage_mode", "entropic")
-    hybrid_mode = configured_advantage_mode == "hybrid"
+    hybrid_mode = configured_advantage_mode in ("hybrid", HYBRID_INVARIANT_MODE)
     invariant_mode = configured_advantage_mode in INVARIANT_ADVANTAGE_MODES
     critic_mode = configured_advantage_mode == LLM_CRITIC_MODE
     hybrid_loss = uses_hybrid_policy_loss(configured_advantage_mode)
@@ -3615,10 +3640,7 @@ def _main(trainer_startup):
             print(f"SPO-RS beta:        fixed {cfg.spo_rs_beta}")
         print(f"SPO-RS D_half:      {cfg.spo_rs_d_half}")
         print(f"SPO-RS rho min/max: {cfg.spo_rs_rho_min} / {cfg.spo_rs_rho_max}")
-        if configured_advantage_mode == HYBRID_INVARIANT_MODE:
-            print(f"Hybrid lambda:      {cfg.hybrid_invariant_lambda:g}")
-            print(f"Hybrid target RMS:  {cfg.hybrid_invariant_target_rms:g}")
-        elif hybrid_mode:
+        if hybrid_mode:
             print(f"Hybrid TTT weight:  {cfg.hybrid_ttt_weight:g}")
             print(f"Hybrid SPO-RS weight: {cfg.hybrid_spo_weight:g}")
         else:
@@ -4356,6 +4378,7 @@ def _main(trainer_startup):
                 **(stats or {}),
             }
             save_step_summary(exp_dir, step, step_summary)
+            step_plotter.submit_advantages(step)
             if is_trimul:
                 batch_path = trimul_evaluation.batch_path(exp_dir, step)
                 batch_path.unlink(missing_ok=True)

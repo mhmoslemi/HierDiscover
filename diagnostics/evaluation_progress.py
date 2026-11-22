@@ -6,6 +6,8 @@ import threading
 import time
 from contextlib import nullcontext
 
+from config_validation import DEFAULT_EVAL_PROGRESS_INTERVAL_S
+
 try:
     from tqdm import tqdm
 except ImportError:
@@ -20,7 +22,7 @@ def write_progress_line(message):
 
 
 class CpuEvaluationProgress:
-    def __init__(self, step, total, *, interval=30):
+    def __init__(self, step, total, *, interval=DEFAULT_EVAL_PROGRESS_INTERVAL_S):
         self._step = step
         self._total = total
         self._interval = interval

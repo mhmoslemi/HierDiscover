@@ -38,6 +38,10 @@ ROLLOUT_BUDGET_KEYS = (
     "groups_per_step", "group_size",
 )
 ROLLOUT_CONFIG_KEYS = ROLLOUT_BUDGET_KEYS
+_ADVANTAGE_PLOT_FIELDS = (
+    "group", "rollout", "valid", "reward", "raw_score", "advantage_mode",
+    "advantage", "ttt_advantage", "spo_rs_advantage", "spo_rs_v_t",
+)
 
 
 def _retry_rollout_filesystem(operation, path):
@@ -157,7 +161,7 @@ def load_rollout_logprobs(path):
 
 
 class StepPlotter:
-    """Refresh evaluated-step plots off the training thread, in order.
+    """Refresh step plots off the training thread, in order.
 
     Use the same Python environment, headless CPU-only subprocesses, and a
     bounded timeout per script. A single worker avoids competing plot writes;
@@ -176,7 +180,18 @@ class StepPlotter:
             max_workers=1, thread_name_prefix="step-plots")
 
     def submit(self, step):
-        self.executor.submit(self._refresh, int(step))
+        scripts = [("analysis.plot_erdos_best_curve", []),
+                   ("analysis.plot_parent_tree", [])]
+        if self.problem in {"erdos", "erdos_min_overlap", "erdos_minimum_overlap"}:
+            scripts.insert(0, ("analysis.plot_erdos", ["--saved-only"]))
+        elif self.problem in {"ac1", "ac2"}:
+            scripts.insert(0, ("analysis.plot_ac", []))
+        self.executor.submit(self._refresh, int(step), scripts)
+
+    def submit_advantages(self, step):
+        self.executor.submit(self._refresh, int(step), [
+            ("analysis.plot_advantages", ["--snapshots", str(step)]),
+        ])
 
     def close(self, *, wait=True):
         # On interruption, cancel queued plots; an already-running plot is
@@ -185,17 +200,11 @@ class StepPlotter:
             self.stopping.set()
         self.executor.shutdown(wait=wait, cancel_futures=not wait)
 
-    def _refresh(self, step):
+    def _refresh(self, step, scripts):
         import os
         import subprocess
         import sys
 
-        scripts = [("analysis.plot_erdos_best_curve", []),
-                   ("analysis.plot_parent_tree", [])]
-        if self.problem in {"erdos", "erdos_min_overlap", "erdos_minimum_overlap"}:
-            scripts.insert(0, ("analysis.plot_erdos", ["--saved-only"]))
-        elif self.problem in {"ac1", "ac2"}:
-            scripts.insert(0, ("analysis.plot_ac", []))
         environment = dict(os.environ)
         environment.update({
             "MPLBACKEND": "Agg", "CUDA_VISIBLE_DEVICES": "",
@@ -208,7 +217,7 @@ class StepPlotter:
                 for script, options in scripts:
                     if self.stopping.is_set():
                         break
-                    log.write(f"\n=== evaluated step {step}: {script} ===\n")
+                    log.write(f"\n=== step {step}: {script} ===\n")
                     log.flush()
                     try:
                         result = subprocess.run(
@@ -486,13 +495,19 @@ def save_parent_selections(exp_dir: Path, step: int, sampler_type: str,
     return path
 
 
+def advantage_plot_rollout(meta):
+    """Keep the plot inputs without copying saved constructions or logs."""
+    row = {key: meta[key] for key in _ADVANTAGE_PLOT_FIELDS if key in meta}
+    if "hybrid_invariant_mixture_rms" in (meta.get("spo_rs") or {}):
+        row["legacy_invariant_rms"] = True
+    return row
+
+
 def save_step_summary(exp_dir: Path, step: int, summary: dict):
     """Write a per-step summary (group stats, best so far, timings)."""
     step_dir = Path(exp_dir) / f"step{step:02d}"
-    step_dir.mkdir(exist_ok=True)
-    (step_dir / f"step{step:02d}.summary.json").write_text(
-        json.dumps(summary, indent=2, default=str)
-    )
+    _atomic_write_text(step_dir / f"step{step:02d}.summary.json",
+                       json.dumps(summary, indent=2, default=str))
 
 
 def save_best_state_snapshot(exp_dir: Path, step: int, state, *,

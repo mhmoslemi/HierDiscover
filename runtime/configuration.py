@@ -10,11 +10,12 @@ from types import SimpleNamespace
 
 import yaml
 from config_validation import (
-    ADVANTAGE_MODES, COMMON_OPTIONAL_KEYS, COMMON_REQUIRED_KEYS, LEGACY_CODER_CAP_KEY,
+    ADVANTAGE_MODES, COMMON_OPTIONAL_KEYS, COMMON_REQUIRED_KEYS, DEFAULT_EVAL_PROGRESS_INTERVAL_S,
+    LEGACY_CODER_CAP_KEY,
     HYBRID_INVARIANT_MODE, INVARIANT_ADVANTAGE_MODES, SPO_RS_INVARIANT_MODE,
     LLM_CRITIC_MODE, PARENT_SELECTION_MODES, RETIRED_BATCH_GROWTH_KEYS, RETIRED_TRAINER_KEYS,
     reject_retired_coder_cap, retired_search_keys, uses_hybrid_policy_loss,
-    validate_hybrid_invariant_options, validate_hybrid_weight, validate_problem_config,
+    validate_hybrid_weight, validate_problem_config,
 )
 from runtime.hardware_profiles import generation_cpu_ids, local_checkpoint, restore_hardware_settings
 
@@ -226,10 +227,9 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--spo-rs-beta", type=float, default=None,
                    help="Fixed coefficient and advantage divisor for spo-rs and hybrid "
                         f"(default {SPO_RS_BETA_DEFAULT}).")
-    p.add_argument("--hybrid-invariant-lambda", type=float, default=None,
-                   help="Weight on sibling advantages in hybrid-invariant (default 0.5).")
-    p.add_argument("--hybrid-invariant-target-rms", type=float, default=None,
-                   help="Target batch RMS for hybrid-invariant advantages (default 1.0).")
+    # Older supervisor commands can still resume an interrupted run.
+    p.add_argument("--hybrid-invariant-lambda", type=float, help=argparse.SUPPRESS)
+    p.add_argument("--hybrid-invariant-target-rms", type=float, help=argparse.SUPPRESS)
     p.add_argument("--spo-rs-d-half", type=float, default=None,
                    help="SPO-RS: policy-KL half-life D_half "
                         f"(default {SPO_RS_D_HALF_DEFAULT}).")
@@ -595,6 +595,8 @@ def load_config():
     merged.pop("measure_entropy", None)
     merged["no_train"] = bool(args.no_train)
     merged["isolate_eval"] = bool(args.isolate_eval or ydict.get("isolate_eval"))
+    merged["eval_progress_interval_s"] = ydict.get(
+        "eval_progress_interval_s", DEFAULT_EVAL_PROGRESS_INTERVAL_S)
     merged.pop("coder_retry", None)
     coder_name = merged.get("coder_model_name")
     if not isinstance(coder_name, str) or not coder_name.strip():
@@ -644,8 +646,10 @@ def load_config():
             hybrid_loss or uses_hybrid_policy_loss(saved_mode)
             or advantage_mode in INVARIANT_ADVANTAGE_MODES or saved_mode in INVARIANT_ADVANTAGE_MODES):
         raise ValueError(f"Resume this run with its saved advantage mode ({saved_mode}) and reward scale")
-    if advantage_mode == "hybrid":
-        if saved and "hybrid_spo_weight" not in saved:
+    merged.pop("hybrid_invariant_lambda", None)
+    merged.pop("hybrid_invariant_target_rms", None)
+    if advantage_mode in ("hybrid", HYBRID_INVARIANT_MODE):
+        if advantage_mode == "hybrid" and saved and "hybrid_spo_weight" not in saved:
             raise ValueError("Start a fresh hybrid run to use the new advantage formula")
         weight_source = saved_config_path if saved else cfg_path
         for key, default in (("hybrid_ttt_weight", DEFAULT_TTT_WEIGHT),
@@ -653,16 +657,6 @@ def load_config():
             weight = (saved or merged).get(key, default)
             validate_hybrid_weight(key, weight, source=weight_source)
             merged[key] = float(weight)
-    elif advantage_mode == HYBRID_INVARIANT_MODE:
-        defaults = {"hybrid_invariant_lambda": 0.5, "hybrid_invariant_target_rms": 1.0}
-        for key, default in defaults.items():
-            merged.setdefault(key, default)
-        validate_hybrid_invariant_options(merged, source=saved_config_path if saved else cfg_path)
-        for key, default in defaults.items():
-            value = float(merged[key])
-            if saved and value != float(saved.get(key, default)):
-                raise ValueError(f"{advantage_mode} resume requires the saved {key}")
-            merged[key] = value
     if hybrid_loss:
         merged["grad_clip"] = 0.0
         if not saved and args.kl_penalty_coef is None:
