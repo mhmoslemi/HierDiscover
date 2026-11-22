@@ -3509,7 +3509,7 @@ def _main(trainer_startup):
                        else cfg.evaluation_gpu_id)
     print(f"Evaluation GPU:     {evaluation_gpus if evaluation_gpus is not None else 'none'}")
     evaluation_mode = (
-        f"isolated, {cfg.reward_workers} processes/CPU (--isolate-eval)"
+        f"isolated, {cfg.reward_workers} processes per logical CPU"
         if cfg.isolate_eval else "default")
     print(f"CPU evaluation:    {evaluation_mode}")
     if cfg.generation_backend == "vllm":

@@ -182,10 +182,10 @@ def _build_arg_parser() -> argparse.ArgumentParser:
              "optimizer updates entirely.")
     p.add_argument(
         "--isolate-eval", action="store_const", const=True, default=None,
-        help="Run every CPU candidate in its own one-CPU-affined sandbox. "
+        help="Enable CPU isolation (on by default in the AC1, AC2, and Erdős presets). "
+             "Run every CPU candidate in a sandbox pinned to one logical CPU. "
              "In this mode reward_workers is concurrent processes per CPU, "
-             "and excess candidates wait in the executor queue. Without this "
-             "flag the existing evaluation path is unchanged.")
+             "and excess candidates wait in the executor queue.")
     p.add_argument("--generation-backend", choices=["hf", "vllm"], default=None,
                    help="Engine used by generation workers. Independent of the "
                         "differentiable training backend.")
@@ -544,6 +544,9 @@ def load_config():
         for key in ("budget_s", "sandbox_timeout_s", "eval_cpus", "kernel_python"):
             if key in ydict:
                 merged[key] = ydict[key]
+        # An isolated launch preset specifies workers per CPU, including on resume.
+        if ydict.get("isolate_eval") and "reward_workers" in ydict:
+            merged["reward_workers"] = ydict["reward_workers"]
         # A new YAML selector must not switch an old resumed run's search.
         from search.sampler import parent_selection_mode
         merged["parent_selection"] = parent_selection_mode(saved)
@@ -585,7 +588,7 @@ def load_config():
     merged["fused_long_attention"] = bool(args.fused_long_attention)
     merged.pop("measure_entropy", None)
     merged["no_train"] = bool(args.no_train)
-    merged["isolate_eval"] = bool(args.isolate_eval)
+    merged["isolate_eval"] = bool(args.isolate_eval or ydict.get("isolate_eval"))
     merged.pop("coder_retry", None)
     coder_name = merged.get("coder_model_name")
     if not isinstance(coder_name, str) or not coder_name.strip():
