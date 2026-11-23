@@ -11,8 +11,11 @@ kills the child (and its process group) on timeout.
 
 """
 
+import codecs
+import io
 import os
 import pickle
+import selectors
 import shutil
 import signal
 import subprocess
@@ -112,7 +115,8 @@ class _BoundedCapture:
         return False
 
 
-sys.stdout = _BoundedCapture(STDOUT_PATH, 1)
+if not os.environ.pop("TTT_SANDBOX_STDOUT_FEEDBACK", ""):
+    sys.stdout = _BoundedCapture(STDOUT_PATH, 1)
 sys.stderr = _BoundedCapture(STDERR_PATH, 2)
 
 # Apply the limit before importing NumPy/SciPy or the generated program.  It is
@@ -209,8 +213,64 @@ def _kill_tree(proc, pgid, hard=False):
             pass
 
 
+class _StdoutFeedback:
+    """Drain the full stdout stream while keeping its feedback and log excerpts."""
+
+    def __init__(self, pipe):
+        self._pipe = pipe
+        self._decoder = io.IncrementalNewlineDecoder(
+            codecs.getincrementaldecoder("utf-8")("ignore"), translate=True)
+        self._selector = selectors.DefaultSelector()
+        self._selector.register(pipe, selectors.EVENT_READ)
+        self._head = self._tail = self._whitespace = ""
+
+    def _append(self, text):
+        if not self._tail:
+            text = text.lstrip()
+        self._head += text[:995 - len(self._head)]
+        body = text.rstrip()
+        if body:
+            self._tail = (self._tail + self._whitespace + body)[-2001:]
+            self._whitespace = text[len(body):][-2001:]
+        else:
+            self._whitespace = (self._whitespace + text)[-2001:]
+
+    def _read(self, timeout):
+        if not self._selector.get_map() or not self._selector.select(timeout):
+            return False
+        data = os.read(self._pipe.fileno(), 64 * 1024)
+        if not data:
+            self._selector.unregister(self._pipe)
+        self._append(self._decoder.decode(data))
+        return bool(data)
+
+    def wait(self, proc, timeout):
+        deadline = None if timeout is None else time.monotonic() + timeout
+        while self._selector.get_map() and proc.poll() is None:
+            remaining = 0.05 if deadline is None else deadline - time.monotonic()
+            if remaining <= 0:
+                raise subprocess.TimeoutExpired(proc.args, timeout)
+            self._read(min(0.05, remaining))
+        proc.wait(timeout=None if deadline is None else max(0, deadline - time.monotonic()))
+
+    def finish(self):
+        # A descendant that outlives cleanup must not keep the reader open.
+        deadline = time.monotonic() + 1.0
+        while time.monotonic() < deadline and self._read(0):
+            pass
+        self._append(self._decoder.decode(b"", final=True))
+        if len(self._tail) > 2000:
+            return self._head + "\n...\n" + self._tail[-1000:]
+        return self._tail
+
+    def close(self):
+        self._selector.close()
+        self._pipe.close()
+
+
 def run_code(code: str, entrypoint: str, timeout_s: float | None, max_cpus: int = 1,
-             *, cpu_id=None, memory_limit_bytes=None, on_sandbox_deadline=None):
+             *, cpu_id=None, memory_limit_bytes=None, on_sandbox_deadline=None,
+             stdout_feedback=False):
     """
     Execute `code` (Python source) in a subprocess. Calls `entrypoint()`
     and returns whatever it returns.
@@ -237,6 +297,7 @@ def run_code(code: str, entrypoint: str, timeout_s: float | None, max_cpus: int 
     paths = []
     proc = None
     pgid = None
+    feedback = None
     try:
         # Write code to a temp file.
         with tempfile.NamedTemporaryFile(
@@ -282,6 +343,10 @@ def run_code(code: str, entrypoint: str, timeout_s: float | None, max_cpus: int 
             env["TTT_EVAL_CPU_ID"] = str(pinned_cpu)
         env["TTT_SANDBOX_CAPTURE_LIMIT_BYTES"] = str(
             _CAPTURE_LIMIT_BYTES)
+        if stdout_feedback:
+            env["TTT_SANDBOX_STDOUT_FEEDBACK"] = "1"
+        else:
+            env.pop("TTT_SANDBOX_STDOUT_FEEDBACK", None)
         if memory_limit_bytes is not None:
             resolved_memory_limit = int(memory_limit_bytes)
             if resolved_memory_limit <= 0:
@@ -291,22 +356,25 @@ def run_code(code: str, entrypoint: str, timeout_s: float | None, max_cpus: int 
         else:
             env.pop("TTT_SANDBOX_MEMORY_LIMIT_BYTES", None)
 
-        # Python-level output is written by _BoundedCapture. Native libraries
-        # inherit /dev/null for fd 1/2, preventing them from bypassing the cap.
-        # No PIPE descriptors are retained for hundreds of concurrent jobs.
+        # AC1 drains stdout directly, including writes to fd 1 from native code.
+        # The default sandbox uses the bounded capture files.
         with _SANDBOX_LAUNCH_LOCK:
             proc = subprocess.Popen(
                 [sys.executable, runner_path],
-                stdout=subprocess.DEVNULL,
+                stdout=subprocess.PIPE if stdout_feedback else subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 env=env,
                 start_new_session=True,
             )
 
-        try:
-            pgid = os.getpgid(proc.pid)
-        except Exception:
-            pgid = None
+        if stdout_feedback:
+            pgid = proc.pid  # start_new_session creates this group even for fast exits.
+            feedback = _StdoutFeedback(proc.stdout)
+        else:
+            try:
+                pgid = os.getpgid(proc.pid)
+            except Exception:
+                pgid = None
 
         deadline = None
         if on_sandbox_deadline is not None and timeout_s is not None:
@@ -315,7 +383,10 @@ def run_code(code: str, entrypoint: str, timeout_s: float | None, max_cpus: int 
         timed_out = False
         try:
             wait_timeout = timeout_s if deadline is None else max(0, deadline - time.monotonic())
-            proc.wait(timeout=wait_timeout)
+            if feedback is None:
+                proc.wait(timeout=wait_timeout)
+            else:
+                feedback.wait(proc, wait_timeout)
         except subprocess.TimeoutExpired:
             timed_out = True
             _kill_tree(proc, pgid, hard=False)
@@ -344,10 +415,9 @@ def run_code(code: str, entrypoint: str, timeout_s: float | None, max_cpus: int 
             except OSError:
                 return b""
 
-        stdout_bytes = _read_capture(stdout_path)
+        stdout_text = (_read_capture(stdout_path).decode(errors="ignore") if feedback is None
+                       else feedback.finish())
         stderr_bytes = _read_capture(stderr_path)
-        stdout_text = (
-            stdout_bytes.decode(errors="ignore") if stdout_bytes else "")
         stderr_text = (
             stderr_bytes.decode(errors="ignore") if stderr_bytes else "")
 
@@ -402,6 +472,8 @@ def run_code(code: str, entrypoint: str, timeout_s: float | None, max_cpus: int 
                 proc.wait(timeout=1.0)
             except Exception:
                 pass
+        if feedback is not None:
+            feedback.close()
         for path in paths:
             try:
                 os.unlink(path)
@@ -424,3 +496,11 @@ def my_entry():
         pass
 """
     print(run_code(bad_code, "my_entry", timeout_s=2))
+
+    long_stdout = """
+def my_entry():
+    print('x' * 270000)
+    print('final feedback')
+"""
+    result = run_code(long_stdout, "my_entry", timeout_s=10, stdout_feedback=True)
+    assert result["ok"] and result["stdout"].endswith("final feedback")

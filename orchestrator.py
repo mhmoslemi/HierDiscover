@@ -30,7 +30,9 @@ from config_validation import (
     LLM_CRITIC_MODE, PARENT_SELECTION_MODES,
     SPO_RS_INVARIANT_MODE, reject_retired_coder_cap, uses_hybrid_policy_loss,
 )
-from generation.output_validation import coder_output_issue
+from generation.output_validation import (
+    coder_output_issue, ttt_ac1_program, ttt_ac1_python_block, ttt_ac1_response_code,
+)
 # Same-name aliases retain entrypoint exports used by existing tools/tests.
 from diagnostics.console import (
     _NoticeRoutingStream as _NoticeRoutingStream,
@@ -526,9 +528,10 @@ def _legacy_resume_info(exp_dir):
     return max(matches, key=lambda item: item[0])
 
 
-def _restore_legacy_archive(sampler, exp_dir, before_step):
+def _restore_legacy_archive(sampler, exp_dir, before_step, *, tokenizer=None):
     """Recover valid candidates from rollout files that predate checkpoints."""
     from evaluation.reward import extract_python_code
+    from experiment_io import load_rollout_token_ids
     from search.sampler import State
 
     states = []
@@ -547,7 +550,14 @@ def _restore_legacy_archive(sampler, exp_dir, before_step):
             continue
         text_path = meta_path.with_name(meta_path.name.removesuffix(".meta.json") + ".txt")
         try:
-            code = extract_python_code(text_path.read_text(errors="replace"))
+            if sampler.ac1_ttt_rollouts:
+                token_path = text_path.with_suffix(".tokens.zlib")
+                if tokenizer is not None and token_path.is_file():
+                    code = ttt_ac1_response_code(tokenizer, load_rollout_token_ids(token_path))
+                else:
+                    code = ttt_ac1_python_block(text_path.read_text(errors="replace"))
+            else:
+                code = extract_python_code(text_path.read_text(errors="replace"))
         except OSError:
             code = None
         if not code:
@@ -556,7 +566,7 @@ def _restore_legacy_archive(sampler, exp_dir, before_step):
             reward = float(meta.get("reward", 0.0))
             raw = meta.get("raw_score")
             raw = float(raw) if raw is not None else None
-            construction = (_ac1_saved_construction(meta) if sampler.ac1_archive_seed is not None
+            construction = (_ac1_saved_construction(meta) if sampler.ac1_archive
                             else meta.get("construction"))
         except (TypeError, ValueError):
             continue
@@ -566,7 +576,8 @@ def _restore_legacy_archive(sampler, exp_dir, before_step):
             observation=str(meta.get("sandbox_stdout") or ""),
             previous_raw_score=meta.get("parent_raw_score"),
             poisson=meta.get("poisson"),
-            construction_length=meta.get("construction_length"),
+            construction_length=(meta.get("construction_length")
+                                 if sampler.ac1_archive else None),
         ))
     sampler.import_legacy_states(states, total_expansions=total_rollouts)
     return len(states), total_rollouts
@@ -626,7 +637,7 @@ def _complete_unfinished_rollout_paths(exp_dir, step_idx, cfg):
         return None
     paths = sorted(step_dir.glob(f"step{step_idx:02d}_group*_rollout*.meta.json"))
     parent_count = int(cfg.groups_per_step)
-    if getattr(cfg, "ac1_archive_seed", None) is not None:
+    if getattr(cfg, "ac1_ttt_rollouts", False) or getattr(cfg, "ac1_archive_seed", None) is not None:
         # Lineage blocking can yield fewer parents than the configured target.
         try:
             saved_parents = json.loads((step_dir / f"step{step_idx:02d}.parents.json").read_text())
@@ -1016,7 +1027,7 @@ def _finalize_pending_spo_rs_artifacts(
     from copy import deepcopy
 
     from experiment_io import save_rollout, save_rollout_logprobs
-    from generation.gen_workers import make_progress_bar, native_final_answer_scope
+    from generation.gen_workers import make_progress_bar
     from problems.base import ParentContext, RewardResult
     from search.sampler import State
 
@@ -1039,8 +1050,8 @@ def _finalize_pending_spo_rs_artifacts(
     if token_summary["exact_sidecars"] != len(artifacts):
         raise RuntimeError("generated-step recovery refuses non-exact response token IDs")
 
-    ac1_archive = sampler.ac1_archive_seed is not None
-    parents = sampler.sample_states(int(cfg.groups_per_step), step_idx=step_idx)
+    ac1_archive = sampler.ac1_archive
+    parents = _sample_step_parents(sampler, cfg, exp_dir, step_idx, reuse_saved=True)
     if ac1_archive and step_idx == 0:
         _rebind_interrupted_step_zero_selection(sampler, exp_dir, parents)
     parents_path = (Path(exp_dir) / f"step{int(step_idx):02d}" / f"step{int(step_idx):02d}.parents.json")
@@ -1083,15 +1094,14 @@ def _finalize_pending_spo_rs_artifacts(
         interval = getattr(cfg, "eval_progress_interval_s", DEFAULT_EVAL_PROGRESS_INTERVAL_S)
         cpu_eval_progress = CpuEvaluationProgress(step_idx, len(artifacts), interval=interval)
     evaluation_pool, evaluate_response, _ = _evaluation_pool(
-        cfg, problem, len(artifacts), step_idx, gen_pool)
+        cfg, problem, len(artifacts), step_idx, gen_pool, recovering=True)
 
     def evaluate(item, *, on_sandbox_deadline=None):
         meta = item["meta"]
         response_text = item["response_path"].read_text(encoding="utf-8", errors="replace")
-        final_text = native_final_answer_scope(
-            tokenizer, item["response_token_ids"],
-            prompt_text=item["prompt_path"].read_text(encoding="utf-8", errors="replace"))
-        issue = coder_output_issue(response_text, final_answer_text=final_text)
+        final_text, issue = _rollout_code_input(
+            cfg, tokenizer, item["response_token_ids"], response_text,
+            item["prompt_path"].read_text(encoding="utf-8", errors="replace"))
         meta["output_format_issue"] = issue
         if issue:
             return RewardResult(reward=float(problem.fail_score), msg=str(issue), failure_kind="code")
@@ -1187,10 +1197,11 @@ def _finalize_pending_spo_rs_artifacts(
                 if getattr(gen_pool, "sequential", False):
                     gen_pool.release()
 
+        context_count = len(parents) if ac1_archive else int(cfg.groups_per_step)
         divergence, missing_scores, context_divergences = (
             spo_rs_tracker.consecutive_policy_divergence(
                 current_scores, previous_scores, context_ids,
-                required_context_ids=range(len(parents))))
+                required_context_ids=range(context_count)))
         if missing_scores or not math.isfinite(divergence):
             raise RuntimeError('generated-step recovery did not obtain every exact consecutive-policy score')
 
@@ -1388,6 +1399,25 @@ def _rebind_interrupted_step_zero_selection(sampler, exp_dir, parents):
         sampler.reassign_seed_id(parent, str(row["parent_id"]))
 
 
+def _sample_step_parents(sampler, cfg, exp_dir, step_idx, *, reuse_saved=False):
+    if sampler.ac1_ttt_rollouts and reuse_saved:
+        path = Path(exp_dir) / f"step{step_idx:02d}" / f"step{step_idx:02d}.parents.json"
+        rows = sorted(json.loads(path.read_text(encoding="utf-8"))["parents"],
+                      key=lambda row: int(row["group"]))
+        return sampler.sample_states(int(cfg.groups_per_step), step_idx=step_idx, saved_parents=rows)
+    return sampler.sample_states(int(cfg.groups_per_step), step_idx=step_idx)
+
+
+def _rollout_code_input(cfg, tokenizer, token_ids, response_text, prompt_text):
+    if getattr(cfg, "ac1_ttt_rollouts", False):
+        block = ttt_ac1_response_code(tokenizer, token_ids)
+        return block, None if block else "missing Python block"
+    from generation.gen_workers import native_final_answer_scope
+
+    final_text = native_final_answer_scope(tokenizer, token_ids, prompt_text=prompt_text)
+    return final_text, coder_output_issue(response_text, final_answer_text=final_text)
+
+
 def _invariant_batch(cfg, tracker, rows, *, combine=True):
     hybrid_options = {}
     if cfg.advantage_mode == DECOMPOSE_MODE:
@@ -1518,7 +1548,7 @@ def _resume_spo_rs_step_from_artifacts(
         raise FileNotFoundError(f'evaluated-step recovery cannot find the sampling adapter: {sampling_adapter_path}')
     hybrid_mode = cfg.advantage_mode in ("hybrid", HYBRID_INVARIANT_MODE)
     hybrid_loss = uses_hybrid_policy_loss(cfg.advantage_mode)
-    ac1_archive = sampler.ac1_archive_seed is not None
+    ac1_archive = sampler.ac1_archive
     if critic_mode:
         judged = critic_step.load_batch(exp_dir, step_idx)
         if judged["adapter"] != Path(sampling_adapter_path).name:
@@ -1531,8 +1561,7 @@ def _resume_spo_rs_step_from_artifacts(
         sampler, by_group, int(cfg.groups_per_step)
     ) if step_idx == 0 and not ac1_archive else None
     if parents is None:
-        parents = sampler.sample_states(
-            int(cfg.groups_per_step), step_idx=step_idx)
+        parents = _sample_step_parents(sampler, cfg, exp_dir, step_idx, reuse_saved=True)
         if ac1_archive and step_idx == 0:
             _rebind_interrupted_step_zero_selection(sampler, exp_dir, parents)
     else:
@@ -1656,12 +1685,15 @@ def _resume_spo_rs_step_from_artifacts(
                     or _valid_example_token_logprobs(example, "behavior_logprobs")):
                 all_examples.append(example)
 
-        # Re-encoded legacy text cannot prove where a native token occurred.
-        final_text = (native_final_answer_scope(
-            tokenizer, response_tokens,
-            prompt_text=prompt_text)
-            if bool(recovery.get("exact", False)) else None)
-        code = extract_python_code(response_text, final_answer_text=final_text)
+        exact_tokens = bool(recovery.get("exact", False))
+        if sampler.ac1_ttt_rollouts:
+            code = (ttt_ac1_response_code(tokenizer, response_tokens) if exact_tokens
+                    else ttt_ac1_python_block(response_text))
+        else:
+            # Re-encoded legacy text cannot prove where a native token occurred.
+            final_text = (native_final_answer_scope(tokenizer, response_tokens, prompt_text=prompt_text)
+                          if exact_tokens else None)
+            code = extract_python_code(response_text, final_answer_text=final_text)
 
         if bool(meta.get("archive_eligible", False)):
             if not code:
@@ -1912,7 +1944,8 @@ def _automatic_sandbox_memory_limit_bytes(concurrent_sandboxes: int) -> int:
     return max(512 * 1024**2, min(1024**3, per_process))
 
 
-def _evaluation_pool(cfg, problem, rollout_count, step_idx, gen_pool, parallel_trainer=None):
+def _evaluation_pool(cfg, problem, rollout_count, step_idx, gen_pool,
+                     parallel_trainer=None, *, recovering=False):
     from concurrent.futures import ThreadPoolExecutor
     from queue import Queue
 
@@ -1925,7 +1958,7 @@ def _evaluation_pool(cfg, problem, rollout_count, step_idx, gen_pool, parallel_t
         host_admission = HostMemoryAdmission(
             multiprocessing.get_context("spawn"), hardware_profile=getattr(cfg, "hardware_profile", "RTX6000"))
     isolated_eval = bool(getattr(cfg, "isolate_eval", False))
-    paired = isolated_eval and cfg.problem == "ac1"
+    paired = isolated_eval and getattr(cfg, "problem", None) == "ac1"
     isolated_cpu_slots = None
     isolated_cpu_count = 0
     isolated_processes_per_cpu = 0
@@ -1943,22 +1976,30 @@ def _evaluation_pool(cfg, problem, rollout_count, step_idx, gen_pool, parallel_t
         isolated_capacity = len(allocations) * isolated_processes_per_cpu
         n_reward_workers = max(1, min(rollout_count, isolated_capacity))
         isolated_memory_limit_bytes = (_automatic_sandbox_memory_limit_bytes(n_reward_workers))
-        placement = ("one sandbox per exclusive CPU pair" if paired else
-                     f"up to {isolated_processes_per_cpu} sandbox process(es) per CPU")
-        setting_log_only(
-            f"[step {step_idx}] isolated evaluation pool: "
-            f"{n_reward_workers} sandbox process(es) across "
-            f"{isolated_cpu_count} CPU(s), {placement}; excess candidates remain "
-            "queued; live RAM admission is shared with model transfers and "
-            f"activation offload; RAM reservation="
-            f"{min(1024**3, isolated_memory_limit_bytes) / 1024**3:.2f} GiB/process; "
-            f"automatic address-space ceiling="
-            f"{isolated_memory_limit_bytes / 1024**3:.2f} GiB/process, "
-            "stdout+stderr capture is bounded")
+        if paired or not recovering:
+            placement = ("one sandbox per exclusive CPU pair; " if paired else
+                         f"up to {isolated_processes_per_cpu}/CPU from reward_workers; each "
+                         "process tree is pinned to one CPU and ")
+            capture = ("stdout streamed for prompt feedback, stderr capture is bounded"
+                       if paired and getattr(cfg, "ac1_ttt_rollouts", False)
+                       else "stdout+stderr capture is bounded")
+            setting_log_only(
+                f"[step {step_idx}] isolated evaluation pool: "
+                f"{n_reward_workers} sandbox process(es) across "
+                f"{isolated_cpu_count} CPU(s), {placement}excess candidates remain "
+                "queued; live RAM admission is shared with model transfers and "
+                f"activation offload; RAM reservation="
+                f"{min(1024**3, isolated_memory_limit_bytes) / 1024**3:.2f} GiB/process; "
+                f"automatic address-space ceiling="
+                f"{isolated_memory_limit_bytes / 1024**3:.2f} GiB/process, "
+                f"{capture}")
     else:
-        n_reward_workers = max(1, min(rollout_count, _resolve_reward_workers(cfg, problem)))
-        setting_log_only(f"[step {step_idx}] evaluation pool: {n_reward_workers} worker(s), "
-                         f"{getattr(problem, 'eval_cpus', 1)} CPU(s) per candidate")
+        n_reward_workers = _resolve_reward_workers(cfg, problem)
+        if recovering:
+            n_reward_workers = max(1, min(rollout_count, n_reward_workers))
+        else:
+            setting_log_only(f"[step {step_idx}] evaluation pool: {n_reward_workers} worker(s), "
+                             f"{getattr(problem, 'eval_cpus', 1)} CPU(s) per candidate")
 
     def pin_worker_to_pair():
         # The scoring thread and the sandbox it launches share this mask.
@@ -1974,7 +2015,7 @@ def _evaluation_pool(cfg, problem, rollout_count, step_idx, gen_pool, parallel_t
         if not isolated_eval:
             return problem.compute_reward(text, parent_ctx, cfg.sandbox_timeout_s, **answer_options)
         with host_admission.reservation(min(1024**3, isolated_memory_limit_bytes)):
-            cpu_id = None if paired else isolated_cpu_slots.get_nowait()
+            cpu_id = None if paired else isolated_cpu_slots.get()
             try:
                 return problem.compute_reward(
                     text, parent_ctx, cfg.sandbox_timeout_s, cpu_id=cpu_id,
@@ -2171,11 +2212,12 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
     from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 
     from search.sampler import State
-    from experiment_io import (advantage_plot_rollout, load_rollout_logprobs, load_rollout_token_ids,
+    from experiment_io import (advantage_plot_rollout, archive_unfinished_rollout_step,
+                               load_rollout_logprobs, load_rollout_token_ids,
                                save_best_state_snapshot, save_parent_selections,
                                save_rollout, save_rollout_artifacts, save_rollout_logprobs)
     from problems.base import is_code_failure
-    from generation.gen_workers import make_progress_bar, native_final_answer_scope, render_chat_prompt
+    from generation.gen_workers import make_progress_bar, render_chat_prompt
 
 
     training_enabled = not bool(getattr(cfg, "no_train", False))
@@ -2207,9 +2249,13 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
 
     is_trimul = getattr(problem, "problem_type", "") == "trimul"
     isolated_batch = trimul_evaluation.completed_batch(exp_dir, step_idx) if is_trimul else None
-    ac1_archive = sampler.ac1_archive_seed is not None
-    parents = sampler.sample_states(int(cfg.groups_per_step), step_idx=step_idx)
-    if step_idx == 0:
+    ac1_archive = sampler.ac1_archive
+    if sampler.ac1_ttt_rollouts and pending_artifacts is None:
+        backup = archive_unfinished_rollout_step(exp_dir, step_idx)
+        if backup is not None:
+            setting_log_only(f"[resume] regenerating AC1 step {step_idx}; previous artifacts moved to {backup}")
+    parents = _sample_step_parents(sampler, cfg, exp_dir, step_idx, reuse_saved=pending_artifacts is not None)
+    if step_idx == 0 and (not sampler.ac1_ttt_rollouts or pending_artifacts is not None):
         _rebind_interrupted_step_zero_selection(sampler, exp_dir, parents)
     if isolated_batch is not None or pending_artifacts is not None:
         trimul_evaluation.check_parents(exp_dir, step_idx, parents)
@@ -2395,9 +2441,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                 and all(math.isfinite(float(value)) for value in behavior_values)
                 else None)
         job = prompt_jobs[int(job_idx)]
-        final_text = native_final_answer_scope(
-            tokenizer, token_ids,
-            prompt_text=job["prompt_text"])
+        final_text, issue = _rollout_code_input(cfg, tokenizer, token_ids, text, job["prompt_text"])
         group_id = int(job["parent_group"])
         rollout_index = queued_by_parent[group_id]
         queued_by_parent[group_id] += 1
@@ -2412,7 +2456,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
             "token_ids": token_ids,
             "behavior_logprobs": behavior_logprobs,
             "reference_logprobs": None,
-            "output_format_issue": coder_output_issue(text, final_answer_text=final_text),
+            "output_format_issue": issue,
         }
         pending_meta = {
             "output_format_issue": record["output_format_issue"],
@@ -3891,6 +3935,7 @@ def _main(trainer_startup):
     # ---- sampler ----
     from search.sampler import make_sampler
     ac1_archive_seed = getattr(cfg, "ac1_archive_seed", None)
+    ac1_ttt_rollouts = getattr(cfg, "ac1_ttt_rollouts", False)
     restored_selection = (resume_payload["sampler"].get("selection_mode", cfg.parent_selection)
                           if resume_payload is not None else cfg.parent_selection)
     if restored_selection != cfg.parent_selection:
@@ -3904,13 +3949,15 @@ def _main(trainer_startup):
         seed_value=0.0,
         seed_states=seeds,
         ac1_archive_seed=ac1_archive_seed,
-        refresh_ac1_seed=(problem.refresh_ac1_seed if ac1_archive_seed is not None else None),
+        refresh_ac1_seed=(problem.refresh_ac1_seed if ac1_ttt_rollouts or ac1_archive_seed is not None else None),
+        ac1_ttt_rollouts=ac1_ttt_rollouts,
     )
     if resume_payload is not None:
         sampler.load_state_dict(resume_payload["sampler"])
         setting_log_only(f'[resume] restored exact {sampler.selection_mode.upper()} archive and search statistics')
     elif legacy_resume is not None:
-        n_states, n_rollouts = _restore_legacy_archive(sampler, exp_dir, before_step=start_step)
+        n_states, n_rollouts = _restore_legacy_archive(
+            sampler, exp_dir, before_step=start_step, tokenizer=tokenizer)
         print(f'[resume] reconstructed {n_states} valid archived candidates from {n_rollouts} earlier rollouts')
     if resume_dir and getattr(problem, "name", "") == "gpu_mode":
         restored_observations = _restore_archive_observations(sampler, exp_dir)
@@ -4561,8 +4608,11 @@ def _main(trainer_startup):
             if best.raw_score is not None else ""
         print(f"Best reward (higher=better): {best.value:.9f}{raw}")
         print(f"Found at step:     {best.timestep}")
-        print(f"\n--- best code ---\n{best.code}\n--- end ---")
-        save_final_summary(exp_dir, best.value, best.code, best.timestep,
+        best_code = best.code
+        if ac1_ttt_rollouts:
+            best_code = ttt_ac1_program(best_code) or best_code
+        print(f"\n--- best code ---\n{best_code}\n--- end ---")
+        save_final_summary(exp_dir, best.value, best_code, best.timestep,
                            best_construction=(_as_float_list(
                                getattr(best, "construction", None),
                                cfg.max_saved_construction)

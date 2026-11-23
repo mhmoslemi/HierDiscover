@@ -296,8 +296,6 @@ def make_experiment_dir(cfg, root: str = "runs", resume_dir=None,
 
 def restart_changed_rollout_step(cfg, exp_dir, step):
     """Archive an unfinished step whose prompt or rollout budget changed."""
-    import tempfile
-
     run = Path(exp_dir)
     directory = run / f"step{step:02d}"
     parents_path = directory / f"step{step:02d}.parents.json"
@@ -318,6 +316,25 @@ def restart_changed_rollout_step(cfg, exp_dir, step):
     if not (budget_changed or prompt_changed):
         return None
 
+    backup = archive_unfinished_rollout_step(exp_dir, step)
+    reasons = []
+    if budget_changed:
+        reasons.append("rollout counts changed")
+    if prompt_changed:
+        reasons.append("task prompt revision changed")
+    print(f"[resume] {'; '.join(reasons)}: restarting step {step} with "
+          f"{cfg.groups_per_step} parents x {cfg.group_size} rollouts; "
+          f"previous step artifacts moved to {backup}", flush=True)
+    return backup
+
+
+def archive_unfinished_rollout_step(exp_dir, step):
+    import tempfile
+
+    run = Path(exp_dir)
+    directory = run / f"step{step:02d}"
+    if not directory.is_dir() or (directory / f"step{step:02d}.summary.json").is_file():
+        return None
     # Partial gradients belong to the discarded trajectories.
     sidecars = [run / f".exact_spo_rs_overflow_step{step:04d}.pt"]
     marker = run / ".exact_sharded_recovery.json"
@@ -345,14 +362,6 @@ def restart_changed_rollout_step(cfg, exp_dir, step):
     if directory.is_dir():
         directory.rename(backup / directory.name)
 
-    reasons = []
-    if budget_changed:
-        reasons.append("rollout counts changed")
-    if prompt_changed:
-        reasons.append("task prompt revision changed")
-    print(f"[resume] {'; '.join(reasons)}: restarting step {step} with "
-          f"{cfg.groups_per_step} parents x {cfg.group_size} rollouts; "
-          f"previous step artifacts moved to {backup}", flush=True)
     return backup
 
 
@@ -475,6 +484,8 @@ def save_parent_selections(exp_dir: Path, step: int, sampler_type: str,
             "selection_score": (float(info["score"])
                                 if info.get("score") is not None else None),
         })
+        if parent.is_seed and getattr(rollout_config, "ac1_ttt_rollouts", False):
+            selected[-1]["seed_construction"] = parent.construction
     payload = {
         "version": 1,
         "step": int(step),

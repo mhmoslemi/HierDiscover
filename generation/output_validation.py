@@ -3,6 +3,31 @@
 import re
 
 
+def ttt_ac1_python_block(text):
+    """Use the pinned TTT parser's Python-only block boundaries."""
+    matches = list(re.finditer(r"```python\n(?!```)(.*?)(?:\n```)?(?=\n```|$)", text, re.DOTALL))
+    if matches:
+        body = matches[-1].group(1).rstrip()
+        if body.strip():
+            return f"```python\n{body}\n```"
+    return ""
+
+
+def ttt_ac1_response_code(tokenizer, token_ids):
+    (return_id,) = tokenizer.encode("<|return|>", add_special_tokens=False)
+    return_count = token_ids.count(return_id)
+    if return_count > 1:
+        raise ValueError(f"TTT AC1 response has {return_count} return tokens")
+    if return_count:
+        token_ids = token_ids[:token_ids.index(return_id)]
+    return ttt_ac1_python_block(tokenizer.decode(token_ids))
+
+
+def ttt_ac1_program(block):
+    match = re.search(r"```python\s+([\s\S]*?)\s*```", block)
+    return match[1].strip() if match else None
+
+
 def final_answer_scope(response):
     text = str(response or "")
     lowered = text.lower()

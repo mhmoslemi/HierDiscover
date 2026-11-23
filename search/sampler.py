@@ -105,12 +105,15 @@ class PUCTSampler:
         use_uct: bool = False,
         ac1_archive_seed: int | None = None,
         refresh_ac1_seed=None,
+        ac1_ttt_rollouts: bool = False,
     ):
         self.puct_c = float(puct_c)
         self.use_uct = bool(use_uct)
         self.max_buffer_size = max_buffer_size
         self.topk_children = topk_children
         self.ac1_archive_seed = ac1_archive_seed
+        self.ac1_ttt_rollouts = ac1_ttt_rollouts
+        self.ac1_archive = ac1_ttt_rollouts or ac1_archive_seed is not None
         self._refresh_ac1_seed = refresh_ac1_seed
         self._last_seed_refresh_step = None
         self._last_seed_refresh_picks = []
@@ -126,10 +129,11 @@ class PUCTSampler:
 
         self._lock = threading.RLock()
 
+        seed_timestep = -1 if ac1_ttt_rollouts else 0
         if seed_states:
             for ss in seed_states:
                 s = State.make(
-                    timestep=0,
+                    timestep=seed_timestep,
                     value=getattr(ss, "value", seed_value),
                     code=getattr(ss, "code", "") or "",
                     is_seed=True,
@@ -141,7 +145,7 @@ class PUCTSampler:
                 self._seed_ids.add(s.id)
         else:
             for _ in range(num_seeds):
-                s = State.make(timestep=0, value=seed_value, code="", is_seed=True)
+                s = State.make(timestep=seed_timestep, value=seed_value, code="", is_seed=True)
                 self._states.append(s)
                 self._seed_ids.add(s.id)
 
@@ -185,18 +189,18 @@ class PUCTSampler:
                 self._best_raw_max = state
 
     def _search_value(self, state):
-        if self.ac1_archive_seed is not None:
+        if self.ac1_archive:
             raw = self._finite_raw(state)
             return -raw if raw is not None else -np.inf
         return state.value if state.value is not None else -np.inf
 
     def _archive_key(self, state):
-        if self.ac1_archive_seed is not None and state.construction:
+        if self.ac1_archive and state.construction:
             return tuple(state.construction)
         return ("code", state.code) if state.code else None
 
     def _accepts_construction(self, state):
-        if self.ac1_archive_seed is None:
+        if not self.ac1_archive:
             return True
         length = state.construction_length
         if length is None and state.construction is not None:
@@ -207,7 +211,7 @@ class PUCTSampler:
     def _cap_archive(self):
         if len(self._states) <= self.max_buffer_size:
             return
-        if self.ac1_archive_seed is not None:
+        if self.ac1_archive:
             # Use upstream's cutoff ordering, then preserve insertion order.
             values = [self._search_value(s) for s in self._states]
             keep = {i for i, s in enumerate(self._states) if s.id in self._seed_ids}
@@ -250,7 +254,7 @@ class PUCTSampler:
             self._search_value(s) for s in self._states
             if s.id not in self._seed_ids and s.value is not None
         ])
-        if vals.size == 0 and self.ac1_archive_seed is not None:
+        if vals.size == 0 and self.ac1_archive:
             vals = np.array([self._search_value(s) for s in self._states])
         if vals.size == 0:
             return 1.0
@@ -307,11 +311,13 @@ class PUCTSampler:
             "is_seed": entry[2].id in self._seed_ids,
         }
 
-    def sample_states(self, num_states: int, *, step_idx: int | None = None):
+    def sample_states(self, num_states: int, *, step_idx: int | None = None,
+                      saved_parents=None):
         """Pick `num_states` parent states for the next batch."""
         if not self._states:
             return []
-        if (self.ac1_archive_seed is not None and step_idx is not None
+        if (self.ac1_archive and step_idx is not None
+                and (saved_parents is not None or not self.ac1_ttt_rollouts)
                 and self._last_seed_refresh_step == step_idx):
             return list(self._last_seed_refresh_picks)
         scored = self._ranked_states()
@@ -332,7 +338,7 @@ class PUCTSampler:
                 break
 
         # Only the legacy archive tops up with states from blocked lineages.
-        if self.ac1_archive_seed is None and len(picks) < num_states:
+        if not self.ac1_archive and len(picks) < num_states:
             picked_ids = {s.id for s in picks}
             for entry in scored:
                 if len(picks) >= num_states:
@@ -343,17 +349,29 @@ class PUCTSampler:
                 picks.append(s)
                 info.append(self._pick_info(entry))
 
-        if self.ac1_archive_seed is not None:
-            # Recreate the same random constructions from the pre-step checkpoint.
-            entropy = None if step_idx is None else [self.ac1_archive_seed, step_idx]
-            rng = np.random.default_rng(entropy)
+        if self.ac1_archive:
+            if saved_parents is not None and len(saved_parents) != len(picks):
+                raise RuntimeError("saved AC1 parent count differs from the checkpoint selection")
+            if not self.ac1_ttt_rollouts:
+                entropy = None if step_idx is None else [self.ac1_archive_seed, step_idx]
+                rng = np.random.default_rng(entropy)
             refreshed = {}
             for index, state in enumerate(picks):
                 if state.id in self._seed_ids:
-                    seed = self._refresh_ac1_seed(rng)
+                    if saved_parents is not None:
+                        row = saved_parents[index]
+                        construction = row.get("seed_construction")
+                        if not row["parent_is_seed"] or not construction:
+                            raise RuntimeError(f"saved AC1 group {index} is missing its seed construction")
+                        raw_score = float(row["parent_raw_score"])
+                        value = float(row["parent_reward"])
+                    else:
+                        if self.ac1_ttt_rollouts:
+                            rng = np.random.default_rng()
+                        seed = self._refresh_ac1_seed(rng)
+                        construction, raw_score, value = seed.construction, seed.raw_score, seed.value
                     refreshed[state.id] = picks[index] = replace(
-                        state, construction=seed.construction, raw_score=seed.raw_score,
-                        value=seed.value)
+                        state, construction=construction, raw_score=raw_score, value=value)
             self._states = [refreshed.get(s.id, s) for s in self._states]
             self._record_raw_states(refreshed.values())
             self._last_seed_refresh_step = step_idx
@@ -380,7 +398,7 @@ class PUCTSampler:
                 if child.value is None:
                     continue
                 pid = parent.id
-                parent_best[pid] = max(parent_best.get(pid, -np.inf), self._search_value(child))
+                parent_best[pid] = max(parent_best.get(pid, -np.inf), float(self._search_value(child)))
             for pid, best in parent_best.items():
                 self._m[pid] = max(self._m.get(pid, best), best)
 
@@ -470,26 +488,36 @@ class PUCTSampler:
     def state_dict(self):
         """Return all search state required to continue in another process."""
         with self._lock:
-            return {
+            ac1_archive = self.ac1_archive
+
+            def save_state(state):
+                if state is None:
+                    return None
+                fields = asdict(state)
+                if not ac1_archive:
+                    fields.pop("construction_length")
+                return fields
+
+            payload = {
                 "version": 1,
-                "states": [asdict(s) for s in self._states],
+                "states": [save_state(s) for s in self._states],
                 "seed_ids": sorted(self._seed_ids),
                 "n": dict(self._n),
                 "m": dict(self._m),
                 "T": int(self._T),
                 "selection_mode": self.selection_mode,
-                "ac1_archive": self.ac1_archive_seed is not None,
-                "best_raw_min": (asdict(self._best_raw_min)
-                                 if self._best_raw_min is not None else None),
-                "best_raw_max": (asdict(self._best_raw_max)
-                                 if self._best_raw_max is not None else None),
+                "best_raw_min": save_state(self._best_raw_min),
+                "best_raw_max": save_state(self._best_raw_max),
             }
+            if ac1_archive:
+                payload["ac1_archive"] = True
+            return payload
 
     def load_state_dict(self, payload):
         """Restore a snapshot produced by :meth:`state_dict`."""
         if not isinstance(payload, dict) or payload.get("version") != 1:
             raise ValueError("unsupported or invalid sampler checkpoint")
-        if bool(payload.get("ac1_archive")) != (self.ac1_archive_seed is not None):
+        if bool(payload.get("ac1_archive")) != self.ac1_archive:
             raise ValueError("sampler checkpoint uses different AC1 archive scoring rules")
         saved_mode = payload.get("selection_mode")
         current_mode = self.selection_mode
@@ -562,6 +590,9 @@ if __name__ == "__main__":
     picks2 = sampler.sample_states(2)
     print(f"Pick info: {sampler.last_picks_info}")
     print("Best state value:", sampler.best_state().value)
+    snapshot = sampler.state_dict()
+    assert "ac1_archive" not in snapshot
+    assert "construction_length" not in snapshot["states"][0]
 
     ac1 = PUCTSampler(num_seeds=1, topk_children=1, ac1_archive_seed=0)
     parent = ac1._states[0]

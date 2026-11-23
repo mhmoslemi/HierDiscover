@@ -6,7 +6,6 @@ import math
 import os
 from pathlib import Path
 import re
-import secrets
 from types import SimpleNamespace
 
 import yaml
@@ -18,9 +17,7 @@ from config_validation import (
     reject_retired_coder_cap, retired_search_keys, uses_hybrid_policy_loss,
     validate_hybrid_weight, validate_problem_config,
 )
-from runtime.hardware_profiles import (
-    cpu_threads_by_core, generation_cpu_ids, local_checkpoint, restore_hardware_settings,
-)
+from runtime.hardware_profiles import generation_cpu_ids, local_checkpoint, restore_hardware_settings
 
 from prompts.base import UPSTREAM_COMMIT
 from models.coder_profiles import (
@@ -595,16 +592,19 @@ def load_config():
         f"{UPSTREAM_COMMIT}-direct-coder"
         if merged["problem"] == "circle_packing" else UPSTREAM_COMMIT)
     if merged["problem"] == "ac1":
-        # Preserve the search score units used by existing checkpoints.
-        if resume_dir is None:
-            merged["ac1_archive_seed"] = (
-                int(merged["seed"]) if merged.get("deterministic") else secrets.randbits(64))
+        if resume_dir is None or saved.get("ac1_ttt_rollouts"):
+            merged["ac1_ttt_rollouts"] = True
+            merged.pop("ac1_archive_seed", None)
+            merged["rollout_prompt_revision"] = f"{UPSTREAM_COMMIT}-ac1-ttt-rollouts"
         elif saved.get("ac1_archive_seed") is not None:
+            # Preserve the draws and score units of existing checkpoints.
             merged["ac1_archive_seed"] = int(saved["ac1_archive_seed"])
+            merged["rollout_prompt_revision"] = f"{UPSTREAM_COMMIT}-ac1-archive"
         else:
             merged.pop("ac1_archive_seed", None)
-        if merged.get("ac1_archive_seed") is not None:
-            merged["rollout_prompt_revision"] = f"{UPSTREAM_COMMIT}-ac1-archive"
+    else:
+        merged.pop("ac1_archive_seed", None)
+        merged.pop("ac1_ttt_rollouts", None)
     merged["fused_long_attention"] = bool(args.fused_long_attention)
     merged.pop("measure_entropy", None)
     merged["no_train"] = bool(args.no_train)
@@ -987,10 +987,17 @@ def _isolated_evaluation_cpu_ids(cfg=None):
 
 def _isolated_ac1_cpu_pairs(cfg):
     cpu_ids = _isolated_evaluation_cpu_ids(cfg)
-    cores = cpu_threads_by_core(cpu_ids)
-    if cores:
+    cores = {}
+    for cpu in cpu_ids:
+        siblings_path = Path(f"/sys/devices/system/cpu/cpu{cpu}/topology/thread_siblings_list")
+        try:
+            siblings = siblings_path.read_text().strip()
+        except OSError:
+            break
+        cores.setdefault(siblings, cpu)
+    else:
         # Use one logical CPU per physical core to avoid sharing SMT siblings.
-        cpu_ids = [siblings[0] for siblings in cores.values()]
+        cpu_ids = list(cores.values())
     pairs = list(zip(cpu_ids[::2], cpu_ids[1::2]))
     if not pairs:
         raise RuntimeError("isolated AC1 evaluation requires two available CPU cores")

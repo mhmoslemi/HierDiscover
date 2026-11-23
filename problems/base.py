@@ -150,16 +150,22 @@ class Problem(ABC):
                        on_sandbox_deadline=None,
                        ) -> RewardResult:
         res = RewardResult(reward=self.fail_score)
-        code = extract_python_code(
-            response_text,
-            final_answer_text=final_answer_text,
-        )
+        ac1_ttt_rollouts = (getattr(self, "problem_type", None) == "ac1"
+                            and self.cfg.get("ac1_ttt_rollouts", False))
+        if ac1_ttt_rollouts:
+            from generation.output_validation import ttt_ac1_program, ttt_ac1_python_block
+
+            stored_code = (ttt_ac1_python_block(response_text) if final_answer_text is None
+                           else final_answer_text)
+            code = ttt_ac1_program(stored_code)
+        else:
+            code = stored_code = extract_python_code(response_text, final_answer_text=final_answer_text)
         if code is None:
             res.msg = "no_code_block"
             res.failure_kind = "code"
             return res
         res.parsed = True
-        res.code = code
+        res.code = stored_code
 
         full_code = self.preprocess(code, parent)
         out = run_code(
@@ -170,6 +176,7 @@ class Problem(ABC):
             cpu_id=cpu_id,
             memory_limit_bytes=memory_limit_bytes,
             on_sandbox_deadline=on_sandbox_deadline,
+            **({"stdout_feedback": True} if ac1_ttt_rollouts else {}),
         )
         diagnostics = [out.get("stdout", ""), out.get("traceback", ""),
                        out.get("stderr", "")]
@@ -186,7 +193,7 @@ class Problem(ABC):
         # carry engine-level fields the scorer does not set
         scored.parsed = True
         scored.ran = True
-        scored.code = code
+        scored.code = stored_code
         if not scored.stdout:
             scored.stdout = res.stdout
         if not scored.valid and not scored.msg:

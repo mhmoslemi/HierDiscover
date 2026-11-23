@@ -207,7 +207,8 @@ class ACInequalities(Problem):
                          construction=construction)
 
     def seed_states(self) -> List[SeedState]:
-        if self.problem_type == "ac1" and self.cfg.get("ac1_archive_seed") is not None:
+        if self.problem_type == "ac1" and (self.cfg.get("ac1_ttt_rollouts")
+                                           or self.cfg.get("ac1_archive_seed") is not None):
             return [self.refresh_ac1_seed(np.random.default_rng(12345))
                     for _ in range(self.num_seed_states)]
         seeds: List[SeedState] = []
