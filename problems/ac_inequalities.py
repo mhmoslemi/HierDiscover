@@ -11,11 +11,13 @@ Autocorrelation Inequalities (AC1 and AC2).
 from __future__ import annotations
 
 import inspect
+import json
 from typing import Any, List
 
 import numpy as np
 
 from config_validation import uses_hybrid_policy_loss
+from evaluation.sandbox import run_code
 from examples.ac_inequalities.seeds import (
     example_ae_program_random_init,
     thetaevolve_initial_program_prev_init,
@@ -167,7 +169,17 @@ class ACInequalities(Problem):
         # and no numerical comparison tolerance to tune: independently run the
         # authoritative evaluator once and trust only that result.
         try:
-            result = float(self._evaluate(output))
+            if self.problem_type == "ac1" and self.cfg.get("isolate_eval"):
+                # Keep NumPy's native threads on the worker's CPU pair too.
+                verification = run_code(
+                    f"import numpy as np\n\n{self._eval_src}\n\ndef verify():\n"
+                    f"    return evaluate_sequence({json.dumps(output, allow_nan=False)})\n",
+                    "verify", timeout_s=None, max_cpus=self.eval_cpus)
+                if not verification["ok"]:
+                    raise ValueError(verification["error"])
+                result = float(verification["value"])
+            else:
+                result = float(self._evaluate(output))
         except Exception as exc:
             res.msg = f"invalid_solution: {exc}"
             res.failure_kind = "constraint"

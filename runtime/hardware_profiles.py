@@ -26,25 +26,29 @@ def hardware_profile(value):
     return name
 
 
+def cpu_threads_by_core(cpu_ids):
+    cores = {}
+    for cpu in cpu_ids:
+        topology = Path(f"/sys/devices/system/cpu/cpu{cpu}/topology")
+        try:
+            key = (int((topology / "physical_package_id").read_text()),
+                   (topology / "thread_siblings_list").read_text().strip())
+        except (OSError, ValueError):
+            return {}
+        cores.setdefault(key, []).append(cpu)
+    return cores
+
+
 def generation_cpu_ids(profile, gpu_count):
     """Keep evaluation off inference cores, including their SMT siblings."""
     if profile != "B200_full_ram" or not hasattr(os, "sched_getaffinity"):
         return []
-    cores = {}
-    for cpu in sorted(os.sched_getaffinity(0)):
-        topology = Path(f"/sys/devices/system/cpu/cpu{cpu}/topology")
-        try:
-            key = (int((topology / "physical_package_id").read_text()),
-                   int((topology / "core_id").read_text()))
-        except (OSError, ValueError):
-            # Without physical topology, do not accidentally reserve half a core.
-            return []
-        cores.setdefault(key, []).append(cpu)
+    cores = cpu_threads_by_core(sorted(os.sched_getaffinity(0)))
     reserve = min(2 + 2 * int(gpu_count), len(cores) // 2)
     if len(cores) < 4 or int(gpu_count) < 1:
         return []
     sockets = {}
-    for (socket, _core), threads in cores.items():
+    for (socket, _siblings), threads in cores.items():
         sockets.setdefault(socket, []).append(threads)
     # Spread inference across sockets rather than trapping all engines on one.
     ordered = [threads for row in zip_longest(*sockets.values())

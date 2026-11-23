@@ -209,14 +209,14 @@ def _kill_tree(proc, pgid, hard=False):
             pass
 
 
-def run_code(code: str, entrypoint: str, timeout_s: float, max_cpus: int = 1,
+def run_code(code: str, entrypoint: str, timeout_s: float | None, max_cpus: int = 1,
              *, cpu_id=None, memory_limit_bytes=None, on_sandbox_deadline=None):
     """
     Execute `code` (Python source) in a subprocess. Calls `entrypoint()`
     and returns whatever it returns.
 
-    The optional callback receives the monotonic timeout deadline when the
-    process launches and None when the sandbox has exited or been stopped.
+    A None timeout allows a trusted check to finish without a deadline. The
+    optional callback reports a configured deadline on launch and None on exit.
 
     Returns a dict:
       {"ok": True,  "value": <return value>, "stdout": "..."}
@@ -309,7 +309,7 @@ def run_code(code: str, entrypoint: str, timeout_s: float, max_cpus: int = 1,
             pgid = None
 
         deadline = None
-        if on_sandbox_deadline is not None:
+        if on_sandbox_deadline is not None and timeout_s is not None:
             deadline = time.monotonic() + timeout_s
             on_sandbox_deadline(deadline)
         timed_out = False

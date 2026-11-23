@@ -18,7 +18,9 @@ from config_validation import (
     reject_retired_coder_cap, retired_search_keys, uses_hybrid_policy_loss,
     validate_hybrid_weight, validate_problem_config,
 )
-from runtime.hardware_profiles import generation_cpu_ids, local_checkpoint, restore_hardware_settings
+from runtime.hardware_profiles import (
+    cpu_threads_by_core, generation_cpu_ids, local_checkpoint, restore_hardware_settings,
+)
 
 from prompts.base import UPSTREAM_COMMIT
 from models.coder_profiles import (
@@ -188,9 +190,9 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--isolate-eval", action="store_const", const=True, default=None,
         help="Enable CPU isolation (on by default in the AC1, AC2, and Erdős presets). "
-             "Run every CPU candidate in a sandbox pinned to one logical CPU. "
-             "In this mode reward_workers is concurrent processes per CPU, "
-             "and excess candidates wait in the executor queue.")
+             "AC1 uses one sandbox per exclusive CPU pair. Other isolated tasks "
+             "use one logical CPU per sandbox, with reward_workers setting "
+             "the concurrency per CPU.")
     p.add_argument("--generation-backend", choices=["hf", "vllm"], default=None,
                    help="Engine used by generation workers. Independent of the "
                         "differentiable training backend.")
@@ -734,6 +736,9 @@ def load_config():
                 "--isolate-eval is for CPU sandbox problems; gpu_mode uses "
                 "its dedicated serialized GPU benchmark evaluator")
     if merged["isolate_eval"]:
+        if merged["problem"] == "ac1":
+            merged["eval_cpus"] = 2
+            merged["reward_workers"] = 1
         if int(merged.get('reward_workers', 0) or 0) < 1:
             raise ValueError(
                 "--isolate-eval requires reward_workers >= 1; in this mode "
@@ -943,6 +948,8 @@ def load_config():
                                           else ERDOS_REWARD_ANCHORS[reward_task])
     merged["target_modules"] = tuple(merged["target_modules"])
     cfg = SimpleNamespace(**merged)
+    if cfg.isolate_eval and cfg.problem == "ac1":
+        _isolated_ac1_cpu_pairs(cfg)
     if cfg.generation_backend == 'vllm' and int(cfg.num_gpus or 0) < 1:
         raise ValueError("vLLM generation requires num_gpus >= 1")
     if cfg.generation_backend == "vllm":
@@ -976,3 +983,15 @@ def _isolated_evaluation_cpu_ids(cfg=None):
             getattr(cfg, "hardware_profile", "RTX6000"), len(_parse_gpu_ids(cfg.gpu_ids))))
         cpu_ids = [cpu for cpu in cpu_ids if cpu not in reserved]
     return cpu_ids
+
+
+def _isolated_ac1_cpu_pairs(cfg):
+    cpu_ids = _isolated_evaluation_cpu_ids(cfg)
+    cores = cpu_threads_by_core(cpu_ids)
+    if cores:
+        # Use one logical CPU per physical core to avoid sharing SMT siblings.
+        cpu_ids = [siblings[0] for siblings in cores.values()]
+    pairs = list(zip(cpu_ids[::2], cpu_ids[1::2]))
+    if not pairs:
+        raise RuntimeError("isolated AC1 evaluation requires two available CPU cores")
+    return pairs

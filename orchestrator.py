@@ -44,7 +44,7 @@ from models.coder_profiles import (
     _coder_vllm_persistent_workers, _model_basename as _model_basename,
 )
 from runtime.configuration import (
-    _build_arg_parser as _build_arg_parser, _isolated_evaluation_cpu_ids,
+    _build_arg_parser as _build_arg_parser, _isolated_ac1_cpu_pairs, _isolated_evaluation_cpu_ids,
     _is_spo_rs_mode,
     _normalize_saved_advantage_config as _normalize_saved_advantage_config, _parse_gpu_ids,
     _resolve_training_backend as _resolve_training_backend,
@@ -1012,9 +1012,8 @@ def _finalize_pending_spo_rs_artifacts(
     those trajectories, after which the ordinary evaluated-step recovery
     performs the unchanged fast distributed adapter update.
     """
-    from concurrent.futures import ThreadPoolExecutor, as_completed
+    from concurrent.futures import as_completed
     from copy import deepcopy
-    from queue import Queue
 
     from experiment_io import save_rollout, save_rollout_logprobs
     from generation.gen_workers import make_progress_bar, native_final_answer_scope
@@ -1083,25 +1082,8 @@ def _finalize_pending_spo_rs_artifacts(
     if cfg.evaluation_gpu_id is None:
         interval = getattr(cfg, "eval_progress_interval_s", DEFAULT_EVAL_PROGRESS_INTERVAL_S)
         cpu_eval_progress = CpuEvaluationProgress(step_idx, len(artifacts), interval=interval)
-    isolated_eval = bool(getattr(cfg, "isolate_eval", False))
-    isolated_slots = None
-    isolated_memory_limit = None
-    if isolated_eval:
-        cpu_ids = _isolated_evaluation_cpu_ids(cfg)
-        processes_per_cpu = int(cfg.reward_workers)
-        isolated_slots = Queue()
-        for _layer in range(processes_per_cpu):
-            for cpu_id in cpu_ids:
-                isolated_slots.put(cpu_id)
-        workers = max(1, min(len(artifacts), len(cpu_ids) * processes_per_cpu))
-        isolated_memory_limit = _automatic_sandbox_memory_limit_bytes(workers)
-    else:
-        workers = max(1, min(len(artifacts), _resolve_reward_workers(cfg, problem)))
-
-    from runtime.host_memory import HostMemoryAdmission
-    import multiprocessing
-    host_admission = (getattr(gen_pool, "host_memory_admission", None)
-                      or HostMemoryAdmission(multiprocessing.get_context("spawn"), hardware_profile=getattr(cfg, "hardware_profile", "RTX6000")))
+    evaluation_pool, evaluate_response, _ = _evaluation_pool(
+        cfg, problem, len(artifacts), step_idx, gen_pool)
 
     def evaluate(item, *, on_sandbox_deadline=None):
         meta = item["meta"]
@@ -1117,19 +1099,8 @@ def _finalize_pending_spo_rs_artifacts(
         if on_sandbox_deadline is not None:
             answer_options["on_sandbox_deadline"] = on_sandbox_deadline
         parent_context = parent_contexts[int(meta["parent_group"])]
-        if not isolated_eval:
-            return problem.compute_reward(response_text, parent_context, cfg.sandbox_timeout_s, **answer_options)
-        with host_admission.reservation(min(1024**3, isolated_memory_limit)):
-            cpu_id = isolated_slots.get()
-            try:
-                return problem.compute_reward(
-                    response_text, parent_context, cfg.sandbox_timeout_s,
-                    cpu_id=cpu_id,
-                    memory_limit_bytes=isolated_memory_limit, **answer_options)
-            finally:
-                isolated_slots.put(cpu_id)
+        return evaluate_response(response_text, parent_context, **answer_options)
 
-    evaluation_pool = ThreadPoolExecutor(max_workers=workers)
     eval_bar = None
     eval_progress_lock = threading.Lock()
     live_best_state = sampler.best_raw_state(maximize=bool(problem.maximize))
@@ -1903,7 +1874,8 @@ def _resume_spo_rs_step_from_artifacts(
 # `reward_workers` is configured in YAML (0 = auto). Auto
 # leaves ~one CPU core per GPU worker for the generation loop and divides the
 # remainder by the CPU allocation of each candidate evaluation.
-# In --isolate-eval mode it instead means processes per CPU and must be >= 1.
+# AC1 uses one worker per CPU pair. Other isolated tasks use reward_workers
+# as the number of processes per logical CPU.
 # ======================================================================
 
 
@@ -1940,11 +1912,9 @@ def _automatic_sandbox_memory_limit_bytes(concurrent_sandboxes: int) -> int:
     return max(512 * 1024**2, min(1024**3, per_process))
 
 
-def _open_reward_pool(cfg, problem, rollout_count, step_idx, gen_pool,
-                      parallel_trainer, *, cpu_eval_progress=None):
-    from concurrent.futures import Future, ThreadPoolExecutor
+def _evaluation_pool(cfg, problem, rollout_count, step_idx, gen_pool, parallel_trainer=None):
+    from concurrent.futures import ThreadPoolExecutor
     from queue import Queue
-    from problems.base import RewardResult
 
     from runtime.host_memory import HostMemoryAdmission
     host_admission = getattr(parallel_trainer, "host_memory_admission", None)
@@ -1952,31 +1922,33 @@ def _open_reward_pool(cfg, problem, rollout_count, step_idx, gen_pool,
         host_admission = getattr(gen_pool, "host_memory_admission", None)
     if host_admission is None:
         import multiprocessing
-        host_admission = HostMemoryAdmission(multiprocessing.get_context("spawn"), hardware_profile=cfg.hardware_profile)
+        host_admission = HostMemoryAdmission(
+            multiprocessing.get_context("spawn"), hardware_profile=getattr(cfg, "hardware_profile", "RTX6000"))
     isolated_eval = bool(getattr(cfg, "isolate_eval", False))
+    paired = isolated_eval and cfg.problem == "ac1"
     isolated_cpu_slots = None
     isolated_cpu_count = 0
     isolated_processes_per_cpu = 0
     isolated_memory_limit_bytes = None
     if isolated_eval:
-        isolated_cpu_ids = _isolated_evaluation_cpu_ids(cfg)
-        isolated_cpu_count = len(isolated_cpu_ids)
-        isolated_processes_per_cpu = int(cfg.reward_workers)
+        allocations = (_isolated_ac1_cpu_pairs(cfg) if paired
+                       else _isolated_evaluation_cpu_ids(cfg))
+        isolated_cpu_count = len(allocations) * (2 if paired else 1)
+        isolated_processes_per_cpu = 1 if paired else int(cfg.reward_workers)
         isolated_cpu_slots = Queue()
-        # Layered admission is intentional: put one candidate on every CPU
-        # before allowing a second on each CPU, and so on.
+        # Give each CPU a slot before allowing any to host a second sandbox.
         for _layer in range(isolated_processes_per_cpu):
-            for cpu_id in isolated_cpu_ids:
-                isolated_cpu_slots.put(cpu_id)
-        isolated_capacity = isolated_cpu_count * isolated_processes_per_cpu
+            for allocation in allocations:
+                isolated_cpu_slots.put(allocation)
+        isolated_capacity = len(allocations) * isolated_processes_per_cpu
         n_reward_workers = max(1, min(rollout_count, isolated_capacity))
         isolated_memory_limit_bytes = (_automatic_sandbox_memory_limit_bytes(n_reward_workers))
+        placement = ("one sandbox per exclusive CPU pair" if paired else
+                     f"up to {isolated_processes_per_cpu} sandbox process(es) per CPU")
         setting_log_only(
             f"[step {step_idx}] isolated evaluation pool: "
             f"{n_reward_workers} sandbox process(es) across "
-            f"{isolated_cpu_count} CPU(s), up to "
-            f"{isolated_processes_per_cpu}/CPU from reward_workers; each "
-            "process tree is pinned to one CPU and excess candidates remain "
+            f"{isolated_cpu_count} CPU(s), {placement}; excess candidates remain "
             "queued; live RAM admission is shared with model transfers and "
             f"activation offload; RAM reservation="
             f"{min(1024**3, isolated_memory_limit_bytes) / 1024**3:.2f} GiB/process; "
@@ -1984,22 +1956,48 @@ def _open_reward_pool(cfg, problem, rollout_count, step_idx, gen_pool,
             f"{isolated_memory_limit_bytes / 1024**3:.2f} GiB/process, "
             "stdout+stderr capture is bounded")
     else:
-        n_reward_workers = _resolve_reward_workers(cfg, problem)
+        n_reward_workers = max(1, min(rollout_count, _resolve_reward_workers(cfg, problem)))
         setting_log_only(f"[step {step_idx}] evaluation pool: {n_reward_workers} worker(s), "
                          f"{getattr(problem, 'eval_cpus', 1)} CPU(s) per candidate")
-    reward_pool = ThreadPoolExecutor(max_workers=n_reward_workers)
+
+    def pin_worker_to_pair():
+        # The scoring thread and the sandbox it launches share this mask.
+        pair = set(isolated_cpu_slots.get_nowait())
+        os.sched_setaffinity(0, pair)
+        if os.sched_getaffinity(0) != pair:
+            raise RuntimeError(f"AC1 could not pin the evaluation worker to CPUs {sorted(pair)}")
+
+    reward_pool = ThreadPoolExecutor(
+        max_workers=n_reward_workers, initializer=pin_worker_to_pair if paired else None)
 
     def evaluate(text, parent_ctx, **answer_options):
         if not isolated_eval:
             return problem.compute_reward(text, parent_ctx, cfg.sandbox_timeout_s, **answer_options)
         with host_admission.reservation(min(1024**3, isolated_memory_limit_bytes)):
-            cpu_id = isolated_cpu_slots.get()
+            cpu_id = None if paired else isolated_cpu_slots.get_nowait()
             try:
                 return problem.compute_reward(
                     text, parent_ctx, cfg.sandbox_timeout_s, cpu_id=cpu_id,
                     memory_limit_bytes=isolated_memory_limit_bytes, **answer_options)
             finally:
-                isolated_cpu_slots.put(cpu_id)
+                if cpu_id is not None:
+                    isolated_cpu_slots.put(cpu_id)
+
+    return reward_pool, evaluate, {
+        "evaluation_isolated": isolated_eval,
+        "evaluation_workers": int(n_reward_workers),
+        "evaluation_cpu_count": int(isolated_cpu_count),
+        "evaluation_processes_per_cpu": int(isolated_processes_per_cpu),
+    }
+
+
+def _open_reward_pool(cfg, problem, rollout_count, step_idx, gen_pool,
+                      parallel_trainer, *, cpu_eval_progress=None):
+    from concurrent.futures import Future
+    from problems.base import RewardResult
+
+    reward_pool, evaluate, stats = _evaluation_pool(
+        cfg, problem, rollout_count, step_idx, gen_pool, parallel_trainer)
 
     def submit(text, parent_ctx, final_text, format_issue):
         if format_issue is not None:
@@ -2014,12 +2012,7 @@ def _open_reward_pool(cfg, problem, rollout_count, step_idx, gen_pool,
             return cpu_eval_progress.submit(reward_pool, evaluate, text, parent_ctx, **answer_options)
         return reward_pool.submit(evaluate, text, parent_ctx, **answer_options)
 
-    return reward_pool, submit, {
-        "evaluation_isolated": isolated_eval,
-        "evaluation_workers": int(n_reward_workers),
-        "evaluation_cpu_count": int(isolated_cpu_count),
-        "evaluation_processes_per_cpu": int(isolated_processes_per_cpu),
-    }
+    return reward_pool, submit, stats
 
 
 def _prepare_gpu_evaluation(backend, optimizer, cfg, problem, step_idx, count,
@@ -3634,12 +3627,9 @@ def _main(trainer_startup):
     # knobs like num_circles / problem_type / budget_s / score_scale from here).
     from problems.registry import get_problem
     problem_config = merged
-    if cfg.isolate_eval:
-        # Prompts must describe the sandbox's real allocation. Keep the saved
-        # YAML value intact for ordinary launches, but tell this problem
-        # instance that every candidate owns exactly one CPU.
-        problem_config = dict(merged)
-        problem_config["eval_cpus"] = 1
+    if cfg.isolate_eval and cfg.problem != "ac1":
+        # Prompts must describe the sandbox's real allocation.
+        problem_config = {**merged, "eval_cpus": 1}
     problem = get_problem(cfg.problem, problem_config)
     if getattr(problem, "problem_type", "") == "trimul":
         from problems.gpu_mode import verify_benchmark_environment
@@ -3669,9 +3659,12 @@ def _main(trainer_startup):
     evaluation_gpus = (cfg.gpu_ids if getattr(problem, "problem_type", "") == "trimul"
                        else cfg.evaluation_gpu_id)
     print(f"Evaluation GPU:     {evaluation_gpus if evaluation_gpus is not None else 'none'}")
-    evaluation_mode = (
-        f"isolated, {cfg.reward_workers} processes per logical CPU"
-        if cfg.isolate_eval else "default")
+    if cfg.isolate_eval and cfg.problem == "ac1":
+        evaluation_mode = "isolated, one sandbox per exclusive CPU pair"
+    elif cfg.isolate_eval:
+        evaluation_mode = f"isolated, {cfg.reward_workers} processes per logical CPU"
+    else:
+        evaluation_mode = "default"
     print(f"CPU evaluation:    {evaluation_mode}")
     if cfg.generation_backend == "vllm":
         print(f"vLLM parallelism:   TP={cfg.vllm_tensor_parallel_size or 'auto'} "
