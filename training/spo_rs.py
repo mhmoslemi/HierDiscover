@@ -9,7 +9,7 @@ from typing import Sequence
 
 import numpy as np
 
-from training.advantage import capped_weighted_tilt, invariant_group_advantages
+from training.advantage import capped_weighted_tilt, decompose_advantages, invariant_group_advantages
 
 
 def _validate_history_decay(d_half, rho_min, rho_max):
@@ -325,7 +325,7 @@ class InvariantSPORSTracker:
         rewards[~valid] = failure_reward
         return rewards
 
-    def calculate(self, rewards, valid, *, group_size, ttt_weight=None, spo_weight=1.0):
+    def calculate(self, rewards, valid, *, group_size, ttt_weight=None, spo_weight=1.0, decompose=False):
         """Calculate one complete batch against the history entering its step."""
         rewards = np.array(rewards, dtype=np.float64, copy=True)
         valid = np.asarray(valid, dtype=bool)
@@ -341,6 +341,7 @@ class InvariantSPORSTracker:
         if effective is not None:
             if not self._rewards.size:
                 historical, theta, span, kl = invariant_group_advantages(effective)
+                center = float(effective.max())
             else:
                 center = float(self._rewards.max())
                 span = max(center, float(effective.max())) - min(
@@ -356,22 +357,31 @@ class InvariantSPORSTracker:
 
         sibling = np.zeros_like(rewards)
         sibling_betas = [0.0] * (rewards.size // group_size)
-        if effective is not None:
-            for group, start in enumerate(range(0, rewards.size, group_size)):
-                group_slice = slice(start, start + group_size)
-                sibling[group_slice], sibling_theta, sibling_span, _ = (
-                    invariant_group_advantages(effective[group_slice]))
-                sibling_betas[group] = _reward_beta(sibling_theta, sibling_span)
         info = {
             "theta": theta, "reward_span": span, "tilt_kl": kl,
             "beta": _reward_beta(theta, span), "log_partition": log_partition,
             "pooled_start": not self._rewards.size,
         }
         applied = historical
-        if ttt_weight is not None:
-            applied = ttt_weight * sibling + spo_weight * historical
-            if not np.isfinite(applied).all():
-                raise FloatingPointError("nonfinite invariant hybrid advantages")
+        if decompose:
+            group_weight = 0.0
+            if span and group_size > 1:
+                logits = theta * ((effective - center) / span)
+                sibling, applied, group_weight = decompose_advantages(
+                    logits, group_size, log_partition)
+                sibling_betas = [info["beta"]] * len(sibling_betas)
+            info["decompose_group_weight"] = group_weight
+        else:
+            if effective is not None:
+                for group, start in enumerate(range(0, rewards.size, group_size)):
+                    group_slice = slice(start, start + group_size)
+                    sibling[group_slice], sibling_theta, sibling_span, _ = (
+                        invariant_group_advantages(effective[group_slice]))
+                    sibling_betas[group] = _reward_beta(sibling_theta, sibling_span)
+            if ttt_weight is not None:
+                applied = ttt_weight * sibling + spo_weight * historical
+                if not np.isfinite(applied).all():
+                    raise FloatingPointError("nonfinite invariant hybrid advantages")
         return InvariantBatch(effective, valid, historical, sibling, sibling_betas, applied, info)
 
     def update(self, batch, *, divergence, policy_adapter, step):

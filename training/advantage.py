@@ -131,3 +131,31 @@ def invariant_group_advantages(rewards):
     weights = np.exp(logits)
     sibling_mean = (weights.sum() - weights) / (rewards.size - 1)
     return np.expm1(logits - np.log(sibling_mean)), theta, span, kl
+
+
+def decompose_advantages(log_rewards, group_size, log_history_mean):
+    """Blend the sibling and historical baselines by their estimated errors."""
+    rewards = np.exp(log_rewards).reshape(-1, group_size)
+    group_count = rewards.shape[0]
+    group_means = rewards.mean(axis=1)
+    within = float(np.var(rewards, axis=1, ddof=1).mean())
+    between = 0.0
+    if group_count > 1:
+        between = max(0.0, float(np.var(group_means, ddof=1)) - within / group_size)
+
+    drift = 0.0
+    if log_history_mean is None:
+        history_mean = (rewards.sum() - rewards) / (rewards.size - 1)
+    else:
+        history_mean = math.exp(log_history_mean)
+        drift = max(0.0, (float(group_means.mean()) - history_mean) ** 2
+                    - between / group_count - within / rewards.size)
+
+    historical_error = between + drift
+    sibling_error = within / (group_size - 1)
+    weight = historical_error / (historical_error + sibling_error) if historical_error else 0.0
+    sibling_mean = (rewards.sum(axis=1, keepdims=True) - rewards) / (group_size - 1)
+    baseline = weight * sibling_mean + (1.0 - weight) * history_mean
+    sibling = np.expm1(log_rewards - np.log(sibling_mean.ravel()))
+    applied = np.expm1(log_rewards - np.log(baseline.ravel()))
+    return sibling, applied, weight

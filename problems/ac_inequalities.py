@@ -19,6 +19,7 @@ from config_validation import uses_hybrid_policy_loss
 from examples.ac_inequalities.seeds import (
     example_ae_program_random_init,
     thetaevolve_initial_program_prev_init,
+    upstream_ac1_seed_program,
 )
 from problems.base import (
     ERDOS_REWARD_ANCHORS, ParentContext, Problem, RewardResult, SeedState, erdos_scaled_reward,
@@ -186,7 +187,17 @@ class ACInequalities(Problem):
         return res
 
     # ------------------------------------------------------------------
+    def refresh_ac1_seed(self, rng) -> SeedState:
+        construction = [float(rng.random())] * int(rng.integers(1000, 8000))
+        raw = float(evaluate_sequence_ac1(construction))
+        code = "```python\n" + upstream_ac1_seed_program() + "\n```"
+        return SeedState(code=code, value=self._ac1_reward(raw), raw_score=raw,
+                         construction=construction)
+
     def seed_states(self) -> List[SeedState]:
+        if self.problem_type == "ac1" and self.cfg.get("ac1_archive_seed") is not None:
+            return [self.refresh_ac1_seed(np.random.default_rng(12345))
+                    for _ in range(self.num_seed_states)]
         seeds: List[SeedState] = []
         for i in range(self.num_seed_states):
             rng = np.random.default_rng(self.seed + i)

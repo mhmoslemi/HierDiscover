@@ -6,6 +6,7 @@ import math
 import os
 from pathlib import Path
 import re
+import secrets
 from types import SimpleNamespace
 
 import yaml
@@ -591,6 +592,17 @@ def load_config():
     merged["rollout_prompt_revision"] = (
         f"{UPSTREAM_COMMIT}-direct-coder"
         if merged["problem"] == "circle_packing" else UPSTREAM_COMMIT)
+    if merged["problem"] == "ac1":
+        # Preserve the search score units used by existing checkpoints.
+        if resume_dir is None:
+            merged["ac1_archive_seed"] = (
+                int(merged["seed"]) if merged.get("deterministic") else secrets.randbits(64))
+        elif saved.get("ac1_archive_seed") is not None:
+            merged["ac1_archive_seed"] = int(saved["ac1_archive_seed"])
+        else:
+            merged.pop("ac1_archive_seed", None)
+        if merged.get("ac1_archive_seed") is not None:
+            merged["rollout_prompt_revision"] = f"{UPSTREAM_COMMIT}-ac1-archive"
     merged["fused_long_attention"] = bool(args.fused_long_attention)
     merged.pop("measure_entropy", None)
     merged["no_train"] = bool(args.no_train)

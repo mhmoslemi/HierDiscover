@@ -44,6 +44,115 @@ def propose_candidate(seed=42, budget_s={num_seconds}, **kwargs):
 '''
 
 
+# AC1 seed program from the pinned TTT-Discover revision (examples/ac_inequalities/prompt.py).
+# MIT License
+#
+# Copyright (c) 2025 Mert Yuksekgonul
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+
+
+def upstream_ac1_seed_program(num_seconds=1000):
+    return f'''
+import numpy as np
+import time
+from scipy import optimize
+linprog = optimize.linprog
+
+
+def get_good_direction_to_move_into(sequence):
+    """Returns a better direction using LP to find g with larger sum while keeping conv bounded."""
+    n = len(sequence)
+    sum_sequence = np.sum(sequence)
+    normalized_sequence = [x * np.sqrt(2 * n) / sum_sequence for x in sequence]
+    rhs = np.max(np.convolve(normalized_sequence, normalized_sequence))
+    g_fun = solve_convolution_lp(normalized_sequence, rhs)
+    if g_fun is None:
+        return None
+    sum_g = np.sum(g_fun)
+    normalized_g_fun = [x * np.sqrt(2 * n) / sum_g for x in g_fun]
+    t = 0.01
+    new_sequence = [(1 - t) * x + t * y for x, y in zip(sequence, normalized_g_fun)]
+    return new_sequence
+
+
+def solve_convolution_lp(f_sequence, rhs):
+    """Solves the LP: maximize sum(b) s.t. conv(f, b) <= rhs, b >= 0."""
+    n = len(f_sequence)
+    c = -np.ones(n)
+    a_ub = []
+    b_ub = []
+    for k in range(2 * n - 1):
+        row = np.zeros(n)
+        for i in range(n):
+            j = k - i
+            if 0 <= j < n:
+                row[j] = f_sequence[i]
+        a_ub.append(row)
+        b_ub.append(rhs)
+    a_ub_nonneg = -np.eye(n)
+    b_ub_nonneg = np.zeros(n)
+    a_ub = np.vstack([a_ub, a_ub_nonneg])
+    b_ub = np.hstack([b_ub, b_ub_nonneg])
+    result = linprog(c, A_ub=a_ub, b_ub=b_ub, options={{
+        'time_limit': 10.0,   # seconds, make sure we don't get stuck
+        'disp': False,
+    }})
+    if result.success:
+        return result.x
+    return None
+
+
+def propose_candidate(seed=42, budget_s={num_seconds}, **kwargs):
+    np.random.seed(seed)
+    deadline = time.time() + budget_s - 10
+\x20\x20\x20\x20\x20\x20\x20\x20
+    if np.random.rand() < 0.5:
+        # Start from the SOTA sequence (already available as height_sequence_1)
+        best_sequence = list(height_sequence_1)
+    else:
+        # Start from random initialization, could help if height_sequence_1 is a local minimum
+        best_sequence = [np.random.random()] * np.random.randint(100, 1000)
+    curr_sequence = best_sequence.copy()
+    best_score = evaluate_sequence(best_sequence)
+\x20\x20\x20\x20
+    while time.time() < deadline:
+        h_function = get_good_direction_to_move_into(curr_sequence)
+        if h_function is None:
+            # Random perturbation if LP fails
+            idx = np.random.randint(len(curr_sequence))
+            curr_sequence[idx] = max(0, curr_sequence[idx] + np.random.randn() * 0.01)
+        else:
+            curr_sequence = h_function
+\x20\x20\x20\x20\x20\x20\x20\x20
+        try:
+            curr_score = evaluate_sequence(curr_sequence)
+            if curr_score < best_score:
+                best_score = curr_score
+                best_sequence = curr_sequence.copy()
+        except:
+            pass
+\x20\x20\x20\x20
+    return best_sequence
+'''
+
+
 thetaevolve_initial_program_prev_init = '''
 import numpy as np
 from typing import Tuple

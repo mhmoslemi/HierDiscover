@@ -11,7 +11,8 @@ from pathlib import Path
 LLM_CRITIC_MODE = "llm-critic"
 SPO_RS_INVARIANT_MODE = "spo-rs-invariant"
 HYBRID_INVARIANT_MODE = "hybrid-invariant"
-INVARIANT_ADVANTAGE_MODES = (SPO_RS_INVARIANT_MODE, HYBRID_INVARIANT_MODE)
+DECOMPOSE_MODE = "decompose"
+INVARIANT_ADVANTAGE_MODES = (SPO_RS_INVARIANT_MODE, HYBRID_INVARIANT_MODE, DECOMPOSE_MODE)
 ADVANTAGE_MODES = ("entropic", "spo-rs", "hybrid", *INVARIANT_ADVANTAGE_MODES, LLM_CRITIC_MODE)
 PARENT_SELECTION_MODES = ("puct", "uct")
 LEGACY_CODER_CAP_KEY = "coder_thinking_budget"
@@ -19,7 +20,7 @@ DEFAULT_EVAL_PROGRESS_INTERVAL_S = 120
 
 
 def uses_hybrid_policy_loss(mode):
-    return mode in ("hybrid", HYBRID_INVARIANT_MODE, LLM_CRITIC_MODE)
+    return mode in ("hybrid", HYBRID_INVARIANT_MODE, DECOMPOSE_MODE, LLM_CRITIC_MODE)
 
 
 # These settings are consumed by the shared training, generation, search,

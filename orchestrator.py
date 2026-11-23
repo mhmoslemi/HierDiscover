@@ -26,7 +26,7 @@ from pathlib import Path
 from types import SimpleNamespace
 import numpy as np
 from config_validation import (
-    DEFAULT_EVAL_PROGRESS_INTERVAL_S, HYBRID_INVARIANT_MODE, INVARIANT_ADVANTAGE_MODES,
+    DECOMPOSE_MODE, DEFAULT_EVAL_PROGRESS_INTERVAL_S, HYBRID_INVARIANT_MODE, INVARIANT_ADVANTAGE_MODES,
     LLM_CRITIC_MODE, PARENT_SELECTION_MODES,
     SPO_RS_INVARIANT_MODE, reject_retired_coder_cap, uses_hybrid_policy_loss,
 )
@@ -291,6 +291,20 @@ def _evaluated_rollout_meta(pending_meta, result):
     }
 
 
+def _ac1_archive_metadata(result, evaluation_order):
+    from search.sampler import AC1_CONSTRUCTION_LIMITS
+
+    construction = result.construction
+    length = len(construction) if construction is not None else 0
+    meta = {"evaluation_order": evaluation_order, "construction_length": length}
+    low, high = AC1_CONSTRUCTION_LIMITS
+    if result.valid and low <= length <= high:
+        # Retain every admissible construction for exact replay, even beyond
+        # the ordinary construction limit used for plotting/debug metadata.
+        meta["construction"] = json.dumps(construction)
+    return meta
+
+
 def _rollout_advantage_fields(advantage, *, ttt_advantage, spo_rs_advantage,
                               ttt_sibling_max, ttt_adaptive_beta, parent_raw_score,
                               spo_rs_v_t):
@@ -542,7 +556,8 @@ def _restore_legacy_archive(sampler, exp_dir, before_step):
             reward = float(meta.get("reward", 0.0))
             raw = meta.get("raw_score")
             raw = float(raw) if raw is not None else None
-            construction = meta.get("construction")
+            construction = (_ac1_saved_construction(meta) if sampler.ac1_archive_seed is not None
+                            else meta.get("construction"))
         except (TypeError, ValueError):
             continue
         states.append(State.make(
@@ -551,6 +566,7 @@ def _restore_legacy_archive(sampler, exp_dir, before_step):
             observation=str(meta.get("sandbox_stdout") or ""),
             previous_raw_score=meta.get("parent_raw_score"),
             poisson=meta.get("poisson"),
+            construction_length=meta.get("construction_length"),
         ))
     sampler.import_legacy_states(states, total_expansions=total_rollouts)
     return len(states), total_rollouts
@@ -610,6 +626,13 @@ def _complete_unfinished_rollout_paths(exp_dir, step_idx, cfg):
         return None
     paths = sorted(step_dir.glob(f"step{step_idx:02d}_group*_rollout*.meta.json"))
     parent_count = int(cfg.groups_per_step)
+    if getattr(cfg, "ac1_archive_seed", None) is not None:
+        # Lineage blocking can yield fewer parents than the configured target.
+        try:
+            saved_parents = json.loads((step_dir / f"step{step_idx:02d}.parents.json").read_text())
+            parent_count = len(saved_parents["parents"])
+        except (OSError, ValueError, KeyError, TypeError):
+            return None
     expected = parent_count * int(cfg.group_size)
     if len(paths) > expected:
         raise RuntimeError(
@@ -800,6 +823,20 @@ def _literal_float_list(value):
     except (TypeError, ValueError):
         return None
     return result if all(math.isfinite(item) for item in result) else None
+
+
+def _ac1_saved_construction(meta):
+    """Decode the saved coefficients without rounding integer values."""
+    from search.sampler import AC1_CONSTRUCTION_LIMITS
+
+    construction = meta.get("construction")
+    if isinstance(construction, str):
+        construction = json.loads(construction)
+    length = meta.get("construction_length", 0)
+    low, high = AC1_CONSTRUCTION_LIMITS
+    if low <= length <= high and (construction is None or len(construction) != length):
+        raise ValueError("saved AC1 rollout is missing its archive construction")
+    return construction
 
 
 def _metadata_is_code_failure(meta):
@@ -1003,7 +1040,10 @@ def _finalize_pending_spo_rs_artifacts(
     if token_summary["exact_sidecars"] != len(artifacts):
         raise RuntimeError("generated-step recovery refuses non-exact response token IDs")
 
-    parents = sampler.sample_states(int(cfg.groups_per_step))
+    ac1_archive = sampler.ac1_archive_seed is not None
+    parents = sampler.sample_states(int(cfg.groups_per_step), step_idx=step_idx)
+    if ac1_archive and step_idx == 0:
+        _rebind_interrupted_step_zero_selection(sampler, exp_dir, parents)
     parents_path = (Path(exp_dir) / f"step{int(step_idx):02d}" / f"step{int(step_idx):02d}.parents.json")
     try:
         saved_parent_rows = json.loads(parents_path.read_text(encoding="utf-8"))["parents"]
@@ -1095,10 +1135,13 @@ def _finalize_pending_spo_rs_artifacts(
     live_best_state = sampler.best_raw_state(maximize=bool(problem.maximize))
     live_best_raw = (
         float(live_best_state.raw_score) if live_best_state is not None else None)
+    evaluation_order = {}
 
-    def evaluation_completed(future):
+    def evaluation_completed(future, index):
         nonlocal eval_bar, live_best_raw
         with eval_progress_lock:
+            if ac1_archive:
+                evaluation_order[index] = len(evaluation_order)
             if eval_bar is not None:
                 eval_bar.update(1)
             elif cpu_eval_progress is None:
@@ -1117,7 +1160,7 @@ def _finalize_pending_spo_rs_artifacts(
             else:
                 future = cpu_eval_progress.submit(evaluation_pool, evaluate, item)
             evaluation_futures[future] = index
-            future.add_done_callback(evaluation_completed)
+            future.add_done_callback(lambda done, index=index: evaluation_completed(done, index))
 
         prompt_cache = {}
         score_pairs = []
@@ -1176,7 +1219,7 @@ def _finalize_pending_spo_rs_artifacts(
         divergence, missing_scores, context_divergences = (
             spo_rs_tracker.consecutive_policy_divergence(
                 current_scores, previous_scores, context_ids,
-                required_context_ids=range(int(cfg.groups_per_step))))
+                required_context_ids=range(len(parents))))
         if missing_scores or not math.isfinite(divergence):
             raise RuntimeError('generated-step recovery did not obtain every exact consecutive-policy score')
 
@@ -1287,6 +1330,8 @@ def _finalize_pending_spo_rs_artifacts(
             "seed": int(cfg.seed),
             "spo_rs": info,
         })
+        if ac1_archive:
+            meta.update(_ac1_archive_metadata(result, evaluation_order[index]))
         response_text = item["response_path"].read_text(encoding="utf-8", errors="replace")
         save_rollout(exp_dir, step_idx, group, rollout, response_text, meta, artifacts_already_saved=True)
 
@@ -1374,7 +1419,9 @@ def _rebind_interrupted_step_zero_selection(sampler, exp_dir, parents):
 
 def _invariant_batch(cfg, tracker, rows, *, combine=True):
     hybrid_options = {}
-    if combine and cfg.advantage_mode == HYBRID_INVARIANT_MODE:
+    if cfg.advantage_mode == DECOMPOSE_MODE:
+        hybrid_options["decompose"] = True
+    elif combine and cfg.advantage_mode == HYBRID_INVARIANT_MODE:
         hybrid_options = {
             "ttt_weight": cfg.hybrid_ttt_weight,
             "spo_weight": cfg.hybrid_spo_weight,
@@ -1500,6 +1547,7 @@ def _resume_spo_rs_step_from_artifacts(
         raise FileNotFoundError(f'evaluated-step recovery cannot find the sampling adapter: {sampling_adapter_path}')
     hybrid_mode = cfg.advantage_mode in ("hybrid", HYBRID_INVARIANT_MODE)
     hybrid_loss = uses_hybrid_policy_loss(cfg.advantage_mode)
+    ac1_archive = sampler.ac1_archive_seed is not None
     if critic_mode:
         judged = critic_step.load_batch(exp_dir, step_idx)
         if judged["adapter"] != Path(sampling_adapter_path).name:
@@ -1510,16 +1558,19 @@ def _resume_spo_rs_step_from_artifacts(
         by_group.setdefault(int(item["meta"]["group"]), []).append(item)
     parents = _rebind_saved_step_zero_parents(
         sampler, by_group, int(cfg.groups_per_step)
-    ) if step_idx == 0 else None
+    ) if step_idx == 0 and not ac1_archive else None
     if parents is None:
         parents = sampler.sample_states(
-            int(cfg.groups_per_step))
+            int(cfg.groups_per_step), step_idx=step_idx)
+        if ac1_archive and step_idx == 0:
+            _rebind_interrupted_step_zero_selection(sampler, exp_dir, parents)
     else:
         print(
             f"[resume] restored {len(parents)} saved step-zero seed parents; "
             "current parent-selection settings begin at step 1",
             flush=True,
         )
+    archive_order = {}
     if set(by_group) != set(range(len(parents))):
         raise RuntimeError(
             "evaluated-step recovery could not reconstruct every selected "
@@ -1649,14 +1700,18 @@ def _resume_spo_rs_step_from_artifacts(
             child = State.make(
                 timestep=step_idx, value=float(meta["reward"]), code=code,
                 raw_score=(float(meta["raw_score"]) if meta.get("raw_score") is not None else None),
-                construction=_literal_float_list(meta.get("construction")),
+                construction=(_ac1_saved_construction(meta) if ac1_archive
+                              else _literal_float_list(meta.get("construction"))),
                 observation=str(meta.get("sandbox_stdout") or ""),
                 poisson=meta.get("poisson"),
+                construction_length=meta.get("construction_length") if ac1_archive else None,
             )
             if meta.get("node_id"):
                 child.id = str(meta["node_id"])
             parent_group = int(meta.get("parent_group", group))
             all_children.append((child, parents[parent_group]))
+            if ac1_archive:
+                archive_order[child.id] = int(meta["evaluation_order"])
         if item.get("critic_label_pending"):
             save_rollout(exp_dir, step_idx, group, int(meta["rollout"]), response_text,
                          meta, artifacts_already_saved=True)
@@ -1722,6 +1777,8 @@ def _resume_spo_rs_step_from_artifacts(
 
     previous_best_raw = sampler.best_raw_state(maximize=bool(problem.maximize))
     previous_best_value = float(previous_best_raw.raw_score) if previous_best_raw is not None else None
+    if ac1_archive:
+        all_children.sort(key=lambda entry: archive_order[entry[0].id])
     archive_stats = sampler.update(all_children)
     setting_log_only(
         f"[resume] step {step_idx}: reusing {len(artifacts)} saved rollout "
@@ -2157,7 +2214,8 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
 
     is_trimul = getattr(problem, "problem_type", "") == "trimul"
     isolated_batch = trimul_evaluation.completed_batch(exp_dir, step_idx) if is_trimul else None
-    parents = sampler.sample_states(int(cfg.groups_per_step))
+    ac1_archive = sampler.ac1_archive_seed is not None
+    parents = sampler.sample_states(int(cfg.groups_per_step), step_idx=step_idx)
     if step_idx == 0:
         _rebind_interrupted_step_zero_selection(sampler, exp_dir, parents)
     if isolated_batch is not None or pending_artifacts is not None:
@@ -2195,6 +2253,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
     entropic_overlap_state = None
     spo_rs_overlap_state = None
     all_children = []
+    archive_order = {}
     saved_rollouts = 0
     # ----- BUILD PROMPTS (one per parent/group) -----
     parent_ctxs = []
@@ -2282,6 +2341,10 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                     evaluated_meta["archive_eligible"] = bool(result.valid and result.code)
                     if save_ctor:
                         evaluated_meta["construction"] = _as_float_list(result.construction, cfg.max_saved_construction)
+                if ac1_archive:
+                    record["evaluation_order"] = eval_progress_completed
+                    if critic_mode:
+                        evaluated_meta.update(_ac1_archive_metadata(result, record["evaluation_order"]))
                 save_future = rollout_io_pool.submit(
                     save_rollout,
                     exp_dir, step_idx, int(record["group_id"]),
@@ -2509,8 +2572,8 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                         for record in vllm_logprob_records
                     ]
                     if any(value is None for value in current_policy_scores):
-                        if hybrid_mode:
-                            raise RuntimeError("hybrid training requires the original sampler logprobs for every response")
+                        if hybrid_loss:
+                            raise RuntimeError(f"{active_advantage_mode} training requires the original sampler logprobs for every response")
                         rescored_current = gen_pool.score_token_logprobs(
                             score_pairs, show_progress=True,
                             adapter_path=str(adapter_path),
@@ -2573,7 +2636,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                                     "SPO-RS exact consecutive-policy scoring "
                                     "completed without a usable score for "
                                     f"{spo_rs_missing_policy_scores} rollout(s)")
-                    if hybrid_mode and cfg.kl_penalty_coef:
+                    if hybrid_loss and cfg.kl_penalty_coef:
                         reference_scores = gen_pool.score_token_logprobs(
                             score_pairs, show_progress=True, require_complete=True)
                 elif critic_mode:
@@ -3115,6 +3178,8 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
             archive_eligible = bool(valids[r_idx] and codes[r_idx])
             if archive_eligible:
                 all_children.append((child, parent))
+                if ac1_archive:
+                    archive_order[child.id] = record["evaluation_order"]
             spo_rs_advantage = spo_rs_advantages[r_idx] if history_mode else None
             meta = {
                 "output_format_issue": record["output_format_issue"],
@@ -3160,6 +3225,8 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                     cfg.max_saved_construction) if save_ctor else None),
                 "seed": int(cfg.seed),
             }
+            if ac1_archive:
+                meta.update(_ac1_archive_metadata(res, record["evaluation_order"]))
             if history_mode:
                 meta["spo_rs"] = spo_rs_rollout_info[r_idx]
             if invariant_mode:
@@ -3292,6 +3359,8 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
         float(previous_best_raw.raw_score) if previous_best_raw is not None else None)
 
     # Update archive
+    if ac1_archive:
+        all_children.sort(key=lambda entry: archive_order[entry[0].id])
     sampler.update(all_children)
 
     # Keep the best valid candidate produced by this exact step separate from
@@ -3643,7 +3712,7 @@ def _main(trainer_startup):
         if hybrid_mode:
             print(f"Hybrid TTT weight:  {cfg.hybrid_ttt_weight:g}")
             print(f"Hybrid SPO-RS weight: {cfg.hybrid_spo_weight:g}")
-        else:
+        elif _is_spo_rs_mode(configured_advantage_mode):
             print(f"SPO-RS clip eps low/high: "
                   f"{cfg.spo_rs_clip_epsilon_low} / "
                   f"{cfg.spo_rs_clip_epsilon_high} "
@@ -3828,6 +3897,7 @@ def _main(trainer_startup):
 
     # ---- sampler ----
     from search.sampler import make_sampler
+    ac1_archive_seed = getattr(cfg, "ac1_archive_seed", None)
     restored_selection = (resume_payload["sampler"].get("selection_mode", cfg.parent_selection)
                           if resume_payload is not None else cfg.parent_selection)
     if restored_selection != cfg.parent_selection:
@@ -3840,6 +3910,8 @@ def _main(trainer_startup):
         topk_children=cfg.topk_children_per_parent,
         seed_value=0.0,
         seed_states=seeds,
+        ac1_archive_seed=ac1_archive_seed,
+        refresh_ac1_seed=(problem.refresh_ac1_seed if ac1_archive_seed is not None else None),
     )
     if resume_payload is not None:
         sampler.load_state_dict(resume_payload["sampler"])
