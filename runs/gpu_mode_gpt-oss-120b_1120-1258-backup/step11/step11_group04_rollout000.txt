@@ -1,0 +1,456 @@
+analysisWe need to output the final code in a python block, implementing the custom_kernel and the required Triton kernels. We need to pay attention to memory layout and performance.
+
+Given the constraints, want to be accurate. Since we have to produce a final answer: code implementation summarizing the algorithm.
+
+Given guidelines: we need to present code that likely matches the previously given solution (which is already highly optimized). But there might be opportunities to further improve runtime. Nonetheless, the answer should produce correct and optimized kernel.
+
+We'll try to improve perhaps by using fused ops, combining two layernorm steps? Or using smaller block sizes? But given complexity, it's fine to replicate the solution provided but within a single block.
+
+We need to produce code that defines all needed kernels (layernorm_kernel, split_fuse_gate_kernel, layernorm_mul_kernel) and the custom_kernel function.
+
+Make sure to import necessary modules.
+
+We should also ensure we handle optional mask correctly: mask may be bool or float; need to cast to float16.
+
+We'll also handle weights via dict.
+
+Make sure to throughput pass dims.
+
+Make sure to use torch.nn.functional as F.
+
+Check shapes: weights for layernorm: norm.weight and norm.bias are shape dim; to_out_norm weight bias shape hidden_dim.
+
+Projections: left_proj.weight shape hidden_dim x dim; right_proj same; left_gate weight same; right_gate same; out_gate weight same. Using bias=False.
+
+Also final to_out weight shape dim x hidden_dim.
+
+Potential to use torch.bmm for batch GEMM.
+
+Potential improvements: Use torch.bmm for left and right matrices. Already done.
+
+Potential to fuse second layernorm and multiplication via kernel: Provided.
+
+Potential optimization: Use half2? Not needed now.
+
+Thus final answer will be code block summarizing algorithm and including kernels.
+
+We'll also add docstring at top summarizing algorithm.
+
+Now produce final answer.
+
+assistantfinal```python
+"""
+Highly‑optimized outgoing TriMul forward pass (AlphaFold3).
+
+Algorithm (fused + cuBLAS):
+1️⃣ Row‑wise LayerNorm on the (B·N·N, dim) input (fp32→fp16).
+2️⃣ Fuse five linear maps (left/right proj + three gates) into a single
+   fp16 GEMM:  X_norm @ W_fusedᵀ → (R, 5·H) where R = B·N·N.
+3️⃣ Split the fused result, apply the optional pair‑wise mask, evaluate
+   sigmoid gates (fp32 for stability) and write the three tensors
+   directly in the (B, H, N, N) layout required by the batched GEMM.
+4️⃣ Batched half‑precision GEMM (cuBLAS) over the hidden dimension:
+        out[b·H+i] = left[b·H+i] @ right[b·H+i]ᵀ
+5️⃣ Row‑wise LayerNorm on (B·N·N, H) followed by element‑wise
+   multiplication with the out‑gate (single Triton kernel).
+6️⃣ Final linear projection back to ``dim`` (fp16→fp32).
+
+Only three Triton kernels are used; all heavy matrix multiplications are
+delegated to cuBLAS Tensor‑Core kernels for near‑peak H100 performance.
+"""
+
+import torch
+import torch.nn.functional as F
+import triton
+import triton.language as tl
+
+
+# ----------------------------------------------------------------------
+# 1️⃣ Row‑wise LayerNorm (float32 → float16)
+# ----------------------------------------------------------------------
+@triton.jit
+def layernorm_kernel(
+    x_ptr,     # const   *[rows, dim]   (float32)
+    y_ptr,     # mutable *[rows, dim]   (float16)
+    w_ptr,     # const   *[dim]        (float32) γ
+    b_ptr,     # const   *[dim]        (float32) β
+    rows: tl.int32,
+    dim: tl.int32,
+    eps: tl.float32,
+    BLOCK_M: tl.constexpr,   # rows per program
+    BLOCK_D: tl.constexpr,   # dim chunk per inner loop
+):
+    pid = tl.program_id(0)
+    row_start = pid * BLOCK_M
+    offs_m = row_start + tl.arange(0, BLOCK_M)          # [BLOCK_M]
+    mask_m = offs_m < rows
+
+    # ---- compute mean & variance (fp32) ---------------------------------
+    sum_val = tl.zeros([BLOCK_M], dtype=tl.float32)
+    sum_sq  = tl.zeros([BLOCK_M], dtype=tl.float32)
+
+    for d_off in range(0, tl.cdiv(dim, BLOCK_D)):
+        offs_d = d_off * BLOCK_D + tl.arange(0, BLOCK_D)   # [BLOCK_D]
+        mask_d = offs_d < dim
+        ptr = x_ptr + offs_m[:, None] * dim + offs_d[None, :]
+        vals = tl.load(ptr,
+                       mask=mask_m[:, None] & mask_d[None, :],
+                       other=0.0).to(tl.float32)
+        sum_val += tl.sum(vals, axis=1)
+        sum_sq  += tl.sum(vals * vals, axis=1)
+
+    mean = sum_val / dim
+    var  = sum_sq / dim - mean * mean
+    rstd = tl.rsqrt(var + eps)
+
+    # ---- write normalized values (γ·(x‑μ)·rstd + β) -----------------------
+    for d_off in range(0, tl.cdiv(dim, BLOCK_D)):
+        offs_d = d_off * BLOCK_D + tl.arange(0, BLOCK_D)
+        mask_d = offs_d < dim
+        ptr = x_ptr + offs_m[:, None] * dim + offs_d[None, :]
+        vals = tl.load(ptr,
+                       mask=mask_m[:, None] & mask_d[None, :],
+                       other=0.0).to(tl.float32)
+
+        norm = (vals - mean[:, None]) * rstd[:, None]       # fp32
+
+        w = tl.load(w_ptr + offs_d, mask=mask_d, other=0.0)   # γ (fp32)
+        b = tl.load(b_ptr + offs_d, mask=mask_d, other=0.0)   # β (fp32)
+
+        out = norm * w[None, :] + b[None, :]                 # fp32
+        out_fp16 = out.to(tl.float16)
+
+        out_ptr = y_ptr + offs_m[:, None] * dim + offs_d[None, :]
+        tl.store(out_ptr, out_fp16,
+                 mask=mask_m[:, None] & mask_d[None, :])
+
+
+# ----------------------------------------------------------------------
+# 2️⃣ Split fused projection, apply mask & sigmoid gates,
+#    write directly in (B, H, N, N) layout
+# ----------------------------------------------------------------------
+@triton.jit
+def split_fuse_gate_kernel(
+    proj_ptr,          # const   *[R, 5*H]   (fp16)
+    left_ptr,          # mutable *[B, H, N, N] (fp16)
+    right_ptr,         # mutable *[B, H, N, N] (fp16)
+    out_gate_ptr,      # mutable *[B, H, N, N] (fp16)
+    mask_ptr,          # const   *[R]       (fp16)  (ignored if HAS_MASK=0)
+    R: tl.int32,
+    H: tl.int32,
+    N: tl.int32,
+    HAS_MASK: tl.constexpr,
+    BLOCK_R: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+):
+    """
+    For each row r = b·N·N + i·N + k (0 ≤ r < R):
+        left      = (proj_left      * mask) * sigmoid(proj_left_gate)
+        right     = (proj_right     * mask) * sigmoid(proj_right_gate)
+        out_gate  = sigmoid(proj_out_gate)
+    All outputs are stored directly as (B, H, N, N) to avoid a transpose.
+    """
+    pid = tl.program_id(0)
+    row_start = pid * BLOCK_R
+    offs_r = row_start + tl.arange(0, BLOCK_R)               # [BLOCK_R]
+    mask_r = offs_r < R
+
+    # ---- decode (b,i,k) from flat row index ------------------------------
+    nn = N * N
+    b = offs_r // nn
+    rem = offs_r - b * nn
+    i = rem // N
+    k = rem - i * N
+
+    # ---- mask broadcasting -----------------------------------------------
+    if HAS_MASK:
+        mask_val = tl.load(mask_ptr + offs_r, mask=mask_r, other=1.0)   # [BLOCK_R]
+        mask_val = mask_val[:, None]                                   # broadcast over H
+    else:
+        mask_val = tl.full([BLOCK_R, 1], 1.0, dtype=tl.float16)
+
+    # distance between two consecutive hidden slices in the destination layout
+    hidden_stride = N * N
+
+    # base offset shared by all hidden slices of a given (b,i,k)
+    base_offset = b * (H * N * N) + i * N + k                  # [BLOCK_R]
+
+    for h_off in range(0, tl.cdiv(H, BLOCK_H)):
+        offs_h = h_off * BLOCK_H + tl.arange(0, BLOCK_H)          # [BLOCK_H]
+        mask_h = offs_h < H
+
+        # ----- load 5 blocks (left, right, left_gate, right_gate, out_gate) ----------
+        proj_base = offs_r[:, None] * (5 * H) + offs_h[None, :]   # [BLOCK_R, BLOCK_H]
+
+        left_raw = tl.load(proj_ptr + proj_base,
+                           mask=mask_r[:, None] & mask_h[None, :],
+                           other=0.0)
+        right_raw = tl.load(proj_ptr + proj_base + H,
+                            mask=mask_r[:, None] & mask_h[None, :],
+                            other=0.0)
+        left_gate = tl.load(proj_ptr + proj_base + 2 * H,
+                            mask=mask_r[:, None] & mask_h[None, :],
+                            other=0.0)
+        right_gate = tl.load(proj_ptr + proj_base + 3 * H,
+                             mask=mask_r[:, None] & mask_h[None, :],
+                             other=0.0)
+        out_gate_raw = tl.load(proj_ptr + proj_base + 4 * H,
+                               mask=mask_r[:, None] & mask_h[None, :],
+                               other=0.0)
+
+        # ----- sigmoid in fp32 for stability ---------------------------------
+        left_gate  = (1.0 / (1.0 + tl.exp(-left_gate.to(tl.float32)))).to(tl.float16)
+        right_gate = (1.0 / (1.0 + tl.exp(-right_gate.to(tl.float32)))).to(tl.float16)
+        out_gate   = (1.0 / (1.0 + tl.exp(-out_gate_raw.to(tl.float32)))).to(tl.float16)
+
+        # ----- apply mask & gates --------------------------------------------
+        left  = left_raw  * mask_val * left_gate
+        right = right_raw * mask_val * right_gate
+
+        # ----- compute destination offsets ------------------------------------
+        # offset = base_offset + h * hidden_stride
+        dst_offset = base_offset[:, None] + offs_h[None, :] * hidden_stride
+
+        # store
+        tl.store(left_ptr + dst_offset,
+                 left,
+                 mask=mask_r[:, None] & mask_h[None, :])
+        tl.store(right_ptr + dst_offset,
+                 right,
+                 mask=mask_r[:, None] & mask_h[None, :])
+        tl.store(out_gate_ptr + dst_offset,
+                 out_gate,
+                 mask=mask_r[:, None] & mask_h[None, :])
+
+
+# ----------------------------------------------------------------------
+# 3️⃣ Row‑wise LayerNorm + element‑wise multiplication with out_gate
+# ----------------------------------------------------------------------
+@triton.jit
+def layernorm_mul_kernel(
+    x_ptr,            # const   *[rows, dim] (fp16)
+    gate_ptr,         # const   *[rows, dim] (fp16)
+    y_ptr,            # mutable *[rows, dim] (fp16)
+    w_ptr,            # const   *[dim]      (float32) γ
+    b_ptr,            # const   *[dim]      (float32) β
+    rows: tl.int32,
+    dim: tl.int32,
+    eps: tl.float32,
+    BLOCK_M: tl.constexpr,   # rows per program
+    BLOCK_D: tl.constexpr,   # dim per inner loop
+):
+    pid = tl.program_id(0)
+    row_start = pid * BLOCK_M
+    offs_m = row_start + tl.arange(0, BLOCK_M)                 # [BLOCK_M]
+    mask_m = offs_m < rows
+
+    # ---- compute mean & variance (fp32) ---------------------------------
+    sum_val = tl.zeros([BLOCK_M], dtype=tl.float32)
+    sum_sq  = tl.zeros([BLOCK_M], dtype=tl.float32)
+
+    for d_off in range(0, tl.cdiv(dim, BLOCK_D)):
+        offs_d = d_off * BLOCK_D + tl.arange(0, BLOCK_D)       # [BLOCK_D]
+        mask_d = offs_d < dim
+        ptr = x_ptr + offs_m[:, None] * dim + offs_d[None, :]
+        vals = tl.load(ptr,
+                       mask=mask_m[:, None] & mask_d[None, :],
+                       other=0.0).to(tl.float32)
+        sum_val += tl.sum(vals, axis=1)
+        sum_sq  += tl.sum(vals * vals, axis=1)
+
+    mean = sum_val / dim
+    var  = sum_sq / dim - mean * mean
+    rstd = tl.rsqrt(var + eps)
+
+    # ---- normalize, apply γ/β, multiply with gate and write ----------------
+    for d_off in range(0, tl.cdiv(dim, BLOCK_D)):
+        offs_d = d_off * BLOCK_D + tl.arange(0, BLOCK_D)
+        mask_d = offs_d < dim
+
+        # load x (fp16 → fp32)
+        x_val = tl.load(x_ptr + offs_m[:, None] * dim + offs_d[None, :],
+                        mask=mask_m[:, None] & mask_d[None, :],
+                        other=0.0).to(tl.float32)
+
+        # (x‑μ)·rstd
+        norm = (x_val - mean[:, None]) * rstd[:, None]           # fp32
+
+        # γ, β (float32)
+        w = tl.load(w_ptr + offs_d, mask=mask_d, other=0.0)      # γ
+        b = tl.load(b_ptr + offs_d, mask=mask_d, other=0.0)      # β
+        norm = norm * w[None, :] + b[None, :]                    # fp32
+
+        # gate (fp16 → fp32)
+        gate_val = tl.load(gate_ptr + offs_m[:, None] * dim + offs_d[None, :],
+                           mask=mask_m[:, None] & mask_d[None, :],
+                           other=0.0).to(tl.float32)
+
+        out = norm * gate_val                                    # fp32
+        out_fp16 = out.to(tl.float16)
+
+        tl.store(y_ptr + offs_m[:, None] * dim + offs_d[None, :],
+                 out_fp16,
+                 mask=mask_m[:, None] & mask_d[None, :])
+
+
+# ----------------------------------------------------------------------
+# Custom forward kernel for the outgoing TriMul operator
+# ----------------------------------------------------------------------
+def custom_kernel(data):
+    """
+    Forward pass of the outgoing TriMul operator.
+
+    Args:
+        data = (input_tensor, mask_tensor, weights_dict, config_dict)
+            - input_tensor : torch.Tensor, shape [B, N, N, dim], dtype float32
+            - mask_tensor  : torch.Tensor, shape [B, N, N] (bool/float) or None
+            - weights_dict : dict with all Linear/LayerNorm parameters
+                             (float32 tensors, bias=False for Linear)
+            - config_dict  : must contain
+                "dim" (int), "hidden_dim" (int), "nomask" (bool)
+
+    Returns:
+        torch.Tensor of shape [B, N, N, dim] (float32)
+    """
+    # --------------------------------------------------------------
+    # Unpack arguments
+    # --------------------------------------------------------------
+    x, mask, w, cfg = data
+    dim = cfg["dim"]
+    hidden_dim = cfg["hidden_dim"]
+    eps = 1e-5
+    device = x.device
+
+    B, N, _, _ = x.shape
+    R = B * N * N                # total rows for row‑wise ops
+    H = hidden_dim
+
+    # --------------------------------------------------------------
+    # 1️⃣ First LayerNorm (fp32 → fp16)
+    # --------------------------------------------------------------
+    x_flat = x.view(R, dim).contiguous()                      # [R, dim] float32
+    x_norm = torch.empty(R, dim, dtype=torch.float16, device=device)
+
+    BLOCK_M = 128        # tune for H100
+    BLOCK_D = 64
+    grid = (triton.cdiv(R, BLOCK_M),)
+    layernorm_kernel[grid](
+        x_flat,
+        x_norm,
+        w["norm.weight"],            # γ (float32)
+        w["norm.bias"],              # β (float32)
+        R,
+        dim,
+        eps,
+        BLOCK_M=BLOCK_M,
+        BLOCK_D=BLOCK_D,
+        num_warps=4,
+    )
+    del x_flat  # free original fp32 tensor
+
+    # --------------------------------------------------------------
+    # 2️⃣ Fused linear: (left/right proj) + (3 gates) → (R, 5·H)
+    # --------------------------------------------------------------
+    fused_w = torch.cat(
+        [
+            w["left_proj.weight"],
+            w["right_proj.weight"],
+            w["left_gate.weight"],
+            w["right_gate.weight"],
+            w["out_gate.weight"],
+        ],
+        dim=0,
+    ).to(torch.float16)                # [5·H, dim]
+
+    proj = F.linear(x_norm, fused_w)    # fp16, shape [R, 5·H]
+    del fused_w, x_norm                 # free intermediates
+
+    # --------------------------------------------------------------
+    # 3️⃣ Split, mask & apply sigmoid gates; write directly in (B, H, N, N)
+    # --------------------------------------------------------------
+    left      = torch.empty(B, H, N, N, dtype=torch.float16, device=device)
+    right     = torch.empty(B, H, N, N, dtype=torch.float16, device=device)
+    out_gate  = torch.empty(B, H, N, N, dtype=torch.float16, device=device)
+
+    if cfg.get("nomask", True):
+        # No mask: use dummy pointer and set HAS_MASK=0
+        dummy_mask = torch.empty(0, dtype=torch.float16, device=device)
+        has_mask = 0
+        mask_ptr = dummy_mask
+    else:
+        # Flatten mask to [R] and cast to fp16
+        mask_flat = mask.to(torch.float16).reshape(R)  # [R]
+        has_mask = 1
+        mask_ptr = mask_flat
+
+    BLOCK_R = 128      # rows per program
+    BLOCK_H = 32       # hidden dim chunk
+    grid_split = (triton.cdiv(R, BLOCK_R),)
+    split_fuse_gate_kernel[grid_split](
+        proj,
+        left,
+        right,
+        out_gate,
+        mask_ptr,
+        R,
+        H,
+        N,
+        HAS_MASK=has_mask,
+        BLOCK_R=BLOCK_R,
+        BLOCK_H=BLOCK_H,
+        num_warps=4,
+    )
+    del proj, mask_ptr
+
+    # --------------------------------------------------------------
+    # 4️⃣ Tri‑multiplicative update (batched GEMM over hidden dim)
+    # --------------------------------------------------------------
+    # view as (B·H, N, N) for cuBLAS
+    left_mat  = left.view(B * H, N, N)
+    right_mat = right.view(B * H, N, N)
+
+    # out_mat = left @ rightᵀ   shape (B·H, N, N)
+    out_mat = torch.bmm(left_mat, right_mat.transpose(1, 2))
+
+    # reshape back to (B, H, N, N)
+    out = out_mat.view(B, H, N, N)
+
+    # --------------------------------------------------------------
+    # 5️⃣ Second LayerNorm + element‑wise multiplication with out_gate
+    # --------------------------------------------------------------
+    # Need (B·N·N, H) layout → permute then contiguous
+    out_perm = out.permute(0, 2, 3, 1).contiguous()          # [B, N, N, H]
+    gate_perm = out_gate.permute(0, 2, 3, 1).contiguous()   # [B, N, N, H]
+
+    out_flat = out_perm.view(R, H).contiguous()
+    gate_flat = gate_perm.view(R, H).contiguous()
+    out_fused = torch.empty_like(out_flat, dtype=torch.float16, device=device)
+
+    grid2 = (triton.cdiv(R, BLOCK_M),)
+    layernorm_mul_kernel[grid2](
+        out_flat,
+        gate_flat,
+        out_fused,
+        w["to_out_norm.weight"],   # γ (float32)
+        w["to_out_norm.bias"],     # β (float32)
+        R,
+        H,
+        eps,
+        BLOCK_M=BLOCK_M,
+        BLOCK_D=BLOCK_D,
+        num_warps=4,
+    )
+    # free intermediate tensors
+    del out_flat, gate_flat, out, out_gate, out_perm, gate_perm
+
+    # --------------------------------------------------------------
+    # 6️⃣ Final projection back to `dim` (fp16 → fp32)
+    # --------------------------------------------------------------
+    final_half = F.linear(
+        out_fused,
+        w["to_out.weight"].to(torch.float16),   # [dim, H]
+    )   # fp16
+
+    final = final_half.view(B, N, N, dim).to(torch.float32)
+    return final
+```
