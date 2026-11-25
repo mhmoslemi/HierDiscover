@@ -309,7 +309,6 @@ def _eval_child(conn, code: str, lib_dir: str, task_yaml: str,
                 problem_type: str, log_chars: int,
                 gpu_id: Optional[int] = None, expected_gpu: str = "",
                 expected_triton: str = "", kernel_python: str = "",
-                environment_verified: bool = False,
                 owner_pid: Optional[int] = None) -> None:
     """
     Runs in a spawned process. Does the whole evaluation and sends back a plain
@@ -343,10 +342,8 @@ def _eval_child(conn, code: str, lib_dir: str, task_yaml: str,
         lib_dir = os.path.abspath(lib_dir)
         if lib_dir not in sys.path:
             sys.path.insert(0, lib_dir)
-        if problem_type == "trimul" and not environment_verified:
-            verify_benchmark_environment(py3, expected_gpu, expected_triton)
         if problem_type == "trimul":
-            out["environment_verified"] = True
+            verify_benchmark_environment(py3, expected_gpu, expected_triton)
         from libkernelbot.task import make_task_definition, build_task_config
         from libkernelbot.run_eval import run_config
         from libkernelbot.submission import compute_score
@@ -427,8 +424,7 @@ def run_eval_with_timeout(code: str, lib_dir: str, task_yaml: str,
                           timeout_s: Optional[float], gpu_id: Optional[int] = None,
                           expected_gpu: str = "",
                           expected_triton: str = "",
-                          kernel_python: str = "",
-                          environment_verified: bool = False) -> Dict:
+                          kernel_python: str = "") -> Dict:
     """
     Spawn, wait, and kill on timeout.
 
@@ -442,7 +438,7 @@ def run_eval_with_timeout(code: str, lib_dir: str, task_yaml: str,
                        args=(child_conn, code, lib_dir, task_yaml,
                              problem_type, log_chars, gpu_id,
                              expected_gpu, expected_triton, kernel_python,
-                             environment_verified, os.getpid()),
+                             os.getpid()),
                        daemon=True)
     proc.start()
     child_conn.close()
@@ -539,14 +535,12 @@ class GpuMode(Problem):
         for gpu_id in self.kernel_gpu_ids:
             self._kernel_gpu_slots.put(gpu_id)
         self.gpu_lease_timeout_s = float(cfg.get("gpu_lease_timeout_s", 0.0))
-        self._verified_kernel_environments = {}
         self._gpu_lease_error = None
         # entrypoint is implicit (custom_kernel inside submission.py)
         self.entrypoint = "custom_kernel"
 
     def begin_evaluation_batch(self):
-        """Check each TriMul device once before evaluating a batch."""
-        self._verified_kernel_environments.clear()
+        """Check that each TriMul device is idle before evaluating a batch."""
         self._gpu_lease_error = None
         if self.problem_type == "trimul":
             removed = _reap_orphaned_kernel_evaluators(self.kernel_gpu_ids)
@@ -664,28 +658,13 @@ class GpuMode(Problem):
         try:
             with gpu_lease(gpu_id, self.gpu_lease_timeout_s,
                            purpose=f"gpu_mode:{self.problem_type}"):
-                environment_verified = False
-                environment_key = None
-                if self.problem_type == "trimul":
-                    try:
-                        stat = os.stat(self.kernel_python)
-                        environment_key = (
-                            gpu_id, self.kernel_python, self.gpu_type, self.triton_version,
-                            stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns,
-                            stat.st_ctime_ns)
-                        environment_verified = (
-                            self._verified_kernel_environments.get(gpu_id) == environment_key)
-                    except Exception as exc:
-                        return self._fail(
-                            f"Local kernel run failed: {type(exc).__name__}: {exc}",
-                            failure_kind="infrastructure")
                 if self.problem_type == "trimul" or timeout > 0 or len(self.kernel_gpu_ids) > 1:
                     out = run_eval_with_timeout(
                         code, self.lib_dir, self.task_yaml,
                         self.problem_type, self.log_chars,
                         timeout if timeout > 0 else None, gpu_id,
                         self.gpu_type, self.triton_version,
-                        self.kernel_python, environment_verified)
+                        self.kernel_python)
                 else:
                     # timeout disabled: run inline, the original behaviour
                     class _Sink:
@@ -695,17 +674,11 @@ class GpuMode(Problem):
                     _eval_child(sink, code, self.lib_dir, self.task_yaml,
                                 self.problem_type, self.log_chars,
                                 gpu_id, self.gpu_type,
-                                self.triton_version, self.kernel_python,
-                                environment_verified)
+                                self.triton_version, self.kernel_python)
                     out = getattr(sink, "v", {
                         "ok": False, "msg": "no result", "logs": "",
                         "score_us": None,
                     })
-                if environment_key is not None:
-                    if out.get("environment_verified"):
-                        self._verified_kernel_environments[gpu_id] = environment_key
-                    else:
-                        self._verified_kernel_environments.pop(gpu_id, None)
         except TimeoutError as exc:
             if self.problem_type == "trimul":
                 self._gpu_lease_error = str(exc)
