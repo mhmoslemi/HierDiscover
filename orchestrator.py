@@ -2,6 +2,7 @@
 
 Configuration: saved settings, current YAML rollout controls, then CLI.
 Entropic training uses adaptive-beta, leave-one-out group advantages.
+Hinge adjusts those group advantages against the best prior valid reward.
 SPO-RS uses a historical run-wide baseline and clipped policy updates.
 Hybrid and llm-critic use a token-summed importance-sampling update.
 """
@@ -26,8 +27,8 @@ from pathlib import Path
 from types import SimpleNamespace
 import numpy as np
 from config_validation import (
-    DECOMPOSE_MODE, DEFAULT_EVAL_PROGRESS_INTERVAL_S, HYBRID_INVARIANT_MODE, INVARIANT_ADVANTAGE_MODES,
-    LLM_CRITIC_MODE, PARENT_SELECTION_MODES,
+    DECOMPOSE_MODE, DEFAULT_EVAL_PROGRESS_INTERVAL_S, HINGE_MODE, HYBRID_INVARIANT_MODE,
+    INVARIANT_ADVANTAGE_MODES, LLM_CRITIC_MODE, PARENT_SELECTION_MODES,
     SPO_RS_INVARIANT_MODE, reject_retired_coder_cap, uses_hybrid_policy_loss,
 )
 from generation.output_validation import (
@@ -72,6 +73,7 @@ from training.trainers import (
     compute_group_advantages, compute_token_logprobs as compute_token_logprobs,
 )
 from training import critic_step
+from training.hinge import hinge_advantages
 from training.hybrid import hybrid_advantages, reference_logprob_mean
 
 
@@ -462,7 +464,8 @@ def _load_adapter(model, adapter_dir, *, announce=True):
         setting_log_only(f"[resume] loaded LoRA adapter from {adapter_dir}")
 
 
-def _save_training_checkpoint(exp_dir, next_step, adapter_path, sampler, optimizer, spo_rs_tracker=None):
+def _save_training_checkpoint(exp_dir, next_step, adapter_path, sampler, optimizer,
+                              spo_rs_tracker=None, *, hinge_frontier=None):
     """Atomically save the state required for an exact next-step resume."""
     import torch
 
@@ -475,6 +478,7 @@ def _save_training_checkpoint(exp_dir, next_step, adapter_path, sampler, optimiz
         "sampler": sampler.state_dict(),
         "optimizer": optimizer.state_dict(),
         "spo_rs_tracker": (spo_rs_tracker.state_dict() if spo_rs_tracker is not None else None),
+        "hinge_frontier": hinge_frontier,
     }
     torch.save(payload, tmp)
     tmp.replace(target)
@@ -505,6 +509,9 @@ def _load_training_checkpoint(exp_dir, *, mmap=False):
     saved_mode = saved_sampler.get("selection_mode")
     if saved_mode is not None and saved_mode not in PARENT_SELECTION_MODES:
         raise ValueError(f"unsupported parent_selection {saved_mode!r} in checkpoint {path}")
+    frontier = payload.get("hinge_frontier")
+    if frontier is not None and (not isinstance(frontier, (int, float)) or not math.isfinite(frontier)):
+        raise ValueError(f"invalid hinge frontier in checkpoint {path}")
     return payload
 
 
@@ -2202,11 +2209,36 @@ def _print_best_ever_raw(sampler, step_idx, cfg, problem, previous_best_value):
     return best_seen_result
 
 
+def _prepare_hinge_batch(group_results, frontier):
+    """Compute one step's advantages using the frontier entering that step."""
+    rewards, valid = [], []
+    groups = {}
+    for group_id, results in group_results.items():
+        group_rewards = np.asarray([result.reward for result in results], dtype=np.float64)
+        sibling, beta = compute_group_advantages(group_rewards)
+        start = len(rewards)
+        rewards.extend(group_rewards)
+        valid.extend(result.valid for result in results)
+        groups[group_id] = (sibling, beta, slice(start, len(rewards)))
+
+    rewards = np.asarray(rewards, dtype=np.float64)
+    valid = np.asarray(valid, dtype=bool)
+    step_siblings = np.concatenate([group[0] for group in groups.values()]) if groups else np.empty(0)
+    applied = hinge_advantages(rewards, valid, step_siblings, frontier)
+    next_frontier = frontier
+    if valid.any():
+        step_best = float(rewards[valid].max())
+        next_frontier = step_best if frontier is None else max(frontier, step_best)
+    return {group_id: (sibling, beta, applied[rows])
+            for group_id, (sibling, beta, rows) in groups.items()}, next_frontier
+
+
 def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                cfg, exp_dir, problem, gen_pool=None,
                parallel_trainer=None,
                spo_rs_tracker=None, sampling_adapter_path=None,
-               evaluation_complete=None, pending_artifacts=None, park_trainer=None):
+               evaluation_complete=None, pending_artifacts=None, park_trainer=None, *,
+               hinge_frontier=None):
     import os
     import torch
     from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
@@ -2225,6 +2257,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
         raise ValueError("training requires the process-distributed trainer")
     step_t0 = time.time()
     active_advantage_mode = str(getattr(cfg, "advantage_mode", "entropic")).lower()
+    hinge_mode = active_advantage_mode == HINGE_MODE
     invariant_mode = active_advantage_mode in INVARIANT_ADVANTAGE_MODES
     hybrid_mode = active_advantage_mode in ("hybrid", HYBRID_INVARIANT_MODE)
     critic_mode = active_advantage_mode == LLM_CRITIC_MODE
@@ -2470,7 +2503,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
             "solver": "coder",
             "model_name": cfg.coder_model_name,
         }
-        if hybrid_loss or invariant_mode:
+        if hybrid_loss or invariant_mode or hinge_mode:
             pending_meta["advantage_mode"] = active_advantage_mode
         if critic_mode:
             pending_meta.update(parent_fields[group_id],
@@ -3041,6 +3074,13 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
     step_code_failure_count = 0
     prompt_ids_by_job = {}
 
+    if hinge_mode:
+        hinge_results = {
+            group_id: [future.result() for _, future in zip(responses, reward_futures[group_id], strict=True)]
+            for group_id, responses in group_responses.items()
+        }
+        hinge_labels, hinge_frontier_after = _prepare_hinge_batch(hinge_results, hinge_frontier)
+
     # All historical labels use the history entering the step. The invariant
     # variants also need the complete current batch for the cap and hybrid RMS.
     spo_rs_prepared = {}
@@ -3128,16 +3168,10 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
         responses = group_responses[g]          # streamed mutable rollout records
         futs = reward_futures[g]                 # aligned RewardResult futures
 
-        rewards = []
-        codes = []
-        valids = []
-        outs = []        # list of RewardResult
-        for r_idx, record in enumerate(responses):
-            res = futs[r_idx].result()           # already computed (or finishes now)
-            rewards.append(res.reward)
-            codes.append(res.code or '')
-            valids.append(res.valid)
-            outs.append(res)
+        outs = hinge_results[g] if hinge_mode else [futs[index].result() for index in range(len(responses))]
+        rewards = [res.reward for res in outs]
+        codes = [res.code or '' for res in outs]
+        valids = [res.valid for res in outs]
 
         rewards_np = np.array(rewards, dtype=np.float64)
         if rewards_np.size == 0:
@@ -3167,6 +3201,8 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
             advantages, ttt_adaptive_beta, ttt_advantages = hybrid_advantages(
                 rewards_np, spo_rs_advantages, ttt_weight=cfg.hybrid_ttt_weight,
                 spo_weight=cfg.hybrid_spo_weight, return_ttt=True)
+        elif hinge_mode:
+            ttt_advantages, ttt_adaptive_beta, advantages = hinge_labels[g]
         else:
             ttt_advantages, ttt_adaptive_beta = compute_group_advantages(rewards_np)
             advantages = spo_rs_advantages if history_mode else ttt_advantages
@@ -3278,9 +3314,8 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
             advantage_plot_rollouts.append(advantage_plot_rollout(meta))
             saved_rollouts += 1
 
-        # Entropic training skips constant groups. SPO-RS compares every
-        # rollout with its historical baseline, so tied groups can still learn.
-        if constant and not replayable_update:
+        # The hinge can supply a reward signal even when all sibling advantages are zero.
+        if constant and not replayable_update and (not hinge_mode or not np.any(advantages)):
             continue
 
         for r_idx, (record, adv) in enumerate(zip(responses, advantages)):
@@ -3355,7 +3390,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
     code_valid_fraction = (1.0 - step_code_failure_count / step_rollout_count if step_rollout_count else 1.0)
 
     # Preserve the standard objectives' constant-reward-group filtering.
-    if not replayable_update:
+    if not replayable_update and not hinge_mode:
         all_examples = [ex for ex in all_examples if not ex["reward_constant"]]
 
     if clipped_policy_mode and cfg.generation_backend == "vllm":
@@ -3494,6 +3529,9 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
         "code_valid_fraction": float(code_valid_fraction),
         **evaluation_stats,
     }
+    if hinge_mode:
+        step_stats["hinge_frontier_before"] = hinge_frontier
+        step_stats["hinge_frontier_after"] = hinge_frontier_after
     if history_mode:
         step_stats["spo_rs_updates"] = spo_rs_updates
         step_stats["spo_rs_tracker_size"] = (0 if spo_rs_tracker is None else len(spo_rs_tracker))
@@ -3720,6 +3758,7 @@ def _main(trainer_startup):
     selection_detail = f"c={cfg.puct_c}"
     print(f"Search selection:   {selection.upper()} ({selection_detail})")
     configured_advantage_mode = getattr(cfg, "advantage_mode", "entropic")
+    hinge_mode = configured_advantage_mode == HINGE_MODE
     hybrid_mode = configured_advantage_mode in ("hybrid", HYBRID_INVARIANT_MODE)
     invariant_mode = configured_advantage_mode in INVARIANT_ADVANTAGE_MODES
     critic_mode = configured_advantage_mode == LLM_CRITIC_MODE
@@ -3830,6 +3869,7 @@ def _main(trainer_startup):
     legacy_resume = None
     interrupted_spo_rs_artifacts = None
     start_step = 0
+    hinge_frontier = None
     current_policy_adapter_path = None
     recover_update = critic_mode or invariant_mode or (
         history_mode and not ((is_trimul or hybrid_mode) and cfg.no_train))
@@ -3837,6 +3877,10 @@ def _main(trainer_startup):
         resume_payload = _load_training_checkpoint(exp_dir, mmap=True)
         if resume_payload is not None:
             start_step = int(resume_payload["next_step"])
+            if hinge_mode:
+                if "hinge_frontier" not in resume_payload:
+                    raise ValueError("hinge checkpoint is missing its pre-step frontier")
+                hinge_frontier = resume_payload["hinge_frontier"]
             adapter_path = Path(exp_dir) / resume_payload["adapter_dir"]
             _load_adapter(model, adapter_path)
             current_policy_adapter_path = adapter_path
@@ -3865,8 +3909,8 @@ def _main(trainer_startup):
                         flush=True,
                     )
         else:
-            if invariant_mode and _adapter_exists(exp_dir):
-                raise FileNotFoundError("resuming an invariant run requires its training_state.pt")
+            if (invariant_mode or hinge_mode) and _adapter_exists(exp_dir):
+                raise FileNotFoundError(f"resuming {configured_advantage_mode} requires its training_state.pt")
             if recover_update:
                 interrupted_spo_rs_artifacts = (_recoverable_spo_rs_artifacts(exp_dir, 0, cfg))
             initial_adapter = Path(exp_dir) / "adapter_initial"
@@ -3899,6 +3943,10 @@ def _main(trainer_startup):
                     "EOS token(s) restored",
                     flush=True,
                 )
+            elif hinge_mode:
+                if initial_adapter.is_dir():
+                    _load_adapter(model, initial_adapter)
+                    current_policy_adapter_path = initial_adapter
             elif not invariant_mode:
                 legacy_resume = _legacy_resume_info(exp_dir)
                 start_step, adapter_path = legacy_resume
@@ -4053,13 +4101,13 @@ def _main(trainer_startup):
                   f"N_eff={initialization['effective_count_after']:.2f}; "
                   "step 0 policy update enabled", flush=True)
 
-    if (is_trimul or hybrid_loss or invariant_mode) and resume_payload is None:
+    if (is_trimul or hybrid_loss or invariant_mode or hinge_mode) and resume_payload is None:
         if current_policy_adapter_path is None:
             current_policy_adapter_path = Path(_save_adapter(
                 model, exp_dir, start_step, directory_name="adapter_initial",
                 base_policy=True))
         _save_training_checkpoint(exp_dir, start_step, current_policy_adapter_path,
-                                  sampler, optimizer, spo_rs_tracker)
+                                  sampler, optimizer, spo_rs_tracker, hinge_frontier=hinge_frontier)
 
     del resume_payload
     from runtime.host_memory import reclaim_unused_host_memory
@@ -4450,7 +4498,8 @@ def _main(trainer_startup):
                         if replayable_update else None),
                     evaluation_complete=step_plotter.submit,
                     pending_artifacts=pending_spo_rs_artifacts,
-                    park_trainer=_offload_trainer_for_generation if critic_mode else None)
+                    park_trainer=_offload_trainer_for_generation if critic_mode else None,
+                    hinge_frontier=hinge_frontier)
 
             stats = stats or {}
             step_training_seconds = float(stats.get("training_seconds", 0.0) or 0.0)
@@ -4474,10 +4523,12 @@ def _main(trainer_startup):
                 adapter_path = current_policy_adapter_path
             else:
                 adapter_path = _save_adapter(model, exp_dir, step)
+            next_frontier = stats["hinge_frontier_after"] if hinge_mode else None
             checkpoint_path = _save_training_checkpoint(
                 exp_dir, step + 1, adapter_path, sampler, optimizer,
-                spo_rs_tracker=spo_rs_tracker,
+                spo_rs_tracker=spo_rs_tracker, hinge_frontier=next_frontier,
             )
+            hinge_frontier = next_frontier
             step_summary = {
                 "step": step,
                 "completed": True,

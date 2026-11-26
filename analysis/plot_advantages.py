@@ -38,33 +38,10 @@ import matplotlib.ticker  # noqa: E402,F401
 import numpy as np  # noqa: E402
 from matplotlib.colors import LinearSegmentedColormap  # noqa: E402
 
-# Running as a script puts analysis/ first on the path; training/ lives at the repo root.
+# Running as a script puts analysis/ first on the path.
 if not __package__:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from training.ta_rs_grpo import (  # noqa: E402
-    DEFAULT_GAMMA, DEFAULT_GATE_FLOOR, DEFAULT_LAMBDA, ta_rs_grpo2_advantages,
-    ta_rs_grpo3_advantages, ta_rs_grpo_advantages, update_anchor)
-
-
-def per_group(fn):
-    """Lift a one-group advantage function to a whole step (step data, anchor)."""
-    def step(s, anchor):
-        out = np.full(len(s["reward"]), np.nan)
-        for g in np.unique(s["group"]):
-            idx = s["group"] == g
-            out[idx] = fn(s["reward"][idx], s["valid"][idx], anchor)[0]
-        return out
-    return step
-
-
-# (key, whole-step function, title, title suffix); TA uses the Ratchet-EMA anchor, the rest the all-time best.
-ANCHOR_METHODS = (
-    ("ta", per_group(ta_rs_grpo_advantages), "TA-RS-GRPO", f", λ {DEFAULT_LAMBDA}, γ {DEFAULT_GAMMA}"),
-    ("t2", lambda s, b: ta_rs_grpo2_advantages(s["reward"], s["valid"], s["group"], b),
-     "TA-RS-GRPO2", f", λ {DEFAULT_LAMBDA}, floor {DEFAULT_GATE_FLOOR}"),
-    ("t3", lambda s, b: ta_rs_grpo3_advantages(s["reward"], s["valid"], s["group"], s["parent_reward"], b),
-     "TA-RS-GRPO3", f", λ {DEFAULT_LAMBDA}"),
-)
+from config_validation import HINGE_MODE  # noqa: E402
 
 # ---- palette (dataviz reference instance, light surface) --------------------
 SURFACE, INK, INK2, MUTED = "#fcfcfb", "#0b0b0b", "#52514e", "#898781"
@@ -115,10 +92,6 @@ def load_run(run, weighted=False, *, max_step=None):
             metas = summary.get("advantage_plot_rollouts")
             if metas is None:
                 metas = [json.loads(path.read_text()) for path in sorted(directory.glob("*.meta.json"))]
-            parents_path = directory / f"{directory.name}.parents.json"
-            parent_reward = ({p["group"]: p.get("parent_reward")
-                              for p in json.loads(parents_path.read_text()).get("parents", [])}
-                             if parents_path.is_file() else {})
         except (OSError, json.JSONDecodeError):
             skipped.append(step)
             continue
@@ -146,10 +119,8 @@ def load_run(run, weighted=False, *, max_step=None):
             ttt=f("ttt_advantage"), spo=f("spo_rs_advantage"),
             adv=advantages, v_t=f("spo_rs_v_t"),
             best_seen=summary.get("best_seen_raw_score"), maximize=summary.get("result_maximize"),
-            linear_hybrid=linear_hybrid,
-            # TA-RS-GRPO3 weights each parent by its own reward; compact summaries lack it, parents.json has it.
-            parent_reward=np.array([parent_reward.get(m.get("group"), m.get("parent_value")) for m in metas],
-                                   dtype=float),
+            linear_hybrid=linear_hybrid, advantage_mode=mode,
+            hinge_frontier=summary.get("hinge_frontier_before"),
         )
         s = steps[step]
         if weighted and linear_hybrid:
@@ -157,18 +128,6 @@ def load_run(run, weighted=False, *, max_step=None):
         else:
             s["wttt"], s["wspo"] = s["ttt"], s["spo"]
     return cfg, wt, ws, steps, skipped
-
-
-def add_anchor_methods(steps):
-    """Replay the anchored advantages over the loaded steps in order; anchors start empty."""
-    ema = best = None
-    for x in sorted(steps):
-        s = steps[x]
-        s["anchors"] = {"ta": ema, "t2": best, "t3": best}
-        for key, fn, _, _ in ANCHOR_METHODS:
-            s[key] = fn(s, s["anchors"][key])
-        ema = update_anchor(ema, s["reward"], s["valid"])
-        best = update_anchor(best, s["reward"], s["valid"], gamma=0.0)
 
 
 def check_weights(wt, ws, steps):
@@ -207,8 +166,11 @@ def statistic(values, fn):
 
 
 def available_series(step_data):
-    return [series for series in ADVANTAGE_SERIES
-            if any(np.isfinite(step[series[0]]).any() for step in step_data)]
+    step_data = tuple(step_data)
+    hinge = all(step["advantage_mode"] == HINGE_MODE for step in step_data)
+    return [(key, color, "Hinge" if hinge and key == "adv" else label)
+            for key, color, label in ADVANTAGE_SERIES
+            if any(np.isfinite(step[key]).any() for step in step_data)]
 
 
 def corr(a, b):
@@ -454,7 +416,7 @@ def fig_snapshot(step, steps, wt, ws, out):
     H, rh = 13.9, 2.91                 # figure height / panel height, inches
     y1, y2, y3 = 9.86, 5.35, 0.84      # bottom edge of each row, inches
     top_count = len(series) + int(compare_components)
-    bottom_count = 2 + len(ANCHOR_METHODS) + int(has_baseline)
+    bottom_count = 2 + int(has_baseline)
     columns = max(top_count, bottom_count)
     fig = plt.figure(figsize=(5 * columns, H))
     L, R, gap = 0.045, 0.94, 0.055
@@ -501,19 +463,7 @@ def fig_snapshot(step, steps, wt, ws, out):
         style_axis(ax, "step", "v_t (before the step's update)",
                    f"RS-SPO baseline through step {step}")
 
-    # The anchored advantages sit between the two best-so-far panels.
-    m = len(ANCHOR_METHODS)
-    for ax, (key, _, name, suffix) in zip(bot[-1 - m:-1], ANCHOR_METHODS):
-        ax.scatter(d["reward"][v], d[key][v], c=gcol[v], s=22, alpha=0.8, lw=0)
-        ax.scatter(d["reward"][~v], d[key][~v], c=gcol[~v], s=26, marker="x", lw=1)
-        anchor = d["anchors"][key]
-        if anchor is not None:
-            ax.axvline(anchor, color=INK2, lw=1, ls="--")
-        anchor_label = "none" if anchor is None else f"{anchor:.5g}"
-        style_axis(ax, "reward (x = invalid, dashed = anchor b_t)", "advantage",
-                   f"{name} vs reward   (b_t {anchor_label}{suffix})", zero=True)
-
-    ax = bot[-2 - m]
+    ax = bot[-2]
     ax.plot(xs_all[upto], best[upto], color=C_TTT, marker="o", ms=3,
             drawstyle="steps-post")
     ax.plot(step, best[i], "o", color=C_TTT, ms=8)
@@ -529,7 +479,7 @@ def fig_snapshot(step, steps, wt, ws, out):
     best_label = f"raw {best[-1]:.5g}" if np.isfinite(best[-1]) else "raw unavailable"
     style_axis(ax, "step", "best raw score so far",
                f"Best across plotted steps   ({best_label})")
-    for ax in bot[:-1 - m] + bot[-1:]:
+    for ax in bot:
         ax.xaxis.set_major_locator(matplotlib.ticker.MaxNLocator(integer=True))
 
     # row 3: same three plots, x = reward rank within the step, y = symlog advantage
@@ -561,27 +511,24 @@ def fig_snapshot(step, steps, wt, ws, out):
 
 
 def fig_methods(step, steps, out):
-    """One PNG per step: RS-GRPO and RS-SPO on top, TA-RS-GRPO, TA-RS-GRPO2, TA-RS-GRPO3 below."""
+    """Plot the available advantage series of one step side by side."""
     d = steps[step]
     v = d["valid"]
     gcol = np.array([GROUP_COLORS[g % len(GROUP_COLORS)] for g in d["group"]])
-    fig, axs = plt.subplots(2, 3, figsize=(16, 9.5), dpi=150)
-    panels = [(axs[0, 0], d["wttt"], "RS-GRPO", "", None), (axs[0, 1], d["wspo"], "RS-SPO", "", None)]
-    panels += [(ax, d[key], name, suffix, d["anchors"][key])
-               for ax, (key, _, name, suffix) in zip(axs[1], ANCHOR_METHODS)]
-    for ax, values, name, suffix, anchor in panels:
+    series = available_series((d,))
+    fig, axs = plt.subplots(1, len(series), figsize=(5.4 * len(series), 5.3), dpi=150, squeeze=False)
+    frontier = d["hinge_frontier"]
+    xlabel = "reward (x = invalid)" if frontier is None else "reward (x = invalid, dashed = frontier)"
+    for ax, (key, _, label) in zip(axs[0], series, strict=True):
+        values = d[key]
         ax.scatter(d["reward"][v], values[v], c=gcol[v], s=22, alpha=0.8, lw=0)
         ax.scatter(d["reward"][~v], values[~v], c=gcol[~v], s=26, marker="x", lw=1)
-        label = ""
-        if anchor is not None:
-            ax.axvline(anchor, color=INK2, lw=1, ls="--")
-            label = f"   (b_t {anchor:.5g}{suffix})"
-        style_axis(ax, "reward (x = invalid, dashed = anchor b_t)", "advantage",
-                   f"{name} vs reward{label}", zero=True)
-    axs[0, 2].axis("off")
-    axs[0, 2].legend(handles=[plt.Line2D([], [], marker="o", ls="", color=GROUP_COLORS[g % len(GROUP_COLORS)],
-                                         label=f"g{g}") for g in np.unique(d["group"])],
-                     ncol=2, title="group", loc="center")
+        if frontier is not None:
+            ax.axvline(frontier, color=INK2, lw=1, ls="--")
+        style_axis(ax, xlabel, "advantage", f"{label} vs reward", zero=True)
+    handles = [plt.Line2D([], [], marker="o", ls="", color=GROUP_COLORS[g % len(GROUP_COLORS)],
+                          label=f"g{g}") for g in np.unique(d["group"])]
+    axs[0, -1].legend(handles=handles, ncol=2, title="group", loc="upper left")
     fig.suptitle(f"Step {step}: {len(d['adv'])} rollouts, valid {v.mean():.0%}",
                  x=0.02, ha="left", fontsize=12, fontweight="bold")
     fig.tight_layout()
@@ -614,7 +561,6 @@ def main():
         print("skipped (incomplete) steps:", skipped)
     print(f"{len(steps)} steps loaded; weights ttt={wt}, spo={ws}")
     check_weights(wt, ws, steps)
-    add_anchor_methods(steps)
     out =Path(a.out) if a.out else Path(a.run_dir) / (
         "adv_plots_unweighted" if a.unweighted else "adv_plots")
 
