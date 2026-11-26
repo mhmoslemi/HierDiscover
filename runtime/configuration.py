@@ -11,7 +11,7 @@ from types import SimpleNamespace
 import yaml
 from config_validation import (
     ADVANTAGE_MODES, COMMON_OPTIONAL_KEYS, COMMON_REQUIRED_KEYS, DEFAULT_EVAL_PROGRESS_INTERVAL_S,
-    LEGACY_CODER_CAP_KEY,
+    HINGE_MODE, LEGACY_CODER_CAP_KEY,
     HYBRID_INVARIANT_MODE, INVARIANT_ADVANTAGE_MODES, SPO_RS_INVARIANT_MODE,
     LLM_CRITIC_MODE, PARENT_SELECTION_MODES, RETIRED_BATCH_GROWTH_KEYS, RETIRED_TRAINER_KEYS,
     reject_retired_coder_cap, retired_search_keys, uses_hybrid_policy_loss,
@@ -222,8 +222,8 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--kl-penalty-coef", type=float, default=None)
     p.add_argument("--advantage-mode", type=str.lower,
                    choices=list(ADVANTAGE_MODES), default=None,
-                   help="Rollout advantage and policy loss. The invariant modes use "
-                        "a weighted history with an adaptive KL tilt.")
+                   help="Rollout advantage and policy loss. Hinge adjusts sibling "
+                        "advantages against the best reward from completed steps.")
     p.add_argument("--spo-rs-beta", type=float, default=None,
                    help="Fixed coefficient and advantage divisor for spo-rs and hybrid "
                         f"(default {SPO_RS_BETA_DEFAULT}).")
@@ -657,7 +657,8 @@ def load_config():
     saved_mode = str(saved.get("advantage_mode") or "entropic").lower()
     hybrid_loss = uses_hybrid_policy_loss(advantage_mode)
     if saved and advantage_mode != saved_mode and (
-            hybrid_loss or uses_hybrid_policy_loss(saved_mode)
+            HINGE_MODE in (advantage_mode, saved_mode)
+            or hybrid_loss or uses_hybrid_policy_loss(saved_mode)
             or advantage_mode in INVARIANT_ADVANTAGE_MODES or saved_mode in INVARIANT_ADVANTAGE_MODES):
         raise ValueError(f"Resume this run with its saved advantage mode ({saved_mode}) and reward scale")
     merged.pop("hybrid_invariant_lambda", None)
