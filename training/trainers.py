@@ -10,7 +10,7 @@ from types import SimpleNamespace
 
 import numpy as np
 
-from config_validation import uses_hybrid_policy_loss
+from config_validation import uses_ttt_policy_loss
 from diagnostics.console import setting_log_only
 from runtime.configuration import (
     SPO_RS_CLIP_EPSILON_DEFAULT, SPO_RS_CLIP_EPSILON_HIGH_DEFAULT,
@@ -28,15 +28,6 @@ from training.hybrid import DEFAULT_SPO_WEIGHT, DEFAULT_TTT_WEIGHT, hybrid_advan
 
 
 _FUSED_LONG_SINGLETON_MIN_TOKENS = 8192
-
-
-def _detached_behavior_importance_ratio(current_logprobs, behavior_logprobs):
-    """Return the detached per-token importance weights for entropic updates."""
-    import torch
-
-    current = current_logprobs.detach()
-    behavior = torch.as_tensor(behavior_logprobs, dtype=current.dtype, device=current.device)
-    return (current - behavior).exp()
 
 
 def compute_group_advantages(rewards_np):
@@ -988,7 +979,7 @@ def _clipped_policy_options(cfg):
 def historical_policy_loss(cfg, current_logprobs, example, clip_options, *,
                            return_tensor_metrics=False, check_finite=True):
     """Use one objective across the replicas and both overflow paths."""
-    if uses_hybrid_policy_loss(cfg.advantage_mode):
+    if uses_ttt_policy_loss(cfg.advantage_mode):
         from training.hybrid import importance_sampling_loss
 
         return importance_sampling_loss(
@@ -1005,12 +996,12 @@ def historical_policy_loss(cfg, current_logprobs, example, clip_options, *,
 
 def _historical_grad_clip(cfg):
     # Keep the nonfinite gradient check when the TTT update clips no gradient.
-    return math.inf if uses_hybrid_policy_loss(cfg.advantage_mode) else cfg.grad_clip
+    return math.inf if uses_ttt_policy_loss(cfg.advantage_mode) else cfg.grad_clip
 
 
 def _prepare_entropic_overlap_group(
         tokenizer, group_id, responses, reward_futures, prompt_jobs,
-        prompt_ids_by_job, num_groups):
+        prompt_ids_by_job, num_groups, *, reference_logprob_mean):
     """Materialize one reward-complete entropic group on CPU.
 
     Entropic advantages depend on every reward in their group, but they do not
@@ -1033,8 +1024,6 @@ def _prepare_entropic_overlap_group(
         return []
     advantages, _beta = compute_group_advantages(rewards)
     constant = float(rewards.max() - rewards.min()) < 1e-12
-    if constant:
-        return []
 
     prepared = []
     for rollout_index, (record, advantage) in enumerate(zip(responses, advantages)):
@@ -1063,7 +1052,8 @@ def _prepare_entropic_overlap_group(
             "advantage": float(advantage),
             "behavior_logprobs": behavior_logprobs,
             "reference_logprobs": reference_logprobs,
-            "reward_constant": False,
+            "reference_logprob_mean": reference_logprob_mean,
+            "reward_constant": constant,
             "group_id": int(group_id),
             "rollout_index": int(rollout_index),
             "prompt_job_id": job_idx,
@@ -1226,7 +1216,7 @@ def _finalize_exact_spo_rs_overflow(
     print(
         f"[step {step_idx}] {cfg.advantage_mode} epoch 1/1: "
         f"loss={totals['loss']:.6f} "
-        f"reference={'on' if uses_hybrid_policy_loss(cfg.advantage_mode) and cfg.kl_penalty_coef else 'off'} "
+        f"reference={'on' if uses_ttt_policy_loss(cfg.advantage_mode) and cfg.kl_penalty_coef else 'off'} "
         f"ratio={totals['ratio']:.6f} max={max_ratio:.6f} "
         f"clipped={totals['clipped_fraction']:.1%} "
         "OOM-quarantined=0 "
@@ -1272,8 +1262,8 @@ class ProcessDistributedTrainer:
         self._memory_percentage = round(100.0 * self._memory_fraction, 1)
         if self._world_size != len(self._physical_ids):
             raise ValueError("num_training_gpus does not match training_gpu_ids")
-        if self._world_size < 2:
-            raise ValueError("process-distributed training requires two GPUs")
+        if self._world_size < 1:
+            raise ValueError("process-distributed training requires at least one GPU")
 
         self._context = mp.get_context("spawn")
         self._result_queue = self._context.Queue()
@@ -1623,7 +1613,7 @@ class ProcessDistributedTrainer:
         supplied_old = sum(_valid_example_token_logprobs(example, "behavior_logprobs") for example in queued_examples)
         reference_label = (
             f"{sum(_valid_example_token_logprobs(ex, 'reference_logprobs') for ex in queued_examples)}/{len(examples)}"
-            if uses_hybrid_policy_loss(cfg.advantage_mode) and cfg.kl_penalty_coef else "off")
+            if uses_ttt_policy_loss(cfg.advantage_mode) and cfg.kl_penalty_coef else "off")
         setting_log_only(f"[step {step_idx}] {cfg.advantage_mode} logprobs: "
                          f"vLLM supplied old={supplied_old}/{len(examples)}, reference={reference_label}",
                          flush=True)
@@ -1993,7 +1983,7 @@ class ProcessDistributedTrainer:
         print(
             f"[step {step_idx}] {cfg.advantage_mode} epoch 1/1: "
             f"loss={totals['loss']:.6f} "
-            f"reference={'on' if uses_hybrid_policy_loss(cfg.advantage_mode) and cfg.kl_penalty_coef else 'off'} "
+            f"reference={'on' if uses_ttt_policy_loss(cfg.advantage_mode) and cfg.kl_penalty_coef else 'off'} "
             f"ratio={totals['ratio']:.6f} max={max_ratio:.6f} "
             f"clipped={totals['clipped_fraction']:.1%} "
             "OOM-quarantined=0 (RAM-bounded replicated exact overflow recovery)",
@@ -2016,7 +2006,7 @@ class ProcessDistributedTrainer:
             "exact_overflow_sharded_examples": 0,
         }
 
-    def begin_entropic_overlap(self, cfg, step_idx, normalization_examples):
+    def begin_entropic_overlap(self, cfg, step_idx):
         """Start a streaming entropic backward before CPU evaluation ends."""
         from concurrent.futures import ThreadPoolExecutor
         from training.fast_distributed import local_policy_update
@@ -2027,9 +2017,6 @@ class ProcessDistributedTrainer:
             raise RuntimeError("process trainer is not idle for an entropic overlap update")
         if self._entropic_overlap is not None:
             raise RuntimeError("an entropic overlap update is already active")
-        normalization_examples = int(normalization_examples)
-        if normalization_examples < 1:
-            raise ValueError("entropic overlap needs a positive normalization count")
         if self._offloaded:
             print(f"[{self._process_label}] restoring {self._world_size} "
                   "process trainers while CPU evaluation continues",
@@ -2044,10 +2031,6 @@ class ProcessDistributedTrainer:
                 "kind": "train_policy",
                 "step_cfg": dict(vars(cfg)),
                 "token_budget": self._token_budgets[rank],
-                # The exact post-filter count is reward-dependent. Divide by
-                # the known pre-reward upper bound during backward, then apply
-                # the small exact correction on every rank before reduction.
-                "total_examples": normalization_examples,
                 "memory_fraction": self._memory_fraction,
             })
 
@@ -2059,7 +2042,6 @@ class ProcessDistributedTrainer:
             "executor": executor,
             "future": None,
             "queued_examples": 0,
-            "normalization_examples": normalization_examples,
             "scheduled_keys": set(),
             "supplied_old": 0,
             "supplied_reference": 0,
@@ -2068,7 +2050,7 @@ class ProcessDistributedTrainer:
         future = executor.submit(
             local_policy_update,
             self.backend, self.model, self.tokenizer, (), cfg, 0,
-            self._token_budgets[0], normalization_examples,
+            self._token_budgets[0],
             memory_fraction=self._memory_fraction,
             work_queue=self._work_queue,
             activation_offload_semaphore=(self._activation_offload_semaphore))
@@ -2106,7 +2088,7 @@ class ProcessDistributedTrainer:
             state["sealed"] = True
 
     def finish_entropic_overlap(self, cfg, step_idx, expected_examples, *, apply_update=True):
-        """Finish, globally normalize, and optionally apply streamed gradients."""
+        """Sum across replicas and optionally apply streamed TTT gradients."""
         import torch
         from training.fast_distributed import (broadcast_trainable_parameters, reduce_trainable_gradients)
 
@@ -2135,28 +2117,20 @@ class ProcessDistributedTrainer:
                     f"accounted for {accounted_examples}/{queued_examples} "
                     "examples")
 
-            gradient_scale = (
-                float(state["normalization_examples"]) / expected_examples
-                if apply_update and expected_examples > 0 else 1.0)
             for command_queue in self._command_queues.values():
                 command_queue.put({
                     "kind": "finish_update",
-                    "gradient_scale": gradient_scale,
                     "apply_update": bool(apply_update),
                 })
 
             grad_norm = None
             update_error = None
             if apply_update:
-                with torch.no_grad():
-                    for parameter in self.model.parameters():
-                        if parameter.requires_grad and parameter.grad is not None:
-                            parameter.grad.mul_(gradient_scale)
                 reduce_trainable_gradients(self.model, destination_rank=0)
                 try:
                     grad_norm_tensor = torch.nn.utils.clip_grad_norm_(
                         [parameter for parameter in self.model.parameters() if parameter.requires_grad],
-                        max_norm=cfg.grad_clip, error_if_nonfinite=True)
+                        max_norm=_historical_grad_clip(cfg), error_if_nonfinite=True)
                     self.optimizer.step()
                     grad_norm = float(grad_norm_tensor.item())
                 except BaseException as error:
@@ -2195,11 +2169,6 @@ class ProcessDistributedTrainer:
         batches_per_gpu = [int(stats["backward_batches"]) for stats in rank_stats]
         peak_fractions = [float(stats["peak_memory_fraction"]) for stats in rank_stats]
         allocator_fractions = [float(stats["allocator_memory_fraction"]) for stats in rank_stats]
-        kl_errors = [error for stats in rank_stats for error in stats["kl_errors"]]
-        if kl_errors:
-            print(f"[warn] disable_adapter failed ({kl_errors[0]}); "
-                  "training without KL penalty on affected examples",
-                  flush=True)
         peak_percentages = [round(100.0 * fraction, 1) for fraction in peak_fractions]
         allocator_percentages = [round(100.0 * fraction, 1) for fraction in allocator_fractions]
         setting_log_only(
@@ -2213,8 +2182,8 @@ class ProcessDistributedTrainer:
         if ratio_count:
             ratio_message = (f'  IS ratio mean={ratio_sum / ratio_count:.9f} max={ratio_max:.3f}')
         print(f"[step {step_idx}] train time: {elapsed:.1f}s  "
-              f"avg loss: {total_loss / expected_examples:.9f}  "
-              "avg logpi_theta - logpi_base: "
+              f"TTT loss sum: {total_loss:.9f}  "
+              "avg logpi_old - logpi_base: "
               f"{total_logp_delta / expected_examples:.9f}{ratio_message}  "
               f"OOM-quarantined={quarantined_examples} "
               "(forward/backward overlapped CPU evaluation)", flush=True)
@@ -2478,8 +2447,9 @@ class ProcessDistributedTrainer:
         }
 
     def train_policy(self, examples, cfg, step_idx):
-        """Run the exact standard policy loss on the process-per-GPU path."""
+        """Run the shared TTT loss for entropic and Hinge on every replica."""
         import torch
+        from training.hybrid import reference_logprob_mean
         from training.fast_distributed import (broadcast_trainable_parameters,
                                       local_policy_update,
                                       reduce_trainable_gradients)
@@ -2496,6 +2466,28 @@ class ProcessDistributedTrainer:
                 "training_parallel_gpus": self._world_size,
                 "oom_quarantined_examples": 0,
             }
+        if cfg.generation_backend == "hf":
+            # HF generation omits scores; freeze them before any backward or update.
+            self.backend.set_training_mode()
+            with _policy_dropout_disabled(self.model):
+                for example in examples:
+                    prompt = example["prompt_ids"].to(self.model.device)
+                    response = example["response_ids"].to(self.model.device)
+                    if not _valid_example_token_logprobs(example, "behavior_logprobs"):
+                        example["behavior_logprobs"] = compute_token_logprobs(
+                            self.model, prompt, response, False, cfg.logprob_chunk).detach().cpu()
+                    if cfg.kl_penalty_coef and not _valid_example_token_logprobs(example, "reference_logprobs"):
+                        with self.backend.disable_adapter():
+                            example["reference_logprobs"] = compute_token_logprobs(
+                                self.model, prompt, response, False, cfg.logprob_chunk).detach().cpu()
+        reference_mean = None
+        if cfg.kl_penalty_coef:
+            reference_mean = reference_logprob_mean(
+                (int(example["response_ids"].shape[1]),
+                 example["behavior_logprobs"], example["reference_logprobs"])
+                for example in examples)
+            for example in examples:
+                example["reference_logprob_mean"] = reference_mean
         queued_examples = self._queue_examples(examples)
         total_examples = len(queued_examples)
         supplied_old = sum(_valid_example_token_logprobs(example, "behavior_logprobs") for example in queued_examples)
@@ -2503,7 +2495,7 @@ class ProcessDistributedTrainer:
             _valid_example_token_logprobs(example, "reference_logprobs")
             for example in queued_examples)
         setting_log_only(f"[step {step_idx}] {cfg.advantage_mode} logprobs: "
-                         f"vLLM supplied old={supplied_old}/{total_examples}, "
+                         f"frozen old={supplied_old}/{total_examples}, "
                          f"reference={supplied_reference}/{total_examples}", flush=True)
         setting_log_only(f"[{process_label}] one process/GPU with adaptive batching; "
                          f"memory ceiling={self._memory_percentage:g}%; "
@@ -2516,13 +2508,12 @@ class ProcessDistributedTrainer:
                 "kind": "train_policy",
                 "step_cfg": dict(vars(cfg)),
                 "token_budget": self._token_budgets[rank],
-                "total_examples": total_examples,
                 "memory_fraction": self._memory_fraction,
             })
 
         local_stats = local_policy_update(
             self.backend, self.model, self.tokenizer, (), cfg, 0,
-            self._token_budgets[0], total_examples,
+            self._token_budgets[0],
             memory_fraction=self._memory_fraction,
             work_queue=self._work_queue,
             activation_offload_semaphore=(self._activation_offload_semaphore))
@@ -2547,7 +2538,7 @@ class ProcessDistributedTrainer:
         try:
             grad_norm_tensor = torch.nn.utils.clip_grad_norm_(
                 [parameter for parameter in self.model.parameters() if parameter.requires_grad],
-                max_norm=cfg.grad_clip, error_if_nonfinite=True)
+                max_norm=_historical_grad_clip(cfg), error_if_nonfinite=True)
             self.optimizer.step()
             grad_norm = float(grad_norm_tensor.item())
         except BaseException as error:
@@ -2572,11 +2563,6 @@ class ProcessDistributedTrainer:
         batches_per_gpu = [int(stats["backward_batches"]) for stats in rank_stats]
         peak_fractions = [float(stats["peak_memory_fraction"]) for stats in rank_stats]
         allocator_fractions = [float(stats["allocator_memory_fraction"]) for stats in rank_stats]
-        kl_errors = [error for stats in rank_stats for error in stats["kl_errors"]]
-        if kl_errors:
-            print(f"[warn] disable_adapter failed ({kl_errors[0]}); "
-                  "training without KL penalty on affected examples",
-                  flush=True)
         peak_percentages = [round(100.0 * fraction, 1) for fraction in peak_fractions]
         allocator_percentages = [round(100.0 * fraction, 1) for fraction in allocator_fractions]
         setting_log_only(
@@ -2589,11 +2575,12 @@ class ProcessDistributedTrainer:
         if ratio_count:
             ratio_message = (f'  IS ratio mean={ratio_sum / ratio_count:.9f} max={ratio_max:.3f}')
         print(f"[step {step_idx}] train time: {elapsed:.1f}s  "
-              f"avg loss: {total_loss / total_examples:.9f}  "
-              "avg logpi_theta - logpi_base: "
+              f"TTT loss sum: {total_loss:.9f}  "
+              "avg logpi_old - logpi_base: "
               f"{total_logp_delta / total_examples:.9f}{ratio_message}  "
               f"OOM-quarantined={quarantined_examples}", flush=True)
         return {
+            "reference_kl_mean": reference_mean,
             "training_seconds": elapsed,
             "training_parallel_gpus": self._world_size,
             "training_grad_norm": grad_norm,

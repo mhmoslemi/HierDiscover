@@ -1,7 +1,7 @@
 """
 Per-experiment file I/O.
 
-Creates a directory under runs/ named from the main hyperparameters, then
+Creates a directory under runs/ named from the benchmark and objective, then
 writes one .txt and one .meta.json per rollout. All rollouts are
 saved, including ones that failed extraction or validation.
 
@@ -11,14 +11,15 @@ Filenames:
     step03_group2_rollout17.behavior_logprobs.zlib ← rollout-policy scores
     step03_group2_rollout17.meta.json  ← reward, valid, msg, beta, advantage, etc.
 
-Directory name (problem-agnostic):
-    runs/erdos_gpt-oss-120b_0602-2201/
+Directory name (TRIOUT is an optional shell-only label):
+    runs/trimul-entropic-0602-2201-triout1/
 
 A config.json is also dumped at the root of the run dir.
 """
 
 import json
 import math
+import os
 import re
 import struct
 import time
@@ -244,11 +245,6 @@ def _slugify(s: str) -> str:
     return re.sub(r"[^A-Za-z0-9._\-]", "_", str(s)).strip("_")
 
 
-def _model_short(model_name: str) -> str:
-    """Return just the last path component of a model name, slugified."""
-    return _slugify(model_name.split("/")[-1])
-
-
 def make_experiment_dir(cfg, root: str = "runs", resume_dir=None,
                         config_dict=None) -> Path:
     """
@@ -265,21 +261,27 @@ def make_experiment_dir(cfg, root: str = "runs", resume_dir=None,
             raise NotADirectoryError(f"resume directory not found: {path}")
         return path
 
-    problem = _slugify(getattr(cfg, "problem", "run"))
-    name_parts = [problem]
-
-    # n<circles> tag for circle-packing problems
-    num_circles = getattr(cfg, "num_circles", None)
-    if problem in ("circle_packing", "circle", "circles") and num_circles is not None:
-        name_parts.append(f"n{num_circles}")
-
-    name_parts += [
-        _model_short(cfg.coder_model_name),
+    benchmark = getattr(cfg, "problem_type", None) or getattr(cfg, "problem", "run")
+    objective = getattr(cfg, "advantage_mode", None) or "entropic"
+    name_parts = [
+        _slugify(benchmark),
+        _slugify(objective),
         time.strftime("%m%d-%H%M"),
     ]
-    name = "_".join(name_parts)
+    triout = os.environ.get("TRIOUT")
+    if triout is not None:
+        if not re.fullmatch(r"[1-9][0-9]*", triout):
+            raise ValueError("TRIOUT must be a positive integer used only in the run directory name")
+        name_parts.append(f"triout{triout}")
+    name = "-".join(name_parts)
     path = Path(root) / name
-    path.mkdir(parents=True, exist_ok=True)
+    try:
+        path.mkdir(parents=True)
+    except FileExistsError:
+        raise FileExistsError(
+            f"Run directory already exists: {path}. "
+            "Choose a different TRIOUT for a new run or use --resume for the existing run."
+        ) from None
 
     if config_dict is not None:
         cfg_dict = dict(config_dict)

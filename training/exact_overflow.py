@@ -17,7 +17,7 @@ import re
 import sys
 import time
 
-from config_validation import uses_hybrid_policy_loss
+from config_validation import uses_ttt_policy_loss
 
 METRICS = ("loss", "policy_loss", "kl_estimate", "ratio", "clipped_fraction")
 
@@ -218,11 +218,11 @@ def backward_overflow_example(backend, tokenizer, example, cfg, gpu_ids):
             input_device = next(model.get_input_embeddings().parameters()).device
             for key in ("prompt_ids", "response_ids"):
                 item[key] = item[key].to(input_device)
-            hybrid = uses_hybrid_policy_loss(cfg.advantage_mode)
-            clip_options = None if hybrid else training._clipped_policy_options(cfg)
+            ttt_loss = uses_ttt_policy_loss(cfg.advantage_mode)
+            clip_options = None if ttt_loss else training._clipped_policy_options(cfg)
             missing_old = training._initialize_behavior_logprobs([item])
-            if hybrid and missing_old:
-                raise ValueError("hybrid overflow requires the original sampler logprobs")
+            if ttt_loss and missing_old:
+                raise ValueError("TTT overflow requires the original sampler logprobs")
             with training._policy_dropout_disabled(model):
                 if missing_old:
                     item["old_policy_logprobs"] = training.compute_batched_token_logprobs(
@@ -237,7 +237,7 @@ def backward_overflow_example(backend, tokenizer, example, cfg, gpu_ids):
                     if not torch.isfinite(loss).all():
                         raise FloatingPointError("nonfinite overflow policy loss")
                     weight = float(item["sample_weight"])
-                    loss_weight = 1.0 if hybrid else weight
+                    loss_weight = 1.0 if ttt_loss else weight
                     (loss_weight * loss).backward()
                     totals = {name: weight * float(metrics[name]) for name in (
                         "kl_estimate", "ratio")}

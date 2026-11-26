@@ -4,7 +4,7 @@ Configuration: saved settings, current YAML rollout controls, then CLI.
 Entropic training uses adaptive-beta, leave-one-out group advantages.
 Hinge adjusts those group advantages against the best prior valid reward.
 SPO-RS uses a historical run-wide baseline and clipped policy updates.
-Hybrid and llm-critic use a token-summed importance-sampling update.
+All other advantage modes use the TTT token-summed importance-sampling update.
 """
 
 import warnings
@@ -29,7 +29,7 @@ import numpy as np
 from config_validation import (
     DECOMPOSE_MODE, DEFAULT_EVAL_PROGRESS_INTERVAL_S, HINGE_MODE, HYBRID_INVARIANT_MODE,
     INVARIANT_ADVANTAGE_MODES, LLM_CRITIC_MODE, PARENT_SELECTION_MODES,
-    SPO_RS_INVARIANT_MODE, reject_retired_coder_cap, uses_hybrid_policy_loss,
+    SPO_RS_INVARIANT_MODE, reject_retired_coder_cap, uses_hybrid_policy_loss, uses_ttt_policy_loss,
 )
 from generation.output_validation import (
     coder_output_issue, ttt_ac1_program, ttt_ac1_python_block, ttt_ac1_response_code,
@@ -135,7 +135,8 @@ def _generate_batch(model, tokenizer, inputs, input_len, n_samples, cfg):
         policy_sampling["top_k"] = int(sampling_top_k)
     if sampling_min_p is not None:
         policy_sampling["min_p"] = float(sampling_min_p)
-    if _uses_clipped_policy_loss(getattr(cfg, "advantage_mode", "entropic")):
+    if (_uses_clipped_policy_loss(getattr(cfg, "advantage_mode", "entropic"))
+            or uses_ttt_policy_loss(getattr(cfg, "advantage_mode", "entropic"))):
         policy_sampling.update(top_k=0, repetition_penalty=1.0)
 
     with torch.inference_mode():
@@ -206,7 +207,8 @@ def generate_prompt_jobs(model, tokenizer, prompts_by_group, counts_by_group,
     """Stream locally generated rollouts from cross-prompt HF batches."""
     if len(prompts_by_group) != len(counts_by_group):
         raise ValueError("counts_by_group must align with prompts_by_group")
-    if _uses_clipped_policy_loss(getattr(cfg, "advantage_mode", "entropic")):
+    if (_uses_clipped_policy_loss(getattr(cfg, "advantage_mode", "entropic"))
+            or uses_ttt_policy_loss(getattr(cfg, "advantage_mode", "entropic"))):
         # This local path owns its sampling arguments, including top_k=0.
         # Use the existing per-prompt OOM-aware micro-batcher instead of an
         # external HF helper that may inherit a top-k generation default.
@@ -2262,6 +2264,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
     hybrid_mode = active_advantage_mode in ("hybrid", HYBRID_INVARIANT_MODE)
     critic_mode = active_advantage_mode == LLM_CRITIC_MODE
     hybrid_loss = uses_hybrid_policy_loss(active_advantage_mode)
+    ttt_loss = uses_ttt_policy_loss(active_advantage_mode)
     history_mode = _uses_reward_history(active_advantage_mode)
     replayable_update = _uses_replayable_policy_update(active_advantage_mode)
     history_label = "hybrid" if hybrid_mode else "SPO-RS"
@@ -2355,7 +2358,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
     spo_rs_context_divergences = {}
     spo_rs_missing_policy_scores = 0
     spo_rs_previous_adapter_path = None
-    hybrid_reference_mean = None
+    batch_reference_mean = None
     if history_mode:
         previous_name = spo_rs_tracker.last_policy_adapter
         if previous_name is not None:
@@ -2569,7 +2572,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                     "top_k": getattr(cfg, "sampling_top_k", None),
                     "min_p": getattr(cfg, "sampling_min_p", None),
                     "step_idx": step_idx,
-                    "full_policy_sampling": hybrid_loss,
+                    "full_policy_sampling": ttt_loss,
                 }
                 if cfg.generation_backend == "vllm":
                     generation_options["return_logprobs"] = training_enabled
@@ -2709,19 +2712,10 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                     if hybrid_loss and cfg.kl_penalty_coef:
                         reference_scores = gen_pool.score_token_logprobs(
                             score_pairs, show_progress=True, require_complete=True)
-                elif critic_mode:
+                else:
                     reference_scores = (gen_pool.score_token_logprobs(
                         score_pairs, show_progress=True, require_complete=True)
                         if cfg.kl_penalty_coef else [None] * len(score_pairs))
-                else:
-                    current_policy_scores = [None] * len(score_pairs)
-                    try:
-                        reference_scores = gen_pool.score_token_logprobs(score_pairs, show_progress=True)
-                    except Exception as error:
-                        reference_scores = [None] * len(score_pairs)
-                        print(f"[warn] vLLM reference scoring failed ({error!r}); "
-                              "missing values will be recomputed exactly by "
-                              "the HF trainer", flush=True)
                 for record, values in zip(vllm_logprob_records, reference_scores):
                     record["reference_logprobs"] = values
                     if hybrid_loss and values is not None and not is_trimul:
@@ -2731,7 +2725,6 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                             save_rollout_logprobs, path.with_suffix(".reference_logprobs.zlib"), values))
                 behavior_count = sum(record["behavior_logprobs"] is not None for record in vllm_logprob_records)
                 reference_count = sum(record["reference_logprobs"] is not None for record in vllm_logprob_records)
-                reference_hf_fallbacks = (0 if replayable_update else len(vllm_logprob_records) - reference_count)
                 eval_done_after = sum(future.done() for futures in reward_futures.values() for future in futures)
                 reference_label = (
                     'off for SPO-RS' if clipped_policy_mode else f'{reference_count}/{len(vllm_logprob_records)}')
@@ -2754,8 +2747,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                     f"{behavior_count}/{len(vllm_logprob_records)}, "
                     f"reference {reference_label}{policy_label} in "
                     f"{time.time() - scoring_started:.1f}s "
-                    f"(HF exact reference fallbacks: {reference_hf_fallbacks}; "
-                    f"CPU evaluations completed during scoring: {eval_done_before}->{eval_done_after})",
+                    f"(CPU evaluations completed during scoring: {eval_done_before}->{eval_done_after})",
                     flush=True)
 
             coder_phase_complete = True
@@ -2810,13 +2802,13 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
 
         all_futs = [f for g in range(num_groups) for f in reward_futures[g]]
         try:
-            if hybrid_loss and training_enabled:
+            if ttt_loss and training_enabled and cfg.generation_backend == "vllm":
                 scored_records = [record for g in range(num_groups) for record in group_responses[g]
                                   if record["token_ids"]]
                 if any(record["behavior_logprobs"] is None for record in scored_records):
                     raise RuntimeError(f"{active_advantage_mode} training requires the original sampler logprobs for every response")
                 if cfg.kl_penalty_coef:
-                    hybrid_reference_mean = reference_logprob_mean(
+                    batch_reference_mean = reference_logprob_mean(
                         (len(record["token_ids"]), record["behavior_logprobs"], record["reference_logprobs"])
                         for record in scored_records)
 
@@ -2835,7 +2827,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                     staged_spo_rs_examples = (
                         _prepare_spo_rs_overlap_inputs(
                             tokenizer, group_responses, reward_futures, prompt_jobs,
-                            reference_logprob_mean=hybrid_reference_mean))
+                            reference_logprob_mean=batch_reference_mean))
                     if staged_spo_rs_examples:
                         pending_before = sum(not future.done() for future in all_futs)
                         pending_by_future = {
@@ -2922,20 +2914,16 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
             # rewards of later groups. Stream each completed group into the
             # process-per-GPU trainer while the remaining sandbox jobs continue
             # on CPU. All forwards see the frozen pre-update policy; gradients
-            # are accumulated only, globally normalized after the final group,
-            # and applied below the rollout persistence barrier.
+            # are summed and applied below the rollout persistence barrier.
             entropic_overlap_eligible = bool(
                 active_advantage_mode == "entropic"
                 and training_enabled
+                and cfg.generation_backend == "vllm"
                 and not deferred_rollouts
                 and not evaluation_trainer_offloaded
             )
             if entropic_overlap_eligible:
                 pending_groups = {int(group_id) for group_id in range(num_groups) if reward_futures[group_id]}
-                overlap_normalization_examples = sum(
-                    bool(record.get("token_ids"))
-                    for responses in group_responses.values()
-                    for record in responses)
                 overlap_prompt_ids = {}
                 try:
                     while pending_groups:
@@ -2959,13 +2947,14 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                                 tokenizer, group_id,
                                 group_responses[group_id],
                                 reward_futures[group_id], prompt_jobs,
-                                overlap_prompt_ids, num_groups)
+                                overlap_prompt_ids, num_groups,
+                                reference_logprob_mean=batch_reference_mean)
                             if prepared:
                                 if entropic_overlap_state is None:
                                     pending_before = sum(not future.done() for future in all_futs)
                                     entropic_overlap_state = (
                                         parallel_trainer.
-                                        begin_entropic_overlap(cfg, step_idx, overlap_normalization_examples))
+                                        begin_entropic_overlap(cfg, step_idx))
                                     print(
                                         f"[step {step_idx}] entropic "
                                         "evaluation/training overlap started; "
@@ -3314,10 +3303,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
             advantage_plot_rollouts.append(advantage_plot_rollout(meta))
             saved_rollouts += 1
 
-        # The hinge can supply a reward signal even when all sibling advantages are zero.
-        if constant and not replayable_update and (not hinge_mode or not np.any(advantages)):
-            continue
-
+        # Zero task advantages still receive the shared reference-KL correction.
         for r_idx, (record, adv) in enumerate(zip(responses, advantages)):
             token_ids = record["token_ids"]
             job_idx = record["job_idx"]
@@ -3370,8 +3356,8 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                 "prompt_job_id": job_idx,
                 "sample_weight": 1.0 / (num_groups * len(responses)),
             }
-            if hybrid_loss:
-                example["reference_logprob_mean"] = hybrid_reference_mean
+            if ttt_loss:
+                example["reference_logprob_mean"] = batch_reference_mean
                 example["_overlap_key"] = (g, r_idx)
             all_examples.append(example)
 
@@ -3388,10 +3374,6 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
 
     valid_fraction = (step_valid_count / step_rollout_count if step_rollout_count else 0.0)
     code_valid_fraction = (1.0 - step_code_failure_count / step_rollout_count if step_rollout_count else 1.0)
-
-    # Preserve the standard objectives' constant-reward-group filtering.
-    if not replayable_update and not hinge_mode:
-        all_examples = [ex for ex in all_examples if not ex["reward_constant"]]
 
     if clipped_policy_mode and cfg.generation_backend == "vllm":
         # SPO-RS requires the frozen behavior probability. A malformed vLLM
@@ -3541,7 +3523,9 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
         step_stats["spo_rs_sampling_adapter"] = Path(adapter_path).name
         step_stats["spo_rs_policy_updated"] = False
     if hybrid_loss:
-        step_stats["hybrid_reference_kl_mean"] = hybrid_reference_mean
+        step_stats["hybrid_reference_kl_mean"] = batch_reference_mean
+    if ttt_loss:
+        step_stats["reference_kl_mean"] = batch_reference_mean
     if hybrid_mode:
         step_stats["hybrid_ttt_weight"] = cfg.hybrid_ttt_weight
         step_stats["hybrid_spo_weight"] = cfg.hybrid_spo_weight
@@ -3774,7 +3758,7 @@ def _main(trainer_startup):
     else:
         print(f"KL coef:            {cfg.kl_penalty_coef}")
     print(f"Advantage mode:     {getattr(cfg, 'advantage_mode', 'entropic')}")
-    if hybrid_loss:
+    if uses_ttt_policy_loss(configured_advantage_mode):
         print("Policy loss:        TTT token-summed importance sampling")
     if history_mode:
         if invariant_mode:

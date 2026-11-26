@@ -1,4 +1,4 @@
-"""TTT-Discover advantages with an additive historical SPO-RS correction."""
+"""Hybrid advantages and the shared TTT-Discover training loss."""
 
 import numpy as np
 
@@ -33,15 +33,15 @@ def reference_logprob_mean(scored_responses):
     num_tokens = 0
     for response_length, behavior, reference in scored_responses:
         if behavior is None or reference is None:
-            raise ValueError("hybrid reference KL requires saved sampler and base logprobs")
-        old = torch.as_tensor(behavior, dtype=torch.float32)
-        base = torch.as_tensor(reference, dtype=torch.float32)
+            raise ValueError("TTT reference KL requires saved sampler and base logprobs")
+        old = torch.as_tensor(behavior, dtype=torch.float32, device="cpu")
+        base = torch.as_tensor(reference, dtype=torch.float32, device="cpu")
         if old.shape != (response_length,) or base.shape != old.shape:
-            raise ValueError("hybrid reference KL logprobs must align to the response tokens")
+            raise ValueError("TTT reference KL logprobs must align to the response tokens")
         total += (old - base).sum()
         num_tokens += response_length
     if not torch.isfinite(total):
-        raise FloatingPointError("nonfinite hybrid batch reference KL")
+        raise FloatingPointError("nonfinite TTT batch reference KL")
     return float(total / num_tokens) if num_tokens else 0.0
 
 
@@ -53,7 +53,7 @@ def importance_sampling_loss(current, example, kl_coef, *, return_tensor_metrics
     current = current.float()
     old = example.get("old_policy_logprobs")
     if old is None or old.shape != current.shape:
-        raise ValueError("hybrid loss requires aligned logprobs from the rollout sampler")
+        raise ValueError("TTT loss requires aligned logprobs from the rollout sampler")
     old = old.detach().to(current)
     advantage = torch.as_tensor(example["advantage"], device=current.device, dtype=current.dtype).detach()
     with torch.no_grad():
@@ -62,7 +62,7 @@ def importance_sampling_loss(current, example, kl_coef, *, return_tensor_metrics
         if kl_coef:
             base = example.get("reference_logprobs")
             if base is None or base.shape != current.shape or example.get("reference_logprob_mean") is None:
-                raise ValueError("hybrid loss requires base logprobs and their batch center")
+                raise ValueError("TTT loss requires base logprobs and their batch center")
             delta = old - base.to(current)
             mean_delta = delta.mean()
             effective_advantage = advantage + kl_coef * (example["reference_logprob_mean"] - delta)
@@ -70,7 +70,7 @@ def importance_sampling_loss(current, example, kl_coef, *, return_tensor_metrics
     ratio = (current - old).exp()
     loss = -(ratio * effective_advantage).sum()
     if check_finite and not torch.isfinite(loss):
-        raise FloatingPointError("nonfinite hybrid importance-sampling loss")
+        raise FloatingPointError("nonfinite TTT importance-sampling loss")
     with torch.no_grad():
         metrics = {
             "policy_loss": -(ratio * advantage).sum(),

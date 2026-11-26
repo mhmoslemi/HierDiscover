@@ -14,7 +14,7 @@ from config_validation import (
     HINGE_MODE, LEGACY_CODER_CAP_KEY,
     HYBRID_INVARIANT_MODE, INVARIANT_ADVANTAGE_MODES, SPO_RS_INVARIANT_MODE,
     LLM_CRITIC_MODE, PARENT_SELECTION_MODES, RETIRED_BATCH_GROWTH_KEYS, RETIRED_TRAINER_KEYS,
-    reject_retired_coder_cap, retired_search_keys, uses_hybrid_policy_loss,
+    reject_retired_coder_cap, retired_search_keys, uses_hybrid_policy_loss, uses_ttt_policy_loss,
     validate_hybrid_weight, validate_problem_config,
 )
 from runtime.hardware_profiles import generation_cpu_ids, local_checkpoint, restore_hardware_settings
@@ -79,14 +79,14 @@ def _normalize_saved_advantage_config(saved):
 def _resolve_policy_options(merged):
     """Match coder sampling to the likelihood used by importance sampling."""
     clipped = _uses_clipped_policy_loss(merged.get("advantage_mode"))
-    hybrid_loss = uses_hybrid_policy_loss(merged.get("advantage_mode"))
+    ttt_loss = uses_ttt_policy_loss(merged.get("advantage_mode"))
     if clipped and int(merged["group_size"]) < 2:
         raise ValueError("SPO-RS requires group_size >= 2")
-    if clipped or hybrid_loss:
+    if clipped or ttt_loss:
         kl_coef = float(merged["kl_penalty_coef"])
         if not math.isfinite(kl_coef) or kl_coef < 0.0:
             raise ValueError("kl_penalty_coef must be finite and nonnegative")
-        if hybrid_loss:
+        if ttt_loss:
             merged["kl_penalty_coef"] = kl_coef
         if float(merged["temperature"]) != 1.0 or float(merged["top_p"]) != 1.0:
             print("[config] full-policy training sets temperature=1 "
@@ -672,8 +672,9 @@ def load_config():
             weight = (saved or merged).get(key, default)
             validate_hybrid_weight(key, weight, source=weight_source)
             merged[key] = float(weight)
-    if hybrid_loss:
+    if uses_ttt_policy_loss(advantage_mode):
         merged["grad_clip"] = 0.0
+    if hybrid_loss:
         if not saved and args.kl_penalty_coef is None:
             merged["kl_penalty_coef"] = 0.1
         if saved and float(merged["kl_penalty_coef"]) != float(saved["kl_penalty_coef"]):
@@ -835,10 +836,10 @@ def load_config():
             merged["backend"] == "hf"
             or (merged["backend"] == "unsloth"
                 and merged.get("coder_model_profile") == "gpt-oss-120b"))
-        if (len(training_gpu_ids) < 2 or not process_backend_supported
+        if (len(training_gpu_ids) < 1 or not process_backend_supported
                 or generation_backend != "vllm"):
             raise ValueError(
-                "Training requires vLLM generation and at least two training GPUs "
+                "Training requires vLLM generation and at least one training GPU "
                 "with an HF LoRA or GPT-OSS-120B packed-MXFP4 Unsloth replica on each GPU.")
 
     if (resume_dir is not None and not merged["no_train"]

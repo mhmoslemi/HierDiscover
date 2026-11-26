@@ -24,6 +24,10 @@ def uses_hybrid_policy_loss(mode):
     return mode in ("hybrid", HYBRID_INVARIANT_MODE, DECOMPOSE_MODE, LLM_CRITIC_MODE)
 
 
+def uses_ttt_policy_loss(mode):
+    return mode in ("entropic", HINGE_MODE) or uses_hybrid_policy_loss(mode)
+
+
 # These settings are consumed by the shared training, generation, search,
 # runtimes. Every checked-in preset carries them so a
 # selected YAML is self-contained, but that does not make problem-specific

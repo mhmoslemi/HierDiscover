@@ -10,7 +10,7 @@ from types import SimpleNamespace
 import math
 import traceback
 
-from config_validation import uses_hybrid_policy_loss
+from config_validation import uses_ttt_policy_loss
 
 STANDARD_TRAINING_MEMORY_FRACTION = 0.80
 MAX_STANDARD_TRAINING_MEMORY_FRACTION = 0.90
@@ -359,8 +359,8 @@ def local_spo_rs_update(backend, model, tokenizer, examples, cfg, logical_id,
     else:
         allocator_fraction = set_total_memory_ceiling(
             logical_id, initial_fraction)
-    hybrid = uses_hybrid_policy_loss(cfg.advantage_mode)
-    clip_options = None if hybrid else training._clipped_policy_options(cfg)
+    ttt_loss = uses_ttt_policy_loss(cfg.advantage_mode)
+    clip_options = None if ttt_loss else training._clipped_policy_options(cfg)
     parameters = trainable_parameters(model)
     packed_memory = (
         _PackedExpertBatchMemory(model, parameters, cfg.logprob_chunk)
@@ -558,8 +558,8 @@ def local_spo_rs_update(backend, model, tokenizer, examples, cfg, logical_id,
         )
         cpu_batch = [dict(example) for example in cpu_batch]
         missing_behavior = training._initialize_behavior_logprobs(cpu_batch)
-        if hybrid and missing_behavior:
-            raise ValueError("hybrid training requires the original sampler logprobs")
+        if ttt_loss and missing_behavior:
+            raise ValueError("TTT training requires the original sampler logprobs")
         for example in cpu_batch:
             example.pop("behavior_logprobs", None)
 
@@ -602,7 +602,7 @@ def local_spo_rs_update(backend, model, tokenizer, examples, cfg, logical_id,
                                 cfg, current_lp, example, clip_options,
                                 return_tensor_metrics=True, check_finite=False)
                             weight = float(example["sample_weight"])
-                            loss_weight = 1.0 if hybrid else weight
+                            loss_weight = 1.0 if ttt_loss else weight
                             weighted_losses.append(loss_weight * loss)
                             attempt_values["loss"].append(
                                 loss_weight * loss.detach())
@@ -617,9 +617,9 @@ def local_spo_rs_update(backend, model, tokenizer, examples, cfg, logical_id,
                             attempt_prefix_ratio_values.append(
                                 metrics["prefix_ratio_max"])
                         if weighted_losses:
-                            if hybrid and not torch.isfinite(
+                            if ttt_loss and not torch.isfinite(
                                     torch.stack([loss.detach() for loss in weighted_losses])).all():
-                                raise FloatingPointError("nonfinite hybrid importance-sampling loss")
+                                raise FloatingPointError("nonfinite TTT importance-sampling loss")
                             sum(weighted_losses[1:],
                                 weighted_losses[0]).backward()
 
@@ -804,17 +804,13 @@ def local_spo_rs_update(backend, model, tokenizer, examples, cfg, logical_id,
 
 
 def local_policy_update(backend, model, tokenizer, examples, cfg, logical_id,
-                        token_budget, total_examples, *,
+                        token_budget, *,
                         memory_fraction=0.80, work_queue=None,
                         activation_offload_semaphore=None):
-    """Accumulate one rank's exact entropic gradients.
-
-    Rank 0 supplies the global example count so summing LoRA gradients
-    across ranks reproduces the global mean loss.
-    """
-    from contextlib import nullcontext
+    """Accumulate token-summed TTT gradients for entropic and Hinge updates."""
     import torch
     import training.trainers as training
+    from training.hybrid import importance_sampling_loss
     from runtime.host_memory import reclaim_unused_host_memory
     from models.model_backend import fused_long_attention_is_active
 
@@ -822,10 +818,6 @@ def local_policy_update(backend, model, tokenizer, examples, cfg, logical_id,
             MAX_STANDARD_TRAINING_MEMORY_FRACTION):
         raise ValueError(
             "fast trainer memory_fraction must be in (0, 0.90]")
-    total_examples = int(total_examples)
-    if total_examples < 1:
-        raise ValueError("fast policy update requires at least one example")
-
     backend.set_training_mode()
     allocator_fraction = set_total_memory_ceiling(
         logical_id, float(memory_fraction))
@@ -840,7 +832,6 @@ def local_policy_update(backend, model, tokenizer, examples, cfg, logical_id,
     backward_batches = 0
     trained_examples = 0
     peak_memory_fraction = 0.0
-    kl_errors = []
     budget = max(1, int(token_budget or cfg.max_seq_length))
     emergency_allocator_fraction = None
     emergency_allocator_stage = 0
@@ -979,6 +970,8 @@ def local_policy_update(backend, model, tokenizer, examples, cfg, logical_id,
                 0, int(total_bytes) - int(free_bytes) - base_reserved)
             torch.cuda.reset_peak_memory_stats()
             local_batch = _move_examples(cpu_batch, logical_id)
+            if training._initialize_behavior_logprobs(local_batch):
+                raise ValueError("TTT training requires frozen rollout-policy logprobs")
 
             def attempt(active_batches):
                 attempt_losses = []
@@ -986,37 +979,8 @@ def local_policy_update(backend, model, tokenizer, examples, cfg, logical_id,
                 attempt_ratio_means = []
                 attempt_ratio_maxima = []
                 attempt_ratio_count = 0
-                attempt_kl_error = None
-
-                # Match the existing standard-policy trainer exactly. Unlike
-                # PPO's frozen-policy likelihood pass, this objective retains
-                # the model's ordinary training-mode dropout behavior.
-                with nullcontext():
+                with training._policy_dropout_disabled(model):
                     for batch in active_batches:
-                        base_logprobs = [
-                            example.get("reference_logprobs")
-                            for example in batch
-                        ]
-                        supplied_reference = all(
-                            training._valid_example_token_logprobs(
-                                example, "reference_logprobs")
-                            for example in batch)
-                        if not supplied_reference:
-                            try:
-                                with (backend.disable_adapter(),
-                                      torch.no_grad()):
-                                    base_logprobs = (
-                                        training.compute_batched_token_logprobs(
-                                            model, batch, with_grad=False,
-                                            chunk=cfg.logprob_chunk,
-                                            pad_token_id=(
-                                                tokenizer.pad_token_id)))
-                            except Exception as error:
-                                raise RuntimeError(
-                                    "exact base-policy logprob fallback "
-                                    "failed; refusing to replace the "
-                                    "configured KL penalty with the current "
-                                    "policy") from error
                         current_logprobs = (
                             training.compute_batched_token_logprobs(
                                 model, batch, with_grad=True,
@@ -1024,52 +988,18 @@ def local_policy_update(backend, model, tokenizer, examples, cfg, logical_id,
                                 pad_token_id=tokenizer.pad_token_id))
 
                         batch_losses = []
-                        for example, current_lp, base_lp in zip(
-                                batch, current_logprobs, base_logprobs):
-                            base_lp = base_lp.to(current_lp.device)
-                            advantage = example["advantage"]
-                            logp_difference = (
-                                current_lp - base_lp).detach()
-                            average_difference = logp_difference.mean()
-                            kl_advantage = cfg.kl_penalty_coef * (
-                                average_difference
-                                - (current_lp - base_lp))
-                            effective_advantage = advantage + kl_advantage
-
-                            has_behavior = (
-                                training._valid_example_token_logprobs(
-                                    example, "behavior_logprobs"))
-                            behavior_lp = (
-                                example["behavior_logprobs"].to(
-                                    current_lp.device)
-                                if has_behavior else None)
-                            if has_behavior:
-                                importance_ratio = (
-                                    training.
-                                    _detached_behavior_importance_ratio(
-                                        current_lp, behavior_lp))
-                                loss = -(
-                                    importance_ratio
-                                    * effective_advantage.detach()
-                                    * current_lp).mean()
-                            else:
-                                importance_ratio = 1.0
-                                loss = -(
-                                    effective_advantage.detach()
-                                    * current_lp).mean()
-                            if has_behavior:
-                                attempt_ratio_means.append(
-                                    importance_ratio.mean().detach())
-                                attempt_ratio_maxima.append(
-                                    importance_ratio.max().detach())
-                                attempt_ratio_count += 1
-                            if not torch.isfinite(loss).all():
-                                raise FloatingPointError(
-                                    "nonfinite policy loss")
-                            batch_losses.append(loss / total_examples)
+                        for example, current_lp in zip(batch, current_logprobs):
+                            loss, metrics = importance_sampling_loss(
+                                current_lp, example, cfg.kl_penalty_coef,
+                                return_tensor_metrics=True)
+                            attempt_ratio_means.append(metrics["ratio"])
+                            attempt_ratio_maxima.append(
+                                (current_lp.detach().float()
+                                 - example["old_policy_logprobs"]).exp().max())
+                            attempt_ratio_count += 1
+                            batch_losses.append(loss)
                             attempt_losses.append(loss.detach())
-                            attempt_logp_deltas.append(
-                                logp_difference.mean().detach())
+                            attempt_logp_deltas.append(metrics["kl_estimate"])
                         if batch_losses:
                             sum(batch_losses[1:],
                                 batch_losses[0]).backward()
@@ -1090,7 +1020,6 @@ def local_policy_update(backend, model, tokenizer, examples, cfg, logical_id,
                 return (
                     packed[0], packed[1], packed[2], packed[3],
                     attempt_ratio_count,
-                    attempt_kl_error,
                 )
 
             result, effective_batches, quarantined = (
@@ -1128,8 +1057,6 @@ def local_policy_update(backend, model, tokenizer, examples, cfg, logical_id,
                 ratio_sum += result[2]
                 ratio_max = max(ratio_max, result[3])
                 ratio_count += result[4]
-                if result[5] is not None:
-                    kl_errors.append(result[5])
 
             model.zero_grad(set_to_none=True)
             quarantined_examples += len(quarantined)
@@ -1198,7 +1125,6 @@ def local_policy_update(backend, model, tokenizer, examples, cfg, logical_id,
         "long_rollout_memory_rescue": (
             emergency_allocator_fraction is not None),
         "token_budget": budget,
-        "kl_errors": kl_errors,
     }
 
 
@@ -1347,7 +1273,6 @@ def worker_main(rank, world_size, cfg_dict, init_method, work_queue,
                 stats = local_policy_update(
                     backend, model, tokenizer, (), step_cfg,
                     int(rank), command["token_budget"],
-                    command["total_examples"],
                     memory_fraction=command.get("memory_fraction", 0.80),
                     work_queue=work_queue,
                     activation_offload_semaphore=(
@@ -1374,19 +1299,8 @@ def worker_main(rank, world_size, cfg_dict, init_method, work_queue,
                 model.zero_grad(set_to_none=True)
                 result_queue.put({"event": "updated", "rank": int(rank)})
             elif kind == "finish_update":
-                gradient_scale = float(command.get("gradient_scale", 1.0))
                 apply_update = bool(command.get("apply_update", True))
-                if not math.isfinite(gradient_scale) or gradient_scale <= 0.0:
-                    raise ValueError(
-                        "finish_update gradient_scale must be finite and "
-                        "positive")
                 if apply_update:
-                    if gradient_scale != 1.0:
-                        with torch.no_grad():
-                            for parameter in model.parameters():
-                                if (parameter.requires_grad
-                                        and parameter.grad is not None):
-                                    parameter.grad.mul_(gradient_scale)
                     reduce_trainable_gradients(model, destination_rank=0)
                     broadcast_trainable_parameters(model, source_rank=0)
                 model.zero_grad(set_to_none=True)
