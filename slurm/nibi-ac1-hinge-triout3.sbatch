@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=ac1-hinge-triout3
 #SBATCH --account=def-boyuwang
-#SBATCH --time=2-00:00:00
+#SBATCH --time=0-01:00:00
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=50
