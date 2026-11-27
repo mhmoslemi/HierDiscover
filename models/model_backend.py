@@ -854,16 +854,19 @@ class UnslothBackend(_ModelPlacementBackend):
         hardware_profile = getattr(self.cfg, "hardware_profile", "RTX6000")
         max_memory = _training_max_memory(self.cfg)
         load_options = {"max_memory": max_memory} if max_memory else {}
+        load_name = training_name
+        if hardware_profile == "H100" and training_name == os.environ.get("TTT_NIBI_MODEL_SOURCE"):
+            load_name = os.environ["TTT_NIBI_TRAINER_MODEL"]
         if (packed_mxfp4 and hardware_profile in HOPPER_GPU_MEMORY_GIB
                 and not getattr(self.cfg, "no_train", False)):
             # Each training replica needs all parameters on its assigned GPU.
             load_options["offload_embedding"] = False
         log_loading = setting_log_only if getattr(self.cfg, "_startup_step", 0) > 0 else print
-        log_loading(f"[backend=unsloth] loading {training_name} across "
+        log_loading(f"[backend=unsloth] loading {load_name} across "
                     f"{int(getattr(self.cfg, 'num_training_gpus', 1))} GPU(s) ...")
         local_files_only = _local_model_files_only(training_name)
         model, tokenizer = retry_host_allocation(lambda: FastLanguageModel.from_pretrained(
-            model_name=training_name,
+            model_name=load_name,
             max_seq_length=self.cfg.max_seq_length,
             load_in_4bit=use_4bit,
             dtype=torch.bfloat16,
@@ -910,6 +913,8 @@ class UnslothBackend(_ModelPlacementBackend):
             random_state=self.cfg.seed,
             **adapter_options,
         )
+        if load_name != training_name:
+            model.peft_config[model.active_adapter].base_model_name_or_path = training_name
         if shared_lora:
             install_shared_expert_lora(
                 model, _lora_rank(self.cfg), self.cfg.lora_alpha, self.cfg.lora_dropout)

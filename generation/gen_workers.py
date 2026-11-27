@@ -1183,6 +1183,17 @@ def _vllm_worker_loop(rank, gpu_id, model_name, max_seq_length, load_in_4bit,
     # stdout/stderr and therefore append to the same run-local file.
     _worker_log_handle = _redirect_vllm_output(
         vllm_log_path, rank, gpu_group)
+    if hardware_profile == "H100" and (cache_root := os.environ.get("TTT_NIBI_VLLM_CACHE")):
+        for variable, directory in (
+            ("VLLM_CACHE_ROOT", "vllm"),
+            ("TORCHINDUCTOR_CACHE_DIR", "inductor"),
+            ("TRITON_CACHE_DIR", "triton"),
+            ("FLASHINFER_WORKSPACE_BASE", "flashinfer"),
+            ("CUDA_CACHE_PATH", "cuda"),
+        ):
+            path = os.path.join(cache_root, directory)
+            os.makedirs(path, exist_ok=True)
+            os.environ[variable] = path
     # Must happen before importing vLLM (and therefore torch). Spawned engine
     # core children inherit this worker-specific environment.
     if enable_sleep_mode:
@@ -1225,6 +1236,12 @@ def _vllm_worker_loop(rank, gpu_id, model_name, max_seq_length, load_in_4bit,
 
         engine_seed = (worker_seed(seed, 0, rank) if seed is not None
                        else int.from_bytes(os.urandom(4), "little") % (2 ** 31 - 1))
+        collectives = "NCCL" if disable_custom_all_reduce else "auto"
+        if (hardware_profile == "H100" and tensor_parallel_size > 1
+                and os.environ.get("TTT_VLLM_DISABLE_CUSTOM_ALL_REDUCE") == "1"):
+            # Nibi's TP ranks fail in cudaIpcGetMemHandle for captured graph buffers.
+            disable_custom_all_reduce = True
+            collectives = "auto (custom all-reduce disabled)"
         engine_kwargs = _vllm_engine_kwargs(
             model_name=model_name,
             max_seq_length=max_seq_length,
@@ -1252,8 +1269,7 @@ def _vllm_worker_loop(rank, gpu_id, model_name, max_seq_length, load_in_4bit,
         )
         print(f"[vllm worker {rank}] loading {model_name} on physical GPU "
               f"group {gpu_group} (TP={tensor_parallel_size}, "
-              f"PP={pipeline_parallel_size}, collectives="
-              f"{'NCCL' if disable_custom_all_reduce else 'auto'}) ...",
+              f"PP={pipeline_parallel_size}, collectives={collectives}) ...",
               flush=True)
         if async_engine:
             async_loop = asyncio.new_event_loop()
@@ -3275,8 +3291,9 @@ class PhasedVLLMGenerationPool:
             self._after_stop()
             raise
 
-    def _pool_for_adapter(self, adapter_path):
-        base_policy = False
+    def _pool_for_adapter(self, adapter_path, *, base_policy=False):
+        if base_policy and (adapter_path is not None or not self._shared_gpt_oss):
+            raise ValueError("Base-only rollout requires shared GPT-OSS and no adapter")
         if self._shared_gpt_oss and adapter_path is not None:
             from models.gpt_oss_lora import is_base_policy_snapshot
 
@@ -3287,8 +3304,9 @@ class PhasedVLLMGenerationPool:
                                     require_lora=adapter_path is not None)
         return pool, adapter_path
 
-    def iter_group_jobs(self, prompts_by_group, group_size, adapter_path, *args, **kwargs):
-        pool, adapter_path = self._pool_for_adapter(adapter_path)
+    def iter_group_jobs(self, prompts_by_group, group_size, adapter_path, *args,
+                        base_policy_only=False, **kwargs):
+        pool, adapter_path = self._pool_for_adapter(adapter_path, base_policy=base_policy_only)
         yield from pool.iter_group_jobs(prompts_by_group, group_size, adapter_path, *args, **kwargs)
 
     def generate_groups(self, prompts_by_group, group_size, adapter_path, *args, **kwargs):

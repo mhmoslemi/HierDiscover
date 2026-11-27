@@ -23,6 +23,4 @@ export PYTHONUNBUFFERED=1
 export CUDA_DEVICE_ORDER=PCI_BUS_ID
 export AVAILABLE_GPUS="${CUDA_VISIBLE_DEVICES:?Slurm did not assign GPUs}"
 
-model_path=/home/mmoslem3/scratch/models/gpt-oss-120b
-exec sh ./run.sh --hardware-profile H100 --advantage-mode hinge \
-    --coder-model-name "$model_path" "$@"
+exec bash ./slurm/nibi-ac1-start.sh hinge "$@"

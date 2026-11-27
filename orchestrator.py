@@ -2241,7 +2241,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                parallel_trainer=None,
                spo_rs_tracker=None, sampling_adapter_path=None,
                evaluation_complete=None, pending_artifacts=None, park_trainer=None, *,
-               hinge_frontier=None):
+               hinge_frontier=None, sample_base_policy=False):
     import os
     import torch
     from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
@@ -2281,7 +2281,10 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
             adapter_path = str(Path(sampling_adapter_path))
             if not Path(adapter_path).is_dir():
                 raise FileNotFoundError(f"sampling adapter not found: {adapter_path}")
-    elif gen_pool is not None:
+    elif (sampling_adapter_path is not None and getattr(cfg, "hardware_profile", None) == "H100"
+          and os.environ.get("TTT_NIBI_VLLM_CACHE")):
+        adapter_path = str(sampling_adapter_path)
+    elif gen_pool is not None and not sample_base_policy:
         adapter_path = _save_adapter(model, exp_dir, step_idx)
 
     is_trimul = getattr(problem, "problem_type", "") == "trimul"
@@ -2577,6 +2580,8 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                 }
                 if cfg.generation_backend == "vllm":
                     generation_options["return_logprobs"] = training_enabled
+                if sample_base_policy:
+                    generation_options["base_policy_only"] = True
                 for job_idx, job_results in gen_pool.iter_group_jobs(**generation_options):
                     for result in job_results:
                         text, token_ids = result[:2]
@@ -4426,6 +4431,12 @@ def _main(trainer_startup):
     restart_for_exact_recovery = False
     evaluation_handoff = None
     active_step = None
+    nibi_ttt_rollouts = (
+        cfg.hardware_profile == "H100" and bool(os.environ.get("TTT_NIBI_VLLM_CACHE"))
+        and cfg.problem == "ac1" and cfg.generation_backend == "vllm"
+        and configured_advantage_mode in ("entropic", HINGE_MODE)
+        and getattr(gen_pool, "_shared_gpt_oss", False)
+    )
     try:
         if start_step >= cfg.num_steps:
             print(f"[resume] run already reached requested num_steps={cfg.num_steps}")
@@ -4476,6 +4487,9 @@ def _main(trainer_startup):
                     completed_spo_rs_artifacts,
                     evaluation_complete=step_plotter.submit)
             else:
+                # A newly initialized GPT-OSS LoRA has zero output. Resumed
+                # and updated policies must use their actual saved adapter.
+                sample_base_policy = nibi_ttt_rollouts and not resume_dir and step == 0
                 stats = train_step(
                     backend, model, tokenizer, sampler, optimizer, step,
                     step_cfg, exp_dir, problem, gen_pool,
@@ -4483,7 +4497,9 @@ def _main(trainer_startup):
                     spo_rs_tracker=spo_rs_tracker,
                     sampling_adapter_path=(
                         current_policy_adapter_path
-                        if replayable_update else None),
+                        if replayable_update or (nibi_ttt_rollouts and not sample_base_policy)
+                        else None),
+                    sample_base_policy=sample_base_policy,
                     evaluation_complete=step_plotter.submit,
                     pending_artifacts=pending_spo_rs_artifacts,
                     park_trainer=_offload_trainer_for_generation if critic_mode else None,
