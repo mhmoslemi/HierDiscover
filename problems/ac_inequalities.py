@@ -134,7 +134,10 @@ class ACInequalities(Problem):
         )
         if parent.construction is not None and len(parent.construction):
             state_ctx += ac_common.CONSTRUCTION_LENGTH.format(size=len(parent.construction))
-        return [{"role": "user", "content": task.TASK_PROMPT.format(
+        template = task.TASK_PROMPT
+        if self.problem_type == "ac1" and self.cfg.get("eval_cpus") == 1:
+            template = template.replace("You can use up to 2 CPUs.", "You can use up to 1 CPU.")
+        return [{"role": "user", "content": template.format(
             evaluator=task.EVALUATOR, literature=task.LITERATURE, state_ctx=state_ctx,
         )}]
 

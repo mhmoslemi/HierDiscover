@@ -1976,7 +1976,8 @@ def _evaluation_pool(cfg, problem, rollout_count, step_idx, gen_pool,
     if isolated_eval:
         allocations = (_isolated_ac1_cpu_pairs(cfg) if paired
                        else _isolated_evaluation_cpu_ids(cfg))
-        isolated_cpu_count = len(allocations) * (2 if paired else 1)
+        cpus_per_slot = len(allocations[0]) if paired else 1
+        isolated_cpu_count = len(allocations) * cpus_per_slot
         isolated_processes_per_cpu = 1 if paired else int(cfg.reward_workers)
         isolated_cpu_slots = Queue()
         # Give each CPU a slot before allowing any to host a second sandbox.
@@ -1987,7 +1988,8 @@ def _evaluation_pool(cfg, problem, rollout_count, step_idx, gen_pool,
         n_reward_workers = max(1, min(rollout_count, isolated_capacity))
         isolated_memory_limit_bytes = (_automatic_sandbox_memory_limit_bytes(n_reward_workers))
         if paired or not recovering:
-            placement = ("one sandbox per exclusive CPU pair; " if paired else
+            unit = "CPU" if cpus_per_slot == 1 else "CPU pair"
+            placement = (f"one sandbox per exclusive {unit}; " if paired else
                          f"up to {isolated_processes_per_cpu}/CPU from reward_workers; each "
                          "process tree is pinned to one CPU and ")
             capture = ("stdout streamed for prompt feedback, stderr capture is bounded"
@@ -3732,7 +3734,8 @@ def _main(trainer_startup):
                        else cfg.evaluation_gpu_id)
     print(f"Evaluation GPU:     {evaluation_gpus if evaluation_gpus is not None else 'none'}")
     if cfg.isolate_eval and cfg.problem == "ac1":
-        evaluation_mode = "isolated, one sandbox per exclusive CPU pair"
+        unit = "CPU" if cfg.eval_cpus == 1 else "CPU pair"
+        evaluation_mode = f"isolated, one sandbox per exclusive {unit}"
     elif cfg.isolate_eval:
         evaluation_mode = f"isolated, {cfg.reward_workers} processes per logical CPU"
     else:

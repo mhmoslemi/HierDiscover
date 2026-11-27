@@ -195,7 +195,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--isolate-eval", action="store_const", const=True, default=None,
         help="Enable CPU isolation (on by default in the AC1, AC2, and Erdős presets). "
-             "AC1 uses one sandbox per exclusive CPU pair. Other isolated tasks "
+             "AC1 uses one sandbox per exclusive CPU pair, or per core with eval_cpus: 1. Other isolated tasks "
              "use one logical CPU per sandbox, with reward_workers setting "
              "the concurrency per CPU.")
     p.add_argument("--generation-backend", choices=["hf", "vllm"], default=None,
@@ -747,7 +747,8 @@ def load_config():
                 "its dedicated serialized GPU benchmark evaluator")
     if merged["isolate_eval"]:
         if merged["problem"] == "ac1":
-            merged["eval_cpus"] = 2
+            if merged.get("eval_cpus") != 1:
+                merged["eval_cpus"] = 2
             merged["reward_workers"] = 1
         if int(merged.get('reward_workers', 0) or 0) < 1:
             raise ValueError(
@@ -1008,6 +1009,7 @@ def _isolated_evaluation_cpu_ids(cfg=None):
 
 
 def _isolated_ac1_cpu_pairs(cfg):
+    """Return exclusive CPU pairs, or single-core tuples when eval_cpus is 1."""
     cpu_ids = _isolated_evaluation_cpu_ids(cfg)
     cores = {}
     for cpu in cpu_ids:
@@ -1020,6 +1022,10 @@ def _isolated_ac1_cpu_pairs(cfg):
     else:
         # Use one logical CPU per physical core to avoid sharing SMT siblings.
         cpu_ids = list(cores.values())
+    if getattr(cfg, "eval_cpus", 2) == 1:
+        if not cpu_ids:
+            raise RuntimeError("isolated AC1 evaluation requires one available CPU core")
+        return [(cpu,) for cpu in cpu_ids]
     pairs = list(zip(cpu_ids[::2], cpu_ids[1::2]))
     if not pairs:
         raise RuntimeError("isolated AC1 evaluation requires two available CPU cores")
