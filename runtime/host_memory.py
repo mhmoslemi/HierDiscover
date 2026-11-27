@@ -20,6 +20,8 @@ import threading
 import time
 from contextlib import contextmanager
 
+from runtime.hardware_profiles import HOPPER_GPU_MEMORY_GIB, uses_throughput_profile
+
 
 GIB = 1024 ** 3
 RAM_RETRY_INTERVAL_S = 60.0
@@ -231,7 +233,8 @@ class HostMemoryAdmission:
         minimum_bytes = size_bytes if minimum_bytes is None else int(minimum_bytes)
         if not 0 <= minimum_bytes <= size_bytes:
             raise ValueError("minimum reservation must be between zero and the requested bytes")
-        bounded_wait = self.hardware_profile == "B200_full_ram"
+        hopper = self.hardware_profile in HOPPER_GPU_MEMORY_GIB
+        bounded_wait = uses_throughput_profile(self.hardware_profile)
         if bounded_wait and deadline is None:
             deadline = time.monotonic() + RAM_WAIT_TIMEOUT_S
         next_report = 0.0
@@ -252,6 +255,10 @@ class HostMemoryAdmission:
                                  if info else None)
                     if not bounded_wait and size_bytes > int(info["total"]) - reserve:
                         raise HostMemoryUnavailable("host-memory request exceeds node capacity")
+                    if hopper and info is not None and minimum_bytes > int(info["total"]) - reserve:
+                        raise HostMemoryUnavailable(
+                            f"{stage}: needs {minimum_bytes / GIB:.1f} GiB after reserve, "
+                            f"above the job's {int(info['total']) / GIB:.1f} GiB RAM limit")
                     # Let active evaluations finish, but do not let new ones
                     # repeatedly spend the space needed by a model handoff.
                     has_priority = priority or not self._priority_waiters.value
@@ -260,6 +267,8 @@ class HostMemoryAdmission:
                         break
                     if not blocking:
                         raise HostMemoryUnavailable(f"{stage}: host RAM is not available now")
+                    if hopper and not wait_for_external and not self._reserved.value:
+                        raise HostMemoryUnavailable(f"{stage}: insufficient available host RAM")
                     waited = True
                     if bounded_wait:
                         now = time.monotonic()
@@ -299,7 +308,7 @@ class HostMemoryAdmission:
 def retry_host_allocation(allocation, *, hardware_profile="RTX6000", stage,
                           required_bytes=0):
     """Retry CPU allocation failures only; never replay a training update."""
-    if hardware_profile != "B200_full_ram":
+    if not uses_throughput_profile(hardware_profile):
         return allocation()
     from contextlib import nullcontext
     import multiprocessing

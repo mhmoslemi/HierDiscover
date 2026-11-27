@@ -55,6 +55,7 @@ from runtime.configuration import (
     _uses_clipped_policy_loss, _uses_replayable_policy_update, _uses_reward_history,
     _validate_known_training_capacity as _validate_known_training_capacity, load_config,
 )
+from runtime.hardware_profiles import HOPPER_GPU_MEMORY_GIB, uses_throughput_profile
 from training.exact_overflow import (
     ExactLongContextTrainingOOM, _clear_exact_sharded_recovery,
     _load_exact_spo_rs_overflow, _read_exact_sharded_recovery, _restart_for_exact_resume,
@@ -4151,9 +4152,12 @@ def _main(trainer_startup):
         )
         if getattr(model, "_ttt_gpt_oss_shared_lora", False):
             from generation.gen_workers import gpt_oss_coder_engine_options
+            capture_rollouts = cfg.groups_per_step * cfg.group_size
+            if cfg.hardware_profile in HOPPER_GPU_MEMORY_GIB and cfg.gen_micro_batch > 0:
+                capture_rollouts = min(capture_rollouts, cfg.gen_micro_batch)
             pool_options["vllm_engine_options"] = gpt_oss_coder_engine_options(
-                cfg.groups_per_step * cfg.group_size,
-                use_cuda_graphs=cfg.hardware_profile == "B200_full_ram",
+                capture_rollouts,
+                use_cuda_graphs=uses_throughput_profile(cfg.hardware_profile),
             )
         if cfg.generation_backend == "vllm":
             from runtime.host_memory import HostMemoryAdmission
@@ -4218,7 +4222,7 @@ def _main(trainer_startup):
                 # the trainer can park safely. The coder reloads on next use.
                 reserve_bytes = None
                 if memory is not None:
-                    if frozen_to_disk or cfg.hardware_profile == "B200_full_ram":
+                    if frozen_to_disk or uses_throughput_profile(cfg.hardware_profile):
                         from runtime.host_memory import host_memory_reserve_bytes
                         reserve_bytes = host_memory_reserve_bytes(memory, cfg.hardware_profile)
                     else:

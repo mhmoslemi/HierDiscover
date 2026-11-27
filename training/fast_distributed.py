@@ -11,6 +11,7 @@ import math
 import traceback
 
 from config_validation import uses_ttt_policy_loss
+from runtime.hardware_profiles import uses_throughput_profile
 
 STANDARD_TRAINING_MEMORY_FRACTION = 0.80
 MAX_STANDARD_TRAINING_MEMORY_FRACTION = 0.90
@@ -257,7 +258,7 @@ def _move_examples(examples, logical_id):
 
 def historical_training_memory_fraction(model, cfg, configured_fraction):
     if (getattr(model, "_ttt_gpt_oss_shared_lora", False)
-            and getattr(cfg, "hardware_profile", None) == "B200_full_ram"):
+            and uses_throughput_profile(getattr(cfg, "hardware_profile", None))):
         return LONG_ROLLOUT_MEMORY_FRACTION
     return float(configured_fraction)
 

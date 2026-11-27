@@ -17,6 +17,7 @@ from runtime.configuration import (
     SPO_RS_CLIP_EPSILON_LOW_DEFAULT,
     _parse_gpu_ids, _uses_replayable_policy_update, _uses_reward_history,
 )
+from runtime.hardware_profiles import uses_throughput_profile
 from training.exact_overflow import (
     ExactLongContextTrainingOOM, _clip_sharded_grad_norm_,
     _commit_exact_spo_rs_overflow_batch, _load_exact_spo_rs_overflow,
@@ -1322,7 +1323,7 @@ class ProcessDistributedTrainer:
 
         try:
             with ExitStack() as reservations:
-                if self.host_memory_admission.hardware_profile == "B200_full_ram":
+                if uses_throughput_profile(self.host_memory_admission.hardware_profile):
                     model_gib = _estimated_weight_gib(self.cfg.coder_model_name, "auto")
                     # Include the loader's per-replica staging allowance and
                     # rank zero's saved state, which can be restored in parallel.

@@ -40,6 +40,7 @@ from problems.base import (
 from prompts.task import mla_decode_nvidia, trimul
 from prompts.utils import render_state_context
 from runtime.gpu_lease import GPUNotIdle, gpu_lease, wait_for_idle_gpu
+from runtime.hardware_profiles import HOPPER_GPU_MEMORY_GIB
 
 # Runtime scaling relative to H100, from memory bandwidth, because trimul and
 # mla_decode are both bandwidth-bound. ESTIMATES: they set the reward scale, not
@@ -560,7 +561,10 @@ class GpuMode(Problem):
             self.metric_name, task.TARGET, parent, maximize=self.maximize,
         )
         if task is trimul:
-            user = task.TASK_PROMPT.format(description=task.DESCRIPTION, state_ctx=state_ctx)
+            gpu_type = (self.gpu_type if self.cfg.get("hardware_profile") in HOPPER_GPU_MEMORY_GIB
+                        else "H100")
+            user = task.TASK_PROMPT.format(
+                description=task.DESCRIPTION, state_ctx=state_ctx, gpu_type=gpu_type)
         else:
             user = task.TASK_PROMPT.format(
                 description=task.DESCRIPTION, state_ctx=state_ctx, rules=task.RULES,

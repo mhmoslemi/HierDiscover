@@ -6,6 +6,11 @@ from pathlib import Path
 
 
 B200_MODEL_DIR = Path("/root/nas/Mohammad/models")
+HOPPER_GPU_MEMORY_GIB = {"H100": 80.0, "H200": 140.0}
+
+
+def uses_throughput_profile(profile):
+    return profile == "B200_full_ram" or profile in HOPPER_GPU_MEMORY_GIB
 
 
 def local_checkpoint(model_name, profile):
@@ -21,14 +26,14 @@ def hardware_profile(value):
     name = str(value).strip().upper()
     if name == "B200_FULL_RAM":
         return "B200_full_ram"
-    if name != "RTX6000":
-        raise ValueError("hardware_profile must be RTX6000 or B200_full_ram")
+    if name != "RTX6000" and name not in HOPPER_GPU_MEMORY_GIB:
+        raise ValueError("hardware_profile must be RTX6000, B200_full_ram, H100, or H200")
     return name
 
 
 def generation_cpu_ids(profile, gpu_count):
     """Keep evaluation off inference cores, including their SMT siblings."""
-    if profile != "B200_full_ram" or not hasattr(os, "sched_getaffinity"):
+    if not uses_throughput_profile(profile) or not hasattr(os, "sched_getaffinity"):
         return []
     cores = {}
     for cpu in sorted(os.sched_getaffinity(0)):
@@ -52,15 +57,17 @@ def generation_cpu_ids(profile, gpu_count):
     return sorted(cpu for threads in ordered[:reserve] for cpu in threads)
 
 
-def restore_hardware_settings(merged, current_yaml, saved):
+def restore_hardware_settings(merged, current_yaml, saved, *, profile_override=None):
     """Do not reuse an old machine's resolved auto capacities on resume."""
-    selected = hardware_profile(current_yaml.get("hardware_profile", "RTX6000"))
+    selected = hardware_profile(
+        current_yaml.get("hardware_profile", "RTX6000")
+        if profile_override is None else profile_override)
     previous = hardware_profile(saved.get("hardware_profile", "RTX6000"))
     merged["hardware_profile"] = selected
     if selected == "B200_full_ram" and previous != selected:
         # Use the current launch's coder residency setting when changing hardware.
         merged["reload_coder_between_phases"] = current_yaml.get("reload_coder_between_phases", False)
-    if saved and previous != selected:
+    if (saved and previous != selected) or selected in HOPPER_GPU_MEMORY_GIB:
         for key, default in {
             "gen_micro_batch": "auto", "vllm_gpu_memory_utilization": "auto",
             "vllm_max_num_batched_tokens": "auto", "logprob_chunk": "auto",

@@ -73,6 +73,7 @@ from runtime.gpu_runtime import (
     uses_bounded_gpt_oss_repack,
     vllm_runtime_reserve_gib as _default_vllm_runtime_reserve_gib,
 )
+from runtime.hardware_profiles import HOPPER_GPU_MEMORY_GIB, uses_throughput_profile
 import diagnostics.terminal_output as _terminal_output
 
 
@@ -919,6 +920,15 @@ def _vllm_engine_kwargs(model_name, max_seq_length, load_in_4bit,
             # startup; bundled FlashAttention (FA4 on SM100) works offline.
             attention = dict(kwargs.get("attention_config") or {})
             attention.setdefault("backend", "FLASH_ATTN")
+            kwargs["attention_config"] = attention
+    elif hardware_profile in HOPPER_GPU_MEMORY_GIB:
+        basename = str(model_name).rstrip("/").rsplit("/", 1)[-1].lower()
+        if basename == "gpt-oss-120b":
+            # Hopper's bundled FA3 supports GPT-OSS's learned attention sinks.
+            attention = dict(kwargs.get("attention_config") or {})
+            attention.setdefault("backend", "FLASH_ATTN")
+            if attention["backend"] == "FLASH_ATTN":
+                attention.setdefault("flash_attn_version", 3)
             kwargs["attention_config"] = attention
     return kwargs
 
@@ -2045,6 +2055,7 @@ class GenerationPool:
         self.procs = [None for _ in range(self.num_workers)]
         self._worker_target = (_vllm_worker_loop
                                if self.backend == "vllm" else _hf_worker_loop)
+        throughput = self.backend == "vllm" and uses_throughput_profile(hardware_profile)
         self._worker_options = {
             "lora_rank": int(lora_rank),
             "gpu_memory_utilization": float(
@@ -2056,14 +2067,8 @@ class GenerationPool:
             "tensor_parallel_size": tp,
             "pipeline_parallel_size": pp,
             "max_num_batched_tokens": effective_max_batched_tokens,
-            "performance_mode": (
-                "throughput"
-                if self.backend == "vllm"
-                and hardware_profile == "B200_full_ram"
-                else None),
-            "use_v2_model_runner": bool(
-                self.backend == "vllm"
-                and hardware_profile == "B200_full_ram"),
+            "performance_mode": "throughput" if throughput else None,
+            "use_v2_model_runner": throughput,
             "enable_expert_parallel": bool(vllm_enable_expert_parallel),
             "engine_options": vllm_engine_options,
             # Separate TP engines remap different physical GPU pairs to the
@@ -2081,7 +2086,7 @@ class GenerationPool:
         }
         if self.backend == "vllm":
             self._worker_options["hardware_profile"] = hardware_profile
-        if self.backend == "vllm" and hardware_profile == "B200_full_ram":
+        if throughput:
             # Evaluation avoids reserved cores; inference can use the full allowed cpuset.
             self._worker_options["enable_log_stats"] = True
         self._load_in_4bit = bool(load_in_4bit)
@@ -2640,9 +2645,9 @@ class GenerationPool:
             options.update(top_k=0, repetition_penalty=1.0)
         capacity = self.gen_micro_batch or max(
             1, (total_expected + self.num_workers - 1) // self.num_workers)
-        # Keep replacements waiting inside vLLM on B200 without preallocating KV.
+        # Keep replacements waiting inside vLLM without preallocating KV.
         queue_capacity = capacity + (
-            8 if getattr(self, "hardware_profile", "RTX6000") == "B200_full_ram"
+            8 if uses_throughput_profile(getattr(self, "hardware_profile", "RTX6000"))
             else 0)
         collected = 0
         try:
@@ -3144,7 +3149,7 @@ class PhasedVLLMGenerationPool:
             pp = int(self._pool_kwargs.get("vllm_pipeline_parallel_size") or 1)
             engines = cards // (tp * pp) if tp > 0 else 1
             if (self._shared_gpt_oss and engines > 1
-                    and self._pool_kwargs.get("hardware_profile") == "B200_full_ram"
+                    and uses_throughput_profile(self._pool_kwargs.get("hardware_profile"))
                     and self._pool_kwargs.get("vllm_staged_loading")):
                 # Reserve a complete model's host footprint for each parallel
                 # load in addition to the small per-rank staging estimate.

@@ -16,6 +16,8 @@ import re
 import subprocess
 from typing import Dict, Iterable, List, Optional
 
+from runtime.hardware_profiles import HOPPER_GPU_MEMORY_GIB
+
 
 GPU_PROBLEM_NAMES = {
     "gpu_mode", "kernel", "kernel_engineering", "trimul",
@@ -259,6 +261,11 @@ def _effective_max_length(cfg: dict) -> int:
     return max(1, int(cfg.get("max_seq_length", 4096)))
 
 
+def _fallback_total_gib(cfg: dict) -> float:
+    profile = cfg.get("hardware_profile")
+    return HOPPER_GPU_MEMORY_GIB.get(profile, 178.0 if profile == "B200_full_ram" else 80.0)
+
+
 def _resolved_vllm_utilization(raw_value, total_gib: float,
                                free_gib: float) -> float:
     if _auto(raw_value):
@@ -338,7 +345,7 @@ def resolve_memory_settings(cfg: dict, roles: GPURoles,
     using_vllm = str(cfg.get("generation_backend", "hf")).lower() == "vllm"
     selected = [memory[g] for g in roles.generation if g in memory]
     min_total = min((item.total_gib for item in selected),
-                    default=178.0 if cfg.get("hardware_profile") == "B200_full_ram" else 80.0)
+                    default=_fallback_total_gib(cfg))
     min_free = min((item.free_gib for item in selected), default=min_total)
 
     raw_util = cfg.get("vllm_gpu_memory_utilization", "auto")
@@ -390,10 +397,12 @@ def resolve_memory_settings(cfg: dict, roles: GPURoles,
             "max_seq_length, choose generation_backend=hf, or provide a "
             "larger compatible TP*PP group.")
 
-    b200 = using_vllm and cfg.get("hardware_profile") == "B200_full_ram"
-    if _auto(cfg.get("gen_micro_batch", "auto")) and b200:
-        # Zero means do not pass max_num_seqs. vLLM 0.30 then selects its
-        # hardware-aware B200 throughput ceiling and admits against profiled KV.
+    profile = cfg.get("hardware_profile")
+    b200 = using_vllm and profile == "B200_full_ram"
+    delegate_batching = b200 or (using_vllm and profile == "H200")
+    if _auto(cfg.get("gen_micro_batch", "auto")) and delegate_batching:
+        # Zero lets vLLM choose its throughput ceiling for the detected GPU
+        # and admit requests against the profiled KV cache.
         cfg["gen_micro_batch"] = 0
         notes.append("generation max sequences=vLLM automatic throughput")
     elif _auto(cfg.get("gen_micro_batch", "auto")):
@@ -437,16 +446,19 @@ def resolve_memory_settings(cfg: dict, roles: GPURoles,
         if cfg["gen_micro_batch"] < 0:
             raise ValueError("gen_micro_batch must be auto or >= 0")
 
-    if _auto(cfg.get("vllm_max_num_batched_tokens", "auto")) and b200:
+    if _auto(cfg.get("vllm_max_num_batched_tokens", "auto")) and delegate_batching:
         # Zero omits the constructor argument. Throughput mode lets vLLM pick
-        # chunked-prefill and token scheduling limits for the detected B200.
+        # chunked-prefill and token scheduling limits for the detected GPU.
         cfg["vllm_max_num_batched_tokens"] = 0
         notes.append("vLLM batched tokens=vLLM automatic throughput")
     elif _auto(cfg.get("vllm_max_num_batched_tokens", "auto")):
         # Chunked prefill keeps a long prompt from monopolizing a giant
         # temporary batch.  This is scheduling work per iteration, not the KV
         # capacity or maximum request length.
-        batched = min(max_len, 8192 if min_total >= 60 else 4096)
+        # H100 needs room for the temporary vocabulary projection in exact
+        # scoring. The prefill chunk is independent of the request length.
+        large_prefill = min_total >= 60 and not (using_vllm and profile == "H100")
+        batched = min(max_len, 8192 if large_prefill else 4096)
         cfg["vllm_max_num_batched_tokens"] = max(2048, batched)
         if using_vllm:
             notes.append("vLLM max batched tokens="
@@ -467,13 +479,18 @@ def resolve_memory_settings(cfg: dict, roles: GPURoles,
 
 
 def validate_selected_gpus(roles: GPURoles,
-                           memory: Dict[int, GPUMemory]) -> None:
+                           memory: Dict[int, GPUMemory], *, hardware_profile=None) -> None:
     if not memory:
         return
     missing = [gpu_id for gpu_id in roles.available if gpu_id not in memory]
     if missing:
         raise ValueError(
             f"AVAILABLE_GPUS contains device(s) not reported by nvidia-smi: {missing}")
+    if hardware_profile in HOPPER_GPU_MEMORY_GIB:
+        for gpu_id in roles.available:
+            if hardware_profile not in memory[gpu_id].name.upper():
+                raise ValueError(f"hardware_profile {hardware_profile} requires {hardware_profile} GPUs, "
+                                 f"but GPU {gpu_id} is {memory[gpu_id].name!r}")
 
 
 def validate_attention_heads(num_attention_heads: Optional[int], tp: int,
@@ -565,7 +582,7 @@ def derive_vllm_parallel_layout(cfg: dict, roles: GPURoles,
 
     selected = [memory[g] for g in roles.generation if g in memory]
     min_total = min((item.total_gib for item in selected),
-                    default=178.0 if cfg.get("hardware_profile") == "B200_full_ram" else 80.0)
+                    default=_fallback_total_gib(cfg))
     min_free = min((item.free_gib for item in selected), default=min_total)
     util = _resolved_vllm_utilization(
         cfg.get("vllm_gpu_memory_utilization", "auto"), min_total, min_free)

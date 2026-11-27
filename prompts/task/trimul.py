@@ -13,7 +13,7 @@ Rules:
 - Define all of your code in one final ```python ``` block.
 - We will test the correctness of your kernel on multiple input shapes, make sure to support different potential test cases.
 - You are allowed to use mixed precision computations, but make sure your final output is in float32.
-- You must use trition 3.3.1 and these kernels will be run on an H100.
+- You must use trition 3.3.1 and these kernels will be run on an {gpu_type}.
 - You do not have to implement everything in triton, you may choose to have some of the operations done in pytorch. However, you must implement at least part of the operations in a kernel.
 - Include a short docstring at the top summarizing your algorithm.
 """

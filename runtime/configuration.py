@@ -17,7 +17,10 @@ from config_validation import (
     reject_retired_coder_cap, retired_search_keys, uses_hybrid_policy_loss, uses_ttt_policy_loss,
     validate_hybrid_weight, validate_problem_config,
 )
-from runtime.hardware_profiles import generation_cpu_ids, local_checkpoint, restore_hardware_settings
+from runtime.hardware_profiles import (
+    HOPPER_GPU_MEMORY_GIB, generation_cpu_ids, hardware_profile, local_checkpoint,
+    restore_hardware_settings,
+)
 
 from prompts.base import UPSTREAM_COMMIT
 from models.coder_profiles import (
@@ -154,6 +157,9 @@ def _build_arg_parser() -> argparse.ArgumentParser:
                         "One of: circle_packing, "
                         "erdos, erdos-c4, ac1, ac2, denoising, gpu_mode.")
     p.add_argument("--config", default=None, help="Explicit path to a YAML config (overrides the --problem lookup).")
+    p.add_argument("--hardware-profile", type=hardware_profile, default=None,
+                   metavar="{RTX6000,B200_full_ram,H100,H200}",
+                   help="Override the YAML hardware profile for this launch.")
     p.add_argument("--resume", "--resume-from", dest="resume", default=None,
                    metavar="RUN_DIR",
                    help="Continue an existing run directory from its latest "
@@ -165,6 +171,8 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--kernel-gpu-id", type=int, default=None,
                    help="Physical device the kernel benchmark owns, exclusively.")
     p.add_argument("--kernel-timeout-s", type=float, default=None)
+    p.add_argument("--kernel-python", default=None,
+                   help="Python executable for the GPU benchmark evaluator.")
     p.add_argument("--problem-type", default=None,
                    help="Sub-type for multi-mode problems (ac1/ac2, trimul/mla_decode_nvidia).")
 
@@ -560,10 +568,10 @@ def load_config():
               f"{resume_dir / 'config.json'}; launch YAML rollout counts, "
               "and evaluation resources override saved values")
 
-    restore_hardware_settings(merged, ydict, saved)
+    restore_hardware_settings(merged, ydict, saved, profile_override=args.hardware_profile)
 
     # 3) CLI overlay (only explicitly-provided values)
-    skip = {"problem", "config", "problem_type", "resume"}
+    skip = {"problem", "config", "problem_type", "resume", "hardware_profile"}
     for arg_name, value in vars(args).items():
         if arg_name in skip or value is None:
             continue
@@ -795,17 +803,23 @@ def load_config():
         and evaluation_gpu_id != training_gpu_id)
 
     if roles.gpu_problem:
+        trimul = str(merged.get("problem_type") or "").lower() == "trimul"
+        profile = merged["hardware_profile"]
+        if trimul and profile in HOPPER_GPU_MEMORY_GIB:
+            if args.gpu_type is not None and args.gpu_type.strip().upper() != profile:
+                raise ValueError(f"TriMul --gpu-type must match hardware_profile {profile}")
+            merged["gpu_type"] = profile
+            merged["rollout_prompt_revision"] = f"{UPSTREAM_COMMIT}-trimul-{profile.lower()}"
         if not str(merged.get('gpu_type') or '').strip():
             merged["gpu_type"] = "H100"
             print("[config] gpu_mode gpu_type not set; defaulting explicitly to H100")
         merged["kernel_gpu_id"] = evaluation_gpu_id
-        trimul = str(merged.get("problem_type") or "").lower() == "trimul"
         merged["reward_workers"] = len(gpu_ids) if trimul else 1
         print(f'[config] gpu_mode uses {merged["reward_workers"]} evaluation '
               'worker(s), one benchmark at a time per GPU')
 
     memory = query_gpu_memory()
-    validate_selected_gpus(roles, memory)
+    validate_selected_gpus(roles, memory, hardware_profile=merged["hardware_profile"])
 
     requested_backend = str(merged["backend"]).strip().lower()
     merged["backend"] = _resolve_training_backend(requested_backend, coder_name)
@@ -892,6 +906,12 @@ def load_config():
         known_heads = detect_attention_heads(coder_name)
         layout = derive_vllm_parallel_layout(
             merged, roles, memory, known_heads, model_name=coder_name)
+        if (merged["hardware_profile"] in HOPPER_GPU_MEMORY_GIB
+                and advantage_mode == LLM_CRITIC_MODE
+                and layout.tensor_parallel_size * layout.pipeline_parallel_size > 1):
+            raise ValueError(
+                "llm-critic requires a complete GPT-OSS vLLM engine per GPU, "
+                "but this allocation needs a sharded engine.")
         merged["vllm_tensor_parallel_size"] = layout.tensor_parallel_size
         merged["vllm_pipeline_parallel_size"] = layout.pipeline_parallel_size
         validate_attention_heads(known_heads, merged["vllm_tensor_parallel_size"], coder_name)
@@ -974,7 +994,7 @@ def load_config():
 
 
 def _isolated_evaluation_cpu_ids(cfg=None):
-    """Use the allowed cpuset, excluding B200's dedicated inference cores."""
+    """Use the allowed cpuset, excluding reserved inference cores."""
     if not (hasattr(os, "sched_getaffinity") and hasattr(os, "sched_setaffinity")):
         raise RuntimeError("--isolate-eval requires Linux CPU affinity support")
     cpu_ids = sorted(int(cpu_id) for cpu_id in os.sched_getaffinity(0))
