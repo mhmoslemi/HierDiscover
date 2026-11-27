@@ -2,6 +2,7 @@ import json
 import multiprocessing
 from pathlib import Path
 import sys
+from types import SimpleNamespace
 
 import pytest
 
@@ -115,6 +116,41 @@ def test_hopper_replans_on_resume(monkeypatch, tmp_path):
 def test_hopper_profile_rejects_wrong_gpu(monkeypatch):
     with pytest.raises(ValueError, match="hardware_profile H100 requires H100 GPUs"):
         _launch_config(monkeypatch, "H100", actual="NVIDIA H200")
+
+
+@pytest.mark.parametrize(("profile", "extra", "embedding_offload"), [
+    ("H100", (), False),
+    ("H200", (), False),
+    (None, (), "auto"),
+    ("H100", ("--no-train",), "auto"),
+])
+def test_unsloth_embedding_placement_for_hopper_training(
+        monkeypatch, profile, extra, embedding_offload):
+    pytest.importorskip("torch")
+    from models import gpt_oss_training, model_backend
+
+    cfg, _ = _launch_config(monkeypatch, profile, extra=extra)
+
+    class CheckpointLoadRequested(Exception):
+        pass
+
+    def from_pretrained(**kwargs):
+        raise CheckpointLoadRequested(kwargs)
+
+    monkeypatch.setitem(sys.modules, "unsloth", SimpleNamespace(
+        FastLanguageModel=SimpleNamespace(from_pretrained=from_pretrained)))
+    monkeypatch.setattr(
+        model_backend, "_require_packed_mxfp4_training_runtime", lambda cfg: None)
+    monkeypatch.setattr(
+        gpt_oss_training, "preserve_mxfp4_allocation_errors", lambda: None)
+    monkeypatch.setattr(host_memory, "host_memory_info", lambda: {
+        "total": 512 * host_memory.GIB, "available": 512 * host_memory.GIB,
+    })
+
+    with pytest.raises(CheckpointLoadRequested) as requested:
+        model_backend.UnslothBackend(cfg).load()
+
+    assert requested.value.args[0].get("offload_embedding", "auto") == embedding_offload
 
 
 def test_hopper_can_stage_loads_when_parallel_load_exceeds_job_ram(monkeypatch):

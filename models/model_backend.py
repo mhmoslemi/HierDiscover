@@ -830,6 +830,7 @@ class UnslothBackend(_ModelPlacementBackend):
         self._FastLanguageModel = None
 
     def load(self):
+        from runtime.hardware_profiles import HOPPER_GPU_MEMORY_GIB
         from runtime.host_memory import retry_host_allocation, GIB
         _require_packed_mxfp4_training_runtime(self.cfg)
         # Unsloth must be imported BEFORE transformers/trl/peft
@@ -850,6 +851,13 @@ class UnslothBackend(_ModelPlacementBackend):
             preserve_mxfp4_allocation_errors()
 
         device_map = _training_device_map(self.cfg)
+        hardware_profile = getattr(self.cfg, "hardware_profile", "RTX6000")
+        max_memory = _training_max_memory(self.cfg)
+        load_options = {"max_memory": max_memory} if max_memory else {}
+        if (packed_mxfp4 and hardware_profile in HOPPER_GPU_MEMORY_GIB
+                and not getattr(self.cfg, "no_train", False)):
+            # Each training replica needs all parameters on its assigned GPU.
+            load_options["offload_embedding"] = False
         log_loading = setting_log_only if getattr(self.cfg, "_startup_step", 0) > 0 else print
         log_loading(f"[backend=unsloth] loading {training_name} across "
                     f"{int(getattr(self.cfg, 'num_training_gpus', 1))} GPU(s) ...")
@@ -864,9 +872,8 @@ class UnslothBackend(_ModelPlacementBackend):
             use_exact_model_name=True,
             local_files_only=local_files_only,
             device_map=device_map,
-            **({"max_memory": _training_max_memory(self.cfg)}
-               if _training_max_memory(self.cfg) else {}),
-        ), hardware_profile=getattr(self.cfg, "hardware_profile", "RTX6000"),
+            **load_options,
+        ), hardware_profile=hardware_profile,
             stage="trainer loading", required_bytes=8 * GIB)
         self._remember_training_placement(model)
         if packed_mxfp4 and not _is_packed_mxfp4(model):
