@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/bin/bash -l
 #SBATCH --job-name=ac1-hinge-triout3
 #SBATCH --account=def-boyuwang
 #SBATCH --time=0-01:00:00
@@ -11,6 +11,8 @@
 #SBATCH --output=/home/mmoslem3/scratch/HierDiscover/slurm-%x-%j.out
 
 set -euo pipefail
+# FlashInfer builds the tensor-parallel communication kernel with this toolkit.
+module load cuda/13.2
 source /home/mmoslem3/scratch/unsloth_env/bin/activate
 
 export TTT_CONFIG=configs/ac1.yaml
