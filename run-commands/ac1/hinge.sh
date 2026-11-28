@@ -6,7 +6,7 @@ CDPATH= cd -- "$(dirname -- "$0")/../.."
 config_path="${TTT_CONFIG:-configs/ac1.yaml}"
 export AVAILABLE_GPUS=7
 export TTT_LAUNCH_ADVANTAGE_DEFAULT=hinge
-export TRIOUT=2  # Directory label only.
+export TRIOUT=3  # Directory label only.
 export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}"
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 
