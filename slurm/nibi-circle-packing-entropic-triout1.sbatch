@@ -1,7 +1,7 @@
 #!/bin/bash -l
 #SBATCH --job-name=circle-packing-entropic-triout1
 #SBATCH --account=def-bghaddar
-#SBATCH --time=0-14:00:00
+#SBATCH --time=0-00:50:00
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=75
