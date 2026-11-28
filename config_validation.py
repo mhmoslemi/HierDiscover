@@ -16,6 +16,7 @@ DECOMPOSE_MODE = "decompose"
 INVARIANT_ADVANTAGE_MODES = (SPO_RS_INVARIANT_MODE, HYBRID_INVARIANT_MODE, DECOMPOSE_MODE)
 ADVANTAGE_MODES = ("entropic", HINGE_MODE, "spo-rs", "hybrid", *INVARIANT_ADVANTAGE_MODES, LLM_CRITIC_MODE)
 PARENT_SELECTION_MODES = ("puct", "uct")
+UPSTREAM_ARCHIVE_PROBLEMS = frozenset({"erdos", "ac2", "circle_packing"})
 LEGACY_CODER_CAP_KEY = "coder_thinking_budget"
 DEFAULT_EVAL_PROGRESS_INTERVAL_S = 120
 
@@ -89,7 +90,7 @@ CPU_PROBLEMS = frozenset({
 
 PROBLEM_REQUIRED_KEYS = {
     "circle_packing": frozenset({
-        "num_circles", "degenerate_threshold", "eval_cpus",
+        "num_circles", "eval_cpus",
     }),
     "erdos": frozenset({
         "budget_s", "eval_cpus",
@@ -108,7 +109,7 @@ PROBLEM_REQUIRED_KEYS = {
 }
 
 PROBLEM_OPTIONAL_KEYS = {
-    "circle_packing": frozenset(),
+    "circle_packing": frozenset({"budget_s", "degenerate_threshold"}),
     "erdos": frozenset({"target_print", "seed_min_points", "seed_max_points"}),
     "erdos-c4": frozenset(),
     "ac1": frozenset({"target_print"}),
@@ -128,7 +129,7 @@ EXCLUSIVE_KEY_OWNERS = {
     "eval_seed": frozenset({"denoising"}),
     "seed_min_points": frozenset({"erdos"}),
     "seed_max_points": frozenset({"erdos"}),
-    "budget_s": frozenset({"erdos", "erdos-c4", "ac1", "ac2"}),
+    "budget_s": frozenset({"erdos", "erdos-c4", "ac1", "ac2", "circle_packing"}),
     "eval_cpus": CPU_PROBLEMS,
     "max_coeff_count": frozenset({"erdos-c4"}),
     "benchmark_c4": frozenset({"erdos-c4"}),

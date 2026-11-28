@@ -14,7 +14,8 @@ from config_validation import (
     HINGE_MODE, LEGACY_CODER_CAP_KEY,
     HYBRID_INVARIANT_MODE, INVARIANT_ADVANTAGE_MODES, SPO_RS_INVARIANT_MODE,
     LLM_CRITIC_MODE, PARENT_SELECTION_MODES, RETIRED_BATCH_GROWTH_KEYS, RETIRED_TRAINER_KEYS,
-    reject_retired_coder_cap, retired_search_keys, uses_hybrid_policy_loss, uses_ttt_policy_loss,
+    UPSTREAM_ARCHIVE_PROBLEMS, reject_retired_coder_cap, retired_search_keys,
+    uses_hybrid_policy_loss, uses_ttt_policy_loss,
     validate_hybrid_weight, validate_problem_config,
 )
 from runtime.hardware_profiles import (
@@ -596,9 +597,18 @@ def load_config():
         if args.spo_rs_clip_epsilon_high is None:
             merged["spo_rs_clip_epsilon_high"] = args.spo_rs_clip_epsilon
     # Trainer/evaluator modes are launch-scoped.
-    merged["rollout_prompt_revision"] = (
-        f"{UPSTREAM_COMMIT}-direct-coder"
-        if merged["problem"] == "circle_packing" else UPSTREAM_COMMIT)
+    task_revision = {
+        "erdos": "-erdos-evaluator",
+        "ac2": "-ac2-seeds",
+        "circle_packing": "-circle-packing",
+    }.get(merged["problem"], "")
+    if merged["problem"] in UPSTREAM_ARCHIVE_PROBLEMS:
+        merged["max_buffer_size"] = ydict.get("max_buffer_size", 1000)
+        merged["topk_children_per_parent"] = ydict.get("topk_children_per_parent", 2)
+        task_revision += (
+            f"-archive-puct-{merged['max_buffer_size']}-{merged['topk_children_per_parent']}"
+        )
+    merged["rollout_prompt_revision"] = UPSTREAM_COMMIT + task_revision
     if merged["problem"] == "ac1":
         if resume_dir is None or saved.get("ac1_ttt_rollouts"):
             merged["ac1_ttt_rollouts"] = True
@@ -734,6 +744,7 @@ def load_config():
     available_gpu_ids = parse_gpu_ids(inventory_value, field=inventory_source)
     roles = allocate_gpu_roles(
         available_gpu_ids, merged["problem"], merged.get("problem_type"))
+    os_scheduled_cpu_evaluation = merged["hardware_profile"] == "H100" and not roles.gpu_problem
     if merged["isolate_eval"] and roles.gpu_problem:
         if str(merged.get("problem_type") or "").lower() == "trimul":
             # run.sh enables CPU isolation for ordinary problems. TriMul has
@@ -750,12 +761,13 @@ def load_config():
             if merged.get("eval_cpus") != 1:
                 merged["eval_cpus"] = 2
             merged["reward_workers"] = 1
-        if int(merged.get('reward_workers', 0) or 0) < 1:
-            raise ValueError(
-                "--isolate-eval requires reward_workers >= 1; in this mode "
-                "reward_workers is the concurrent process count per CPU")
-        # Fail before model loading when the host cannot enforce affinity.
-        _isolated_evaluation_cpu_ids()
+        if not os_scheduled_cpu_evaluation:
+            if int(merged.get('reward_workers', 0) or 0) < 1:
+                raise ValueError(
+                    "--isolate-eval requires reward_workers >= 1; in this mode "
+                    "reward_workers is the concurrent process count per CPU")
+            # Fail before model loading when the host cannot enforce affinity.
+            _isolated_evaluation_cpu_ids()
     training_gpu_id = roles.training
     gpu_ids = roles.generation
     if advantage_mode == LLM_CRITIC_MODE:
@@ -971,7 +983,8 @@ def load_config():
                                           else ERDOS_REWARD_ANCHORS[reward_task])
     merged["target_modules"] = tuple(merged["target_modules"])
     cfg = SimpleNamespace(**merged)
-    if cfg.isolate_eval and cfg.problem == "ac1":
+    cfg.os_scheduled_cpu_evaluation = os_scheduled_cpu_evaluation
+    if cfg.isolate_eval and cfg.problem == "ac1" and not os_scheduled_cpu_evaluation:
         _isolated_ac1_cpu_pairs(cfg)
     if cfg.generation_backend == 'vllm' and int(cfg.num_gpus or 0) < 1:
         raise ValueError("vLLM generation requires num_gpus >= 1")

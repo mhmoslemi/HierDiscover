@@ -27,9 +27,11 @@ from pathlib import Path
 from types import SimpleNamespace
 import numpy as np
 from config_validation import (
-    DECOMPOSE_MODE, DEFAULT_EVAL_PROGRESS_INTERVAL_S, HINGE_MODE, HYBRID_INVARIANT_MODE,
+    DECOMPOSE_MODE, DEFAULT_EVAL_PROGRESS_INTERVAL_S,
+    HINGE_MODE, HYBRID_INVARIANT_MODE,
     INVARIANT_ADVANTAGE_MODES, LLM_CRITIC_MODE, PARENT_SELECTION_MODES,
-    SPO_RS_INVARIANT_MODE, reject_retired_coder_cap, uses_hybrid_policy_loss, uses_ttt_policy_loss,
+    SPO_RS_INVARIANT_MODE, UPSTREAM_ARCHIVE_PROBLEMS,
+    reject_retired_coder_cap, uses_hybrid_policy_loss, uses_ttt_policy_loss,
 )
 from generation.output_validation import (
     coder_output_issue, ttt_ac1_program, ttt_ac1_python_block, ttt_ac1_response_code,
@@ -298,17 +300,22 @@ def _evaluated_rollout_meta(pending_meta, result):
     }
 
 
-def _ac1_archive_metadata(result, evaluation_order):
-    from search.sampler import AC1_CONSTRUCTION_LIMITS
-
+def _archive_construction_metadata(result, limits):
     construction = result.construction
     length = len(construction) if construction is not None else 0
-    meta = {"evaluation_order": evaluation_order, "construction_length": length}
-    low, high = AC1_CONSTRUCTION_LIMITS
+    meta = {"construction_length": length}
+    low, high = limits
     if result.valid and low <= length <= high:
         # Retain every admissible construction for exact replay, even beyond
         # the ordinary construction limit used for plotting/debug metadata.
-        meta["construction"] = json.dumps(construction)
+        coefficients = []
+        for value in construction:
+            if isinstance(value, np.generic):
+                value = value.item()
+            if isinstance(value, np.longdouble):
+                value = {"longdouble": str(value)}
+            coefficients.append(value)
+        meta["construction"] = json.dumps(coefficients)
     return meta
 
 
@@ -576,7 +583,8 @@ def _restore_legacy_archive(sampler, exp_dir, before_step, *, tokenizer=None):
             reward = float(meta.get("reward", 0.0))
             raw = meta.get("raw_score")
             raw = float(raw) if raw is not None else None
-            construction = (_ac1_saved_construction(meta) if sampler.ac1_archive
+            construction = (_saved_archive_construction(meta, sampler.construction_limits)
+                            if sampler.construction_limits is not None
                             else meta.get("construction"))
         except (TypeError, ValueError):
             continue
@@ -586,8 +594,7 @@ def _restore_legacy_archive(sampler, exp_dir, before_step, *, tokenizer=None):
             observation=str(meta.get("sandbox_stdout") or ""),
             previous_raw_score=meta.get("parent_raw_score"),
             poisson=meta.get("poisson"),
-            construction_length=(meta.get("construction_length")
-                                 if sampler.ac1_archive else None),
+            construction_length=meta.get("construction_length"),
         ))
     sampler.import_legacy_states(states, total_expansions=total_rollouts)
     return len(states), total_rollouts
@@ -647,7 +654,8 @@ def _complete_unfinished_rollout_paths(exp_dir, step_idx, cfg):
         return None
     paths = sorted(step_dir.glob(f"step{step_idx:02d}_group*_rollout*.meta.json"))
     parent_count = int(cfg.groups_per_step)
-    if getattr(cfg, "ac1_ttt_rollouts", False) or getattr(cfg, "ac1_archive_seed", None) is not None:
+    if (cfg.problem in UPSTREAM_ARCHIVE_PROBLEMS or getattr(cfg, "ac1_ttt_rollouts", False)
+            or getattr(cfg, "ac1_archive_seed", None) is not None):
         # Lineage blocking can yield fewer parents than the configured target.
         try:
             saved_parents = json.loads((step_dir / f"step{step_idx:02d}.parents.json").read_text())
@@ -699,6 +707,9 @@ def _recoverable_spo_rs_artifacts(exp_dir, step_idx, cfg):
         except (OSError, ValueError, TypeError, json.JSONDecodeError):
             return None
         if not isinstance(meta, dict):
+            return None
+        if (cfg.problem in UPSTREAM_ARCHIVE_PROBLEMS
+                and type(meta.get("evaluation_order")) is not int):
             return None
         reject_retired_coder_cap(meta, source=meta_path)
         critic_label_pending = critic is not None and "advantage" not in meta
@@ -846,17 +857,25 @@ def _literal_float_list(value):
     return result if all(math.isfinite(item) for item in result) else None
 
 
-def _ac1_saved_construction(meta):
+def _saved_archive_construction(meta, limits):
     """Decode the saved coefficients without rounding integer values."""
-    from search.sampler import AC1_CONSTRUCTION_LIMITS
-
     construction = meta.get("construction")
-    if isinstance(construction, str):
-        construction = json.loads(construction)
     length = meta.get("construction_length", 0)
-    low, high = AC1_CONSTRUCTION_LIMITS
+    if isinstance(construction, str):
+        try:
+            construction = json.loads(construction)
+        except json.JSONDecodeError:
+            if not length:
+                return _literal_float_list(construction)
+            raise
+    low, high = limits
     if low <= length <= high and (construction is None or len(construction) != length):
-        raise ValueError("saved AC1 rollout is missing its archive construction")
+        raise ValueError("saved rollout is missing its archive construction")
+    if construction is not None:
+        construction = [
+            np.longdouble(value["longdouble"]) if isinstance(value, dict) else value
+            for value in construction
+        ]
     return construction
 
 
@@ -1061,6 +1080,7 @@ def _finalize_pending_spo_rs_artifacts(
         raise RuntimeError("generated-step recovery refuses non-exact response token IDs")
 
     ac1_archive = sampler.ac1_archive
+    archive_in_evaluation_order = ac1_archive or sampler.upstream_archive
     parents = _sample_step_parents(sampler, cfg, exp_dir, step_idx, reuse_saved=True)
     if ac1_archive and step_idx == 0:
         _rebind_interrupted_step_zero_selection(sampler, exp_dir, parents)
@@ -1131,7 +1151,7 @@ def _finalize_pending_spo_rs_artifacts(
     def evaluation_completed(future, index):
         nonlocal eval_bar, live_best_raw
         with eval_progress_lock:
-            if ac1_archive:
+            if archive_in_evaluation_order:
                 evaluation_order[index] = len(evaluation_order)
             if eval_bar is not None:
                 eval_bar.update(1)
@@ -1207,11 +1227,10 @@ def _finalize_pending_spo_rs_artifacts(
                 if getattr(gen_pool, "sequential", False):
                     gen_pool.release()
 
-        context_count = len(parents) if ac1_archive else int(cfg.groups_per_step)
         divergence, missing_scores, context_divergences = (
             spo_rs_tracker.consecutive_policy_divergence(
                 current_scores, previous_scores, context_ids,
-                required_context_ids=range(context_count)))
+                required_context_ids=range(len(parents))))
         if missing_scores or not math.isfinite(divergence):
             raise RuntimeError('generated-step recovery did not obtain every exact consecutive-policy score')
 
@@ -1322,8 +1341,10 @@ def _finalize_pending_spo_rs_artifacts(
             "seed": int(cfg.seed),
             "spo_rs": info,
         })
-        if ac1_archive:
-            meta.update(_ac1_archive_metadata(result, evaluation_order[index]))
+        if archive_in_evaluation_order:
+            meta["evaluation_order"] = evaluation_order[index]
+        if sampler.construction_limits is not None:
+            meta.update(_archive_construction_metadata(result, sampler.construction_limits))
         response_text = item["response_path"].read_text(encoding="utf-8", errors="replace")
         save_rollout(exp_dir, step_idx, group, rollout, response_text, meta, artifacts_already_saved=True)
 
@@ -1410,7 +1431,7 @@ def _rebind_interrupted_step_zero_selection(sampler, exp_dir, parents):
 
 
 def _sample_step_parents(sampler, cfg, exp_dir, step_idx, *, reuse_saved=False):
-    if sampler.ac1_ttt_rollouts and reuse_saved:
+    if reuse_saved and (sampler.ac1_ttt_rollouts or cfg.problem == "ac2"):
         path = Path(exp_dir) / f"step{step_idx:02d}" / f"step{step_idx:02d}.parents.json"
         rows = sorted(json.loads(path.read_text(encoding="utf-8"))["parents"],
                       key=lambda row: int(row["group"]))
@@ -1559,6 +1580,7 @@ def _resume_spo_rs_step_from_artifacts(
     hybrid_mode = cfg.advantage_mode in ("hybrid", HYBRID_INVARIANT_MODE)
     hybrid_loss = uses_hybrid_policy_loss(cfg.advantage_mode)
     ac1_archive = sampler.ac1_archive
+    archive_in_evaluation_order = ac1_archive or sampler.upstream_archive
     if critic_mode:
         judged = critic_step.load_batch(exp_dir, step_idx)
         if judged["adapter"] != Path(sampling_adapter_path).name:
@@ -1568,8 +1590,8 @@ def _resume_spo_rs_step_from_artifacts(
     for item in artifacts:
         by_group.setdefault(int(item["meta"]["group"]), []).append(item)
     parents = _rebind_saved_step_zero_parents(
-        sampler, by_group, int(cfg.groups_per_step)
-    ) if step_idx == 0 and not ac1_archive else None
+        sampler, by_group, len(by_group)
+    ) if step_idx == 0 and not ac1_archive and cfg.problem != "ac2" else None
     if parents is None:
         parents = _sample_step_parents(sampler, cfg, exp_dir, step_idx, reuse_saved=True)
         if ac1_archive and step_idx == 0:
@@ -1610,7 +1632,7 @@ def _resume_spo_rs_step_from_artifacts(
                 raise RuntimeError(
                     f"evaluated-step recovery parent ID {group} differs from "
                     "the restored sampler checkpoint")
-        sampler.record_expansion(parent, count=int(cfg.group_size))
+        sampler.record_expansion(parent, count=len(records))
 
     if not critic_mode:
         spo_info, tracker_update, divergence = _restore_saved_spo_rs_update(
@@ -1713,17 +1735,18 @@ def _resume_spo_rs_step_from_artifacts(
             child = State.make(
                 timestep=step_idx, value=float(meta["reward"]), code=code,
                 raw_score=(float(meta["raw_score"]) if meta.get("raw_score") is not None else None),
-                construction=(_ac1_saved_construction(meta) if ac1_archive
+                construction=(_saved_archive_construction(meta, sampler.construction_limits)
+                              if sampler.construction_limits is not None
                               else _literal_float_list(meta.get("construction"))),
                 observation=str(meta.get("sandbox_stdout") or ""),
                 poisson=meta.get("poisson"),
-                construction_length=meta.get("construction_length") if ac1_archive else None,
+                construction_length=meta.get("construction_length"),
             )
             if meta.get("node_id"):
                 child.id = str(meta["node_id"])
             parent_group = int(meta.get("parent_group", group))
             all_children.append((child, parents[parent_group]))
-            if ac1_archive:
+            if archive_in_evaluation_order:
                 archive_order[child.id] = int(meta["evaluation_order"])
         if item.get("critic_label_pending"):
             save_rollout(exp_dir, step_idx, group, int(meta["rollout"]), response_text,
@@ -1790,7 +1813,7 @@ def _resume_spo_rs_step_from_artifacts(
 
     previous_best_raw = sampler.best_raw_state(maximize=bool(problem.maximize))
     previous_best_value = float(previous_best_raw.raw_score) if previous_best_raw is not None else None
-    if ac1_archive:
+    if archive_in_evaluation_order:
         all_children.sort(key=lambda entry: archive_order[entry[0].id])
     archive_stats = sampler.update(all_children)
     setting_log_only(
@@ -1958,6 +1981,25 @@ def _evaluation_pool(cfg, problem, rollout_count, step_idx, gen_pool,
                      parallel_trainer=None, *, recovering=False):
     from concurrent.futures import ThreadPoolExecutor
     from queue import Queue
+
+    if getattr(cfg, "os_scheduled_cpu_evaluation", False):
+        n_reward_workers = max(1, rollout_count)
+        memory_limit_bytes = _automatic_sandbox_memory_limit_bytes(n_reward_workers)
+
+        def evaluate(text, parent_ctx, **answer_options):
+            return problem.compute_reward(
+                text, parent_ctx, cfg.sandbox_timeout_s,
+                memory_limit_bytes=memory_limit_bytes, **answer_options)
+
+        setting_log_only(
+            f"[step {step_idx}] Linux-scheduled CPU evaluation: launching each rollout on arrival",
+            flush=True)
+        return ThreadPoolExecutor(max_workers=n_reward_workers), evaluate, {
+            "evaluation_isolated": False,
+            "evaluation_workers": n_reward_workers,
+            "evaluation_cpu_count": 0,
+            "evaluation_processes_per_cpu": 0,
+        }
 
     from runtime.host_memory import HostMemoryAdmission
     host_admission = getattr(parallel_trainer, "host_memory_admission", None)
@@ -2292,10 +2334,13 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
     is_trimul = getattr(problem, "problem_type", "") == "trimul"
     isolated_batch = trimul_evaluation.completed_batch(exp_dir, step_idx) if is_trimul else None
     ac1_archive = sampler.ac1_archive
-    if sampler.ac1_ttt_rollouts and pending_artifacts is None:
+    admit_on_evaluation = sampler.upstream_archive
+    archive_in_evaluation_order = ac1_archive or admit_on_evaluation
+    if (sampler.ac1_ttt_rollouts or cfg.problem == "ac2") and pending_artifacts is None:
         backup = archive_unfinished_rollout_step(exp_dir, step_idx)
         if backup is not None:
-            setting_log_only(f"[resume] regenerating AC1 step {step_idx}; previous artifacts moved to {backup}")
+            setting_log_only(f"[resume] regenerating {cfg.problem.upper()} step {step_idx}; "
+                             f"previous artifacts moved to {backup}")
     parents = _sample_step_parents(sampler, cfg, exp_dir, step_idx, reuse_saved=pending_artifacts is not None)
     if step_idx == 0 and (not sampler.ac1_ttt_rollouts or pending_artifacts is not None):
         _rebind_interrupted_step_zero_selection(sampler, exp_dir, parents)
@@ -2341,7 +2386,8 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
     base_messages = []
 
     for parent in parents:
-        sampler.record_expansion(parent, count=int(cfg.group_size))
+        if not admit_on_evaluation:
+            sampler.record_expansion(parent, count=int(cfg.group_size))
         pc = _parent_context(parent)
         parent_ctxs.append(pc)
         base_messages.append(problem.build_prompt(pc))
@@ -2408,6 +2454,22 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
     live_best_state = sampler.best_raw_state(maximize=bool(problem.maximize))
     live_best_raw = (
         float(live_best_state.raw_score) if live_best_state is not None else None)
+    best_before_evaluation = live_best_raw
+    archive_errors = []
+
+    def rollout_state(result, record):
+        construction_length = None
+        if sampler.construction_limits is not None:
+            construction_length = len(result.construction) if result.construction is not None else 0
+        child = State.make(
+            timestep=step_idx, value=result.reward, code=result.code or "",
+            raw_score=result.raw_score, construction=result.construction,
+            observation=result.stdout, poisson=result.poisson,
+            construction_length=construction_length,
+        )
+        if critic_mode:
+            child.id = record["_pending_meta"]["node_id"]
+        return child
 
     def _record_evaluation_completion(_future, record=None):
         nonlocal eval_bar, eval_progress_completed, live_best_raw
@@ -2422,10 +2484,23 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                     evaluated_meta["archive_eligible"] = bool(result.valid and result.code)
                     if save_ctor:
                         evaluated_meta["construction"] = _as_float_list(result.construction, cfg.max_saved_construction)
-                if ac1_archive:
+                if archive_in_evaluation_order:
                     record["evaluation_order"] = eval_progress_completed
-                    if critic_mode:
-                        evaluated_meta.update(_ac1_archive_metadata(result, record["evaluation_order"]))
+                    evaluated_meta["evaluation_order"] = eval_progress_completed
+                if admit_on_evaluation or (ac1_archive and critic_mode):
+                    try:
+                        if critic_mode and sampler.construction_limits is not None:
+                            evaluated_meta.update(
+                                _archive_construction_metadata(result, sampler.construction_limits))
+                        if admit_on_evaluation:
+                            parent = parents[record["parent_group"]]
+                            sampler.record_expansion(parent)
+                            if result.valid and result.code:
+                                child = rollout_state(result, record)
+                                sampler.update([(child, parent)], prune=False)
+                                record["_archive_state"] = child
+                    except Exception as error:
+                        archive_errors.append(error)
                 save_future = rollout_io_pool.submit(
                     save_rollout,
                     exp_dir, step_idx, int(record["group_id"]),
@@ -3028,6 +3103,8 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
             wait(all_futs)
             with eval_progress_condition:
                 eval_progress_condition.wait_for(lambda: eval_progress_completed >= len(all_futs))
+            if archive_errors:
+                raise archive_errors[0]
         finally:
             if eval_bar is not None:
                 eval_bar.close()
@@ -3234,21 +3311,11 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
             # Allocate a durable ID even for invalid/duplicate candidates. A
             # valid candidate uses this exact State object in sampler.update,
             # so a child selected in a later step links back to this rollout.
-            child = State.make(
-                timestep=step_idx,
-                value=rewards[r_idx],
-                code=res.code or "",
-                raw_score=res.raw_score,
-                construction=res.construction,
-                observation=res.stdout,
-                poisson=res.poisson,
-            )
-            if critic_mode:
-                child.id = record["_pending_meta"]["node_id"]
+            child = record.get("_archive_state") or rollout_state(res, record)
             archive_eligible = bool(valids[r_idx] and codes[r_idx])
             if archive_eligible:
                 all_children.append((child, parent))
-                if ac1_archive:
+                if archive_in_evaluation_order:
                     archive_order[child.id] = record["evaluation_order"]
             spo_rs_advantage = spo_rs_advantages[r_idx] if history_mode else None
             meta = {
@@ -3295,8 +3362,10 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                     cfg.max_saved_construction) if save_ctor else None),
                 "seed": int(cfg.seed),
             }
-            if ac1_archive:
-                meta.update(_ac1_archive_metadata(res, record["evaluation_order"]))
+            if archive_in_evaluation_order:
+                meta["evaluation_order"] = record["evaluation_order"]
+            if sampler.construction_limits is not None:
+                meta.update(_archive_construction_metadata(res, sampler.construction_limits))
             if history_mode:
                 meta["spo_rs"] = spo_rs_rollout_info[r_idx]
             if invariant_mode:
@@ -3416,14 +3485,15 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
 
     # Keep the previous raw optimum so the status line can distinguish a new
     # run best from a step that merely repeats the best-ever value.
-    previous_best_raw = sampler.best_raw_state(maximize=bool(problem.maximize))
-    previous_best_value = (
-        float(previous_best_raw.raw_score) if previous_best_raw is not None else None)
+    previous_best_value = best_before_evaluation
 
     # Update archive
-    if ac1_archive:
+    if archive_in_evaluation_order:
         all_children.sort(key=lambda entry: archive_order[entry[0].id])
-    sampler.update(all_children)
+    if admit_on_evaluation:
+        sampler.flush()
+    else:
+        sampler.update(all_children)
 
     # Keep the best valid candidate produced by this exact step separate from
     # the cumulative best. ``all_children`` still contains candidates removed
@@ -3702,8 +3772,10 @@ def _main(trainer_startup):
     from problems.registry import get_problem
     problem_config = merged
     if cfg.isolate_eval and cfg.problem != "ac1":
-        # Prompts must describe the sandbox's real allocation.
+        # Keep rendering these isolated-evaluation prompts with a one-CPU budget.
         problem_config = {**merged, "eval_cpus": 1}
+    if cfg.os_scheduled_cpu_evaluation:
+        problem_config = {**problem_config, "os_scheduled_cpu_evaluation": True}
     problem = get_problem(cfg.problem, problem_config)
     if getattr(problem, "problem_type", "") == "trimul":
         from problems.gpu_mode import verify_benchmark_environment
@@ -3733,7 +3805,9 @@ def _main(trainer_startup):
     evaluation_gpus = (cfg.gpu_ids if getattr(problem, "problem_type", "") == "trimul"
                        else cfg.evaluation_gpu_id)
     print(f"Evaluation GPU:     {evaluation_gpus if evaluation_gpus is not None else 'none'}")
-    if cfg.isolate_eval and cfg.problem == "ac1":
+    if cfg.os_scheduled_cpu_evaluation:
+        evaluation_mode = "Linux-scheduled, one sandbox per rollout on arrival"
+    elif cfg.isolate_eval and cfg.problem == "ac1":
         unit = "CPU" if cfg.eval_cpus == 1 else "CPU pair"
         evaluation_mode = f"isolated, one sandbox per exclusive {unit}"
     elif cfg.isolate_eval:
@@ -3981,6 +4055,11 @@ def _main(trainer_startup):
                           if resume_payload is not None else cfg.parent_selection)
     if restored_selection != cfg.parent_selection:
         raise ValueError("saved sampler differs from the requested parent picker")
+    refresh_seed = None
+    if ac1_ttt_rollouts or ac1_archive_seed is not None:
+        refresh_seed = problem.refresh_ac1_seed
+    elif cfg.problem == "ac2":
+        refresh_seed = problem.refresh_ac2_seed
     sampler = make_sampler(
         parent_selection=restored_selection,
         num_seeds=len(seeds) if seeds else cfg.num_seed_states,
@@ -3990,11 +4069,16 @@ def _main(trainer_startup):
         seed_value=0.0,
         seed_states=seeds,
         ac1_archive_seed=ac1_archive_seed,
-        refresh_ac1_seed=(problem.refresh_ac1_seed if ac1_ttt_rollouts or ac1_archive_seed is not None else None),
+        refresh_seed=refresh_seed,
         ac1_ttt_rollouts=ac1_ttt_rollouts,
+        seed_timestep=-1 if cfg.problem in {"erdos", "ac2", "circle_packing"} else 0,
+        problem_name=cfg.problem,
     )
     if resume_payload is not None:
-        sampler.load_state_dict(resume_payload["sampler"])
+        sampler.load_state_dict(
+            resume_payload["sampler"],
+            erdos_reward_epsilon=problem.reward_epsilon if cfg.problem == "erdos" else 0.0,
+        )
         setting_log_only(f'[resume] restored exact {sampler.selection_mode.upper()} archive and search statistics')
     elif legacy_resume is not None:
         n_states, n_rollouts = _restore_legacy_archive(
@@ -4094,7 +4178,9 @@ def _main(trainer_startup):
                   f"N_eff={initialization['effective_count_after']:.2f}; "
                   "step 0 policy update enabled", flush=True)
 
-    if (is_trimul or hybrid_loss or invariant_mode or hinge_mode) and resume_payload is None:
+    save_initial_seeds = cfg.problem in {"erdos", "ac2"} and start_step == 0
+    if (resume_payload is None
+            and (is_trimul or hybrid_loss or invariant_mode or hinge_mode or save_initial_seeds)):
         if current_policy_adapter_path is None:
             current_policy_adapter_path = Path(_save_adapter(
                 model, exp_dir, start_step, directory_name="adapter_initial",

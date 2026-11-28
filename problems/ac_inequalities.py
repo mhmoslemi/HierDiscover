@@ -173,11 +173,11 @@ class ACInequalities(Problem):
         # authoritative evaluator once and trust only that result.
         try:
             if self.problem_type == "ac1" and self.cfg.get("isolate_eval"):
-                # Keep NumPy's native threads on the worker's CPU pair too.
+                # Use the same thread policy for the independent verifier.
                 verification = run_code(
                     f"import numpy as np\n\n{self._eval_src}\n\ndef verify():\n"
                     f"    return evaluate_sequence({json.dumps(output, allow_nan=False)})\n",
-                    "verify", timeout_s=None, max_cpus=self.eval_cpus)
+                    "verify", timeout_s=None, max_cpus=self.sandbox_max_cpus)
                 if not verification["ok"]:
                     raise ValueError(verification["error"])
                 result = float(verification["value"])
@@ -187,7 +187,11 @@ class ACInequalities(Problem):
             res.msg = f"invalid_solution: {exc}"
             res.failure_kind = "constraint"
             return res
-        if not np.isfinite(result) or result <= 0.0:
+        invalid_score = (
+            not np.isfinite(result) or result <= 0.0
+            if self.problem_type == "ac1" else result == np.inf
+        )
+        if invalid_score:
             res.msg = f"invalid_score: {result}"
             res.failure_kind = "constraint"
             return res
@@ -209,23 +213,25 @@ class ACInequalities(Problem):
         return SeedState(code=code, value=self._ac1_reward(raw), raw_score=raw,
                          construction=construction)
 
+    def refresh_ac2_seed(self, rng) -> SeedState:
+        construction = [float(rng.random())] * int(rng.integers(1000, 8000))
+        raw = float(evaluate_sequence_ac2(construction))
+        code = "```python\n" + thetaevolve_initial_program_prev_init + "\n```"
+        return SeedState(code=code, value=raw, raw_score=raw, construction=construction)
+
     def seed_states(self) -> List[SeedState]:
-        if self.problem_type == "ac1" and (self.cfg.get("ac1_ttt_rollouts")
-                                           or self.cfg.get("ac1_archive_seed") is not None):
+        if self.problem_type == "ac2":
+            return [self.refresh_ac2_seed(np.random.default_rng(12345))
+                    for _ in range(self.num_seed_states)]
+        if self.cfg.get("ac1_ttt_rollouts") or self.cfg.get("ac1_archive_seed") is not None:
             return [self.refresh_ac1_seed(np.random.default_rng(12345))
                     for _ in range(self.num_seed_states)]
         seeds: List[SeedState] = []
         for i in range(self.num_seed_states):
             rng = np.random.default_rng(self.seed + i)
             construction = [float(rng.random())] * int(rng.integers(1000, 8000))
-            if self.problem_type == "ac1":
-                raw = float(evaluate_sequence_ac1(construction))
-                value = self._ac1_reward(raw)
-                code = example_ae_program_random_init(self.budget_s)
-            else:
-                raw = float(evaluate_sequence_ac2(construction))
-                value = raw
-                code = thetaevolve_initial_program_prev_init
-            seeds.append(SeedState(code=code, value=value, raw_score=raw,
+            raw = float(evaluate_sequence_ac1(construction))
+            seeds.append(SeedState(code=example_ae_program_random_init(self.budget_s),
+                                   value=self._ac1_reward(raw), raw_score=raw,
                                    construction=construction))
         return seeds

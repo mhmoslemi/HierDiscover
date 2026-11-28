@@ -117,6 +117,8 @@ class Problem(ABC):
         self.eval_cpus = int(self.cfg.get("eval_cpus", 1))
         if self.eval_cpus < 1:
             raise ValueError("eval_cpus must be >= 1")
+        self.sandbox_max_cpus = (
+            None if self.cfg.get("os_scheduled_cpu_evaluation") else self.eval_cpus)
 
     # ---- prompt / sandbox program / scoring (subclasses implement) ----
     @abstractmethod
@@ -172,10 +174,11 @@ class Problem(ABC):
             full_code,
             entrypoint=self.entrypoint,
             timeout_s=timeout_s,
-            max_cpus=(1 if cpu_id is not None else self.eval_cpus),
+            max_cpus=(1 if cpu_id is not None else self.sandbox_max_cpus),
             cpu_id=cpu_id,
             memory_limit_bytes=memory_limit_bytes,
             on_sandbox_deadline=on_sandbox_deadline,
+            hard_timeout=self.sandbox_max_cpus is None,
             **({"stdout_feedback": True} if ac1_ttt_rollouts else {}),
         )
         diagnostics = [out.get("stdout", ""), out.get("traceback", ""),

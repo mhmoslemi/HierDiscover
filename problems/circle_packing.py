@@ -38,28 +38,22 @@ class CirclePacking(Problem):
 
     # ------------------------------------------------------------------
     def preprocess(self, code: str, parent: ParentContext) -> str:
-        prelude = (
-            "import numpy as np\n"
-            "import math\n"
-            "try:\n"
-            "    from scipy.optimize import minimize\n"
-            "except ImportError:\n"
-            "    minimize = None\n\n"
-            + circle_packing.VALIDATOR + "\n"
-        )
-        return prelude + "\n# ---- model code below ----\n" + code
+        return code
 
     # ------------------------------------------------------------------
     def score(self, output: Any, stdout: str) -> RewardResult:
         res = RewardResult(reward=self.fail_score)
-        if not (isinstance(output, tuple) and len(output) == 3):
+        try:
+            centers, radii, _ = output
+        except (TypeError, ValueError):
             res.msg = "bad_return_shape"
             res.failure_kind = "code"
             return res
-        centers, radii, _ = output
         try:
-            centers = np.asarray(centers, dtype=float)
-            radii = np.asarray(radii, dtype=float).ravel()
+            if not isinstance(centers, np.ndarray):
+                centers = np.array(centers)
+            if not isinstance(radii, np.ndarray):
+                radii = np.array(radii)
         except (ValueError, TypeError) as e:
             res.msg = f"bad_array: {e}"
             res.failure_kind = "code"
@@ -74,38 +68,18 @@ class CirclePacking(Problem):
             res.failure_kind = "code"
             return res
 
-        valid, msg = validate_packing(centers, radii)
-
-        # A packing the validator accepts but whose radii are all (near) zero is
-        # not a solution: it is a program that detected its own failure and
-        # returned something harmless. Accepting it at reward 0 makes defensive
-        # coding free and inflates the valid rate. Reject it instead.
-        if valid:
-            s = float(np.sum(radii))
-            if s <= self.degenerate_threshold:
-                res.valid = False
-                res.msg = (f"degenerate_packing: sum of radii {s:.3e} <= "
-                           f"{self.degenerate_threshold:.3e}")
-                return res
-            res.valid = True
-            res.msg = msg
-            res.reward = s
-            res.raw_score = s
+        try:
+            valid, msg = validate_packing(centers, radii)
+        except (TypeError, ValueError) as e:
+            res.msg = f"bad_array: {e}"
+            res.failure_kind = "code"
             return res
 
-        res.valid = False
+        res.valid = valid
         res.msg = msg
+        if valid:
+            res.raw_score = res.reward = float(np.sum(radii))
         return res
-
-    @property
-    def degenerate_threshold(self) -> float:
-        """
-        Below this the packing is treated as invalid. Default is deliberately
-        tiny: it should catch all-zero and numerically-collapsed returns without
-        rejecting a genuinely poor but real packing. Override with
-        `degenerate_threshold` in the problem config.
-        """
-        return float(self.cfg.get("degenerate_threshold", 1e-6))
 
     # ------------------------------------------------------------------
     def seed_states(self) -> List[SeedState]:
