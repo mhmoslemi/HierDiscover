@@ -142,13 +142,49 @@ def _with_shared_projections(forward):
     return patched
 
 
-def install_shared_expert_lora(model, rank, alpha, dropout):
+def _chunked_expert_forward(forward, chunk_tokens):
+    from torch.utils.checkpoint import checkpoint
+
+    def routed_forward(experts, hidden_states, router_indices=None, routing_weights=None):
+        hidden_size = hidden_states.shape[-1]
+        if hidden_states.numel() <= chunk_tokens * hidden_size:
+            return forward(experts, hidden_states, router_indices, routing_weights)
+
+        hidden = hidden_states.reshape(-1, hidden_size)
+        indices = router_indices.reshape(len(hidden), -1)
+        weights = routing_weights.reshape(len(hidden), -1)
+
+        def run_chunk(states, routes, scores):
+            return forward(experts, states, routes, scores)
+
+        # Expert routing is per token. Recompute each chunk in backward so
+        # the full layer's expanded expert activations are never live at once.
+        grad_enabled = torch.is_grad_enabled()
+        outputs = []
+        for states, routes, scores in zip(
+                hidden.split(chunk_tokens), indices.split(chunk_tokens), weights.split(chunk_tokens)):
+            if grad_enabled:
+                output = checkpoint(run_chunk, states, routes, scores, use_reentrant=False)
+            else:
+                output = run_chunk(states, routes, scores)
+            outputs.append(output)
+        return torch.cat(outputs, dim=0).reshape_as(hidden_states)
+
+    return routed_forward
+
+
+def install_shared_expert_lora(model, rank, alpha, dropout, *, expert_chunk_tokens=None):
     from unsloth_zoo.temporary_patches.moe_utils import forward_native_grouped_mm
 
     forward = _with_shared_projections(forward_native_grouped_mm)
 
     def routed_forward(experts, hidden_states, router_indices=None, routing_weights=None):
         return forward(experts, hidden_states, router_indices, routing_weights)
+
+    if expert_chunk_tokens is not None:
+        routed_forward = _chunked_expert_forward(forward, expert_chunk_tokens)
+        print(f"[memory] GPT-OSS packed experts: {expert_chunk_tokens:,} tokens per chunk",
+              flush=True)
 
     config = model.config
     expert_modules = [module for name, module in model.named_modules() if name.endswith(".experts")]

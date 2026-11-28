@@ -917,7 +917,8 @@ class UnslothBackend(_ModelPlacementBackend):
             model.peft_config[model.active_adapter].base_model_name_or_path = training_name
         if shared_lora:
             install_shared_expert_lora(
-                model, _lora_rank(self.cfg), self.cfg.lora_alpha, self.cfg.lora_dropout)
+                model, _lora_rank(self.cfg), self.cfg.lora_alpha, self.cfg.lora_dropout,
+                expert_chunk_tokens=4096 if hardware_profile == "H100" else None)
         set_gradient_checkpointing(model, False)
         if str(getattr(self.cfg, "coder_model_profile", "")) == "gpt-oss-120b":
             from models.gpt_oss_training import install_attention_layout_guards

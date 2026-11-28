@@ -117,8 +117,10 @@ class Problem(ABC):
         self.eval_cpus = int(self.cfg.get("eval_cpus", 1))
         if self.eval_cpus < 1:
             raise ValueError("eval_cpus must be >= 1")
+        # H100 schedules sandboxes without pinning, but native thread pools
+        # still have to fit inside each sandbox's address-space limit.
         self.sandbox_max_cpus = (
-            None if self.cfg.get("os_scheduled_cpu_evaluation") else self.eval_cpus)
+            1 if self.cfg.get("os_scheduled_cpu_evaluation") else self.eval_cpus)
 
     # ---- prompt / sandbox program / scoring (subclasses implement) ----
     @abstractmethod
@@ -178,7 +180,7 @@ class Problem(ABC):
             cpu_id=cpu_id,
             memory_limit_bytes=memory_limit_bytes,
             on_sandbox_deadline=on_sandbox_deadline,
-            hard_timeout=self.sandbox_max_cpus is None,
+            hard_timeout=bool(self.cfg.get("os_scheduled_cpu_evaluation")),
             **({"stdout_feedback": True} if ac1_ttt_rollouts else {}),
         )
         diagnostics = [out.get("stdout", ""), out.get("traceback", ""),
