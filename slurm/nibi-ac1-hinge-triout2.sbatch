@@ -1,10 +1,10 @@
 #!/bin/bash -l
 #SBATCH --job-name=ac1-hinge-triout2
 #SBATCH --account=def-bghaddar
-#SBATCH --time=2-00:00:00
+#SBATCH --time=0-14:00:00
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=50
+#SBATCH --cpus-per-task=75
 #SBATCH --gpus-per-node=h100:2
 #SBATCH --mem=512G
 #SBATCH --chdir=/home/mmoslem3/scratch/HierDiscover
