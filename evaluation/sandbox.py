@@ -244,8 +244,9 @@ class _StdoutFeedback:
         self._append(self._decoder.decode(data))
         return bool(data)
 
-    def wait(self, proc, timeout):
-        deadline = None if timeout is None else time.monotonic() + timeout
+    def wait(self, proc, timeout, *, deadline=None):
+        if deadline is None and timeout is not None:
+            deadline = time.monotonic() + timeout
         while self._selector.get_map() and proc.poll() is None:
             remaining = 0.05 if deadline is None else deadline - time.monotonic()
             if remaining <= 0:
@@ -268,15 +269,17 @@ class _StdoutFeedback:
         self._pipe.close()
 
 
-def run_code(code: str, entrypoint: str, timeout_s: float | None, max_cpus: int = 1,
+def run_code(code: str, entrypoint: str, timeout_s: float | None, max_cpus: int | None = 1,
              *, cpu_id=None, memory_limit_bytes=None, on_sandbox_deadline=None,
-             stdout_feedback=False):
+             stdout_feedback=False, hard_timeout=False):
     """
     Execute `code` (Python source) in a subprocess. Calls `entrypoint()`
     and returns whatever it returns.
 
     A None timeout allows a trusted check to finish without a deadline. The
     optional callback reports a configured deadline on launch and None on exit.
+    A None CPU limit preserves the inherited thread environment when unpinned.
+    A hard timeout sends SIGKILL at the deadline.
 
     Returns a dict:
       {"ok": True,  "value": <return value>, "stdout": "..."}
@@ -333,12 +336,13 @@ def run_code(code: str, entrypoint: str, timeout_s: float | None, max_cpus: int 
         env["HIP_VISIBLE_DEVICES"] = ""
         env["ROCR_VISIBLE_DEVICES"] = ""
         env.pop("TTT_EVAL_CPU_ID", None)
-        t = "1" if pinned_cpu is not None else str(max(1, int(max_cpus)))
-        for key in [
-                "OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS",
-                "NUMEXPR_NUM_THREADS", "VECLIB_MAXIMUM_THREADS",
-                "BLIS_NUM_THREADS"]:
-            env[key] = t
+        if pinned_cpu is not None or max_cpus is not None:
+            t = "1" if pinned_cpu is not None else str(max(1, int(max_cpus)))
+            for key in [
+                    "OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS",
+                    "NUMEXPR_NUM_THREADS", "VECLIB_MAXIMUM_THREADS",
+                    "BLIS_NUM_THREADS"]:
+                env[key] = t
         if pinned_cpu is not None:
             env["TTT_EVAL_CPU_ID"] = str(pinned_cpu)
         env["TTT_SANDBOX_CAPTURE_LIMIT_BYTES"] = str(
@@ -358,6 +362,7 @@ def run_code(code: str, entrypoint: str, timeout_s: float | None, max_cpus: int 
 
         # AC1 drains stdout directly, including writes to fd 1 from native code.
         # The default sandbox uses the bounded capture files.
+        deadline = None
         with _SANDBOX_LAUNCH_LOCK:
             proc = subprocess.Popen(
                 [sys.executable, runner_path],
@@ -366,19 +371,22 @@ def run_code(code: str, entrypoint: str, timeout_s: float | None, max_cpus: int 
                 env=env,
                 start_new_session=True,
             )
+            if hard_timeout and timeout_s is not None:
+                deadline = time.monotonic() + timeout_s
 
-        if stdout_feedback:
+        if stdout_feedback or hard_timeout:
             pgid = proc.pid  # start_new_session creates this group even for fast exits.
-            feedback = _StdoutFeedback(proc.stdout)
         else:
             try:
                 pgid = os.getpgid(proc.pid)
             except Exception:
                 pgid = None
 
-        deadline = None
+        if stdout_feedback:
+            feedback = _StdoutFeedback(proc.stdout)
         if on_sandbox_deadline is not None and timeout_s is not None:
-            deadline = time.monotonic() + timeout_s
+            if deadline is None:
+                deadline = time.monotonic() + timeout_s
             on_sandbox_deadline(deadline)
         timed_out = False
         try:
@@ -386,10 +394,10 @@ def run_code(code: str, entrypoint: str, timeout_s: float | None, max_cpus: int 
             if feedback is None:
                 proc.wait(timeout=wait_timeout)
             else:
-                feedback.wait(proc, wait_timeout)
+                feedback.wait(proc, wait_timeout, deadline=deadline if hard_timeout else None)
         except subprocess.TimeoutExpired:
             timed_out = True
-            _kill_tree(proc, pgid, hard=False)
+            _kill_tree(proc, pgid, hard=hard_timeout)
             try:
                 proc.wait(timeout=1.0)
             except subprocess.TimeoutExpired:

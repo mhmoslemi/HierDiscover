@@ -486,7 +486,8 @@ def save_parent_selections(exp_dir: Path, step: int, sampler_type: str,
             "selection_score": (float(info["score"])
                                 if info.get("score") is not None else None),
         })
-        if parent.is_seed and getattr(rollout_config, "ac1_ttt_rollouts", False):
+        if parent.is_seed and (getattr(rollout_config, "ac1_ttt_rollouts", False)
+                               or getattr(rollout_config, "problem", None) == "ac2"):
             selected[-1]["seed_construction"] = parent.construction
     payload = {
         "version": 1,
